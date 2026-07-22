@@ -112,13 +112,19 @@ New module `src/state.rs`:
 
 ## 5. Fallback without tmux
 
-- Detected once at startup (tmux binary present and runnable).
-- Absent → direct `$SHELL` spawn exactly as today. All UI features and
-  layout persistence still work; only session survival is missing.
+- Detected once at startup: tmux binary present, runnable, and
+  `tmux -V` reports version ≥ 3.2 (required for `remain-on-exit
+  failed` and `prefix None`). An older tmux is treated the same as a
+  missing one.
+- Absent or too old → direct `$SHELL` spawn exactly as today. All UI
+  features and layout persistence still work; only session survival is
+  missing.
 - The header bar shows a yellow warning icon
   (`dialog-warning-symbolic`). Clicking it opens a dialog explaining
-  that installing tmux enables crash-safe, upgrade-safe sessions, with
-  an install hint (e.g. `dnf install tmux`).
+  that installing **tmux ≥ 3.2** enables crash-safe, upgrade-safe
+  sessions, with an install hint (e.g. `dnf install tmux`). If an
+  older tmux was found, the dialog states the detected version and
+  the required minimum instead of a plain install hint.
 
 ## 6. Error handling
 
