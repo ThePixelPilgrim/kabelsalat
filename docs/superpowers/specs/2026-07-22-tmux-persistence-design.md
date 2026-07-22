@@ -46,6 +46,11 @@ Embedded in the binary, written to `<state_dir>/tmux.conf` at startup:
 - `set -g detach-on-destroy on`
 - `set -s exit-empty on` — server exits when the last session ends;
   no lingering daemon
+- `set -g remain-on-exit failed` (tmux ≥ 3.2) — clean shell exit
+  destroys the session; non-zero exit keeps the pane dead with its
+  final screen intact and the real exit code in `#{pane_dead_status}`
+- `set-hook -g pane-died 'run-shell "..."'` — writes
+  `<uuid> <exit-code>` to `<runtime_dir>/events/` (see Crash detection)
 - generous `history-limit`
 - `default-terminal` matching VTE's TERM
 
@@ -73,6 +78,9 @@ New module `src/state.rs`:
      (shell exited while GUI was gone; not marked "crashed").
    - live `ks-*` session absent from state → adopt as a tab in a
      special **"Recovered"** group so no live shell is ever invisible.
+   - per live session, query `#{pane_dead}` / `#{pane_dead_status}`:
+     a dead pane restores the tab in crashed state with its final
+     output visible and the real exit code shown.
 4. Empty state and no sessions → current fresh-start behavior
    (one group, one tab).
 
@@ -83,9 +91,24 @@ New module `src/state.rs`:
 - **App quit, crash, upgrade** merely detach; the tmux server keeps all
   shells running.
 - `ChildExited` semantics change: the child VTE observes is the tmux
-  *client*, not the shell. Client exit while the session is still alive
-  (e.g. external detach) offers reattach instead of marking the tab
-  crashed. Session actually gone → existing crashed/close behavior.
+  *client*, not the shell, and its exit code does not reflect the
+  shell's. Client exit while the session is still alive (e.g. external
+  detach) offers reattach instead of marking the tab crashed. Session
+  actually gone → clean shell exit → tab closes as today.
+
+### Crash detection (non-zero shell exit)
+
+- With `remain-on-exit failed`, a shell exiting non-zero leaves a dead
+  pane: the session survives, the final screen stays visible, and the
+  VTE client stays attached — so `ChildExited` never fires for it.
+- The `pane-died` hook writes a file `<uuid> <exit-code>` into
+  `<runtime_dir>/events/`; the GUI watches that directory with a
+  `GFileMonitor` (no polling) and marks the tab crashed, displaying
+  the real exit code from `#{pane_dead_status}`.
+- Because the dead session survives GUI restarts, crashed tabs —
+  including their final output — are restored by reconciliation.
+- Closing a crashed tab kills its session. A tab "restart" action may
+  use `tmux respawn-pane` to rerun the shell in place.
 
 ## 5. Fallback without tmux
 
@@ -114,6 +137,9 @@ New module `src/state.rs`:
 - Manual crash test: open several tabs with running processes,
   `kill -9` the GUI, relaunch, verify layout restored and processes
   still running.
+- Manual exit-code test: run `exit 3` in a tab → tab stays open,
+  marked crashed, shows exit code 3 and final output; run `exit 0` →
+  tab closes. Repeat `exit 3` then restart GUI → crashed tab restored.
 
 ## Out of scope
 
