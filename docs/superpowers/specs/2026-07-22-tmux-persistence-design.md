@@ -122,7 +122,9 @@ New module `src/state.rs`:
 - The header bar shows a yellow warning icon
   (`dialog-warning-symbolic`). Clicking it opens a dialog explaining
   that installing **tmux ≥ 3.2** enables crash-safe, upgrade-safe
-  sessions, with an install hint (e.g. `dnf install tmux`). If an
+  sessions, with install hints for the major distro families:
+  Debian/Ubuntu (`apt install tmux`), Fedora/Red Hat
+  (`dnf install tmux`), and openSUSE/SLE (`zypper install tmux`). If an
   older tmux was found, the dialog states the detected version and
   the required minimum instead of a plain install hint.
 
