@@ -149,6 +149,39 @@ New module `src/state.rs`:
   marked crashed, shows exit code 3 and final output; run `exit 0` →
   tab closes. Repeat `exit 3` then restart GUI → crashed tab restored.
 
+## 8. Logout survival (linger)
+
+Sessions survive GUI crash/quit/upgrade but not logout by default:
+systemd stops `user@<uid>.service` when the last login session ends,
+killing the tmux server, and `/run/user/<uid>` (socket dir) is wiped.
+Two additions make logout survival possible and informed:
+
+- **Server detachment**: when `systemd-run` is available, the tmux
+  server is started via `systemd-run --user --scope --collect` so it
+  lives outside the GUI's session scope and session-scope cleanup
+  (e.g. GNOME/Wayland logout) cannot kill it. Fallback: plain spawn
+  as before.
+- **Linger warning icon**: when tmux is usable but linger is disabled
+  (`loginctl show-user <user> --property=Linger` → `Linger=no`), a
+  second header-bar warning icon appears (distinct tooltip from the
+  tmux icon). Its dialog explains, in this order and without
+  dramatizing: (1) what enabling linger adds — shells survive
+  logout/re-login, not just GUI crashes; (2) the honest downsides —
+  a small permanent background footprint (user manager + enabled user
+  services), "logged out" no longer meaning nothing of yours is
+  running (runaway processes and agents keep going unattended, a
+  consideration on shared machines), and stale state persisting where
+  re-login used to be a clean reset. Reversible via
+  `loginctl disable-linger` at any time.
+- Dialog buttons: **Enable** (runs `loginctl enable-linger <user>`,
+  re-checks, hides the icon on success), **Not now** (icon stays,
+  re-shown next launch), **Don't show again** (icon hidden
+  permanently via a `linger_warning_dismissed` flag in state.json;
+  `#[serde(default)]` for backward compatibility with existing state
+  files). Dismissal never enables linger.
+- No linger check when tmux is unavailable (logout survival is moot)
+  or when `loginctl` is missing (non-systemd system: no icon).
+
 ## Out of scope
 
 - Scrollback beyond tmux's visible-screen replay and internal history.
