@@ -328,6 +328,20 @@ impl TmuxCtl {
     pub fn ensure_server(&self, use_systemd_run: bool) -> Result<(), TmuxError> {
         let argv = self.server_start_argv(use_systemd_run);
         let output = Command::new(&argv[0]).args(&argv[1..]).output()?;
+        if !output.status.success() {
+            return Err(TmuxError::Command(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        // The server survives app restarts and upgrades and only reads its
+        // config at start, so re-apply it to pick up config shipped by a
+        // newer binary. Live sessions are unaffected.
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket)
+            .arg("source-file")
+            .arg(&self.conf)
+            .output()?;
         if output.status.success() {
             Ok(())
         } else {
