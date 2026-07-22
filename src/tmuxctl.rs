@@ -212,7 +212,22 @@ unbind -a
 unbind -a -T root
 unbind -a -T copy-mode
 unbind -a -T copy-mode-vi
-set -g mouse off
+# Mouse must stay ON: tmux runs in VTE's alternate screen, where VTE's
+# fallback scrolling turns the wheel into cursor-up/down keypresses that
+# leak into the shell as history navigation or literal ^[[A. Requesting
+# mouse tracking makes VTE hand wheel events to tmux instead. The root and
+# copy-mode key tables are wiped by `unbind -a` above, so the wheel and
+# copy-mode exit have to be re-bound explicitly below.
+set -g mouse on
+set -g mode-keys emacs
+# tmux's stock root binding: forward to apps that grabbed the mouse
+# (vim, htop), otherwise enter copy-mode and scroll the history.
+bind -n WheelUpPane if -Ft= '#{?pane_in_mode,1,#{mouse_any_flag}}' 'send -M' 'copy-mode -et='
+bind -n WheelDownPane send -M
+bind -T copy-mode WheelUpPane send -X -N 3 scroll-up
+bind -T copy-mode WheelDownPane send -X -N 3 scroll-down
+bind -T copy-mode Escape send -X cancel
+bind -T copy-mode q send -X cancel
 set -g detach-on-destroy on
 # exit-empty must stay OFF: ensure_server() pre-claims the socket with a
 # detached, out-of-scope `start-server` that holds zero sessions, so later
@@ -592,6 +607,27 @@ mod tests {
         // stopped updating under tmux backing.
         assert!(TMUX_CONF.contains("set -g set-titles on"));
         assert!(TMUX_CONF.contains("set-titles-string \"#{pane_title}\""));
+    }
+
+    #[test]
+    fn tmux_conf_pins_mouse_on_with_wheel_bindings() {
+        // Regression: with `mouse off`, tmux never requested mouse tracking,
+        // so VTE's alternate-screen fallback scrolling turned the wheel into
+        // ^[[A/^[[B keypresses (shell history walked, ^[[A echoed by raw
+        // programs). Mouse on alone is not enough -- `unbind -a -T root`
+        // above also drops tmux's stock wheel bindings.
+        assert!(TMUX_CONF.contains("set -g mouse on"));
+        assert!(TMUX_CONF.contains("bind -n WheelUpPane"));
+        assert!(TMUX_CONF.contains("bind -n WheelDownPane"));
+        // Copy-mode needs its own wheel bindings and a way out.
+        assert!(TMUX_CONF.contains("bind -T copy-mode WheelUpPane"));
+        assert!(TMUX_CONF.contains("bind -T copy-mode Escape send -X cancel"));
+        // The wheel bindings must come after the unbind -a lines that wipe
+        // the tables they live in.
+        assert!(
+            TMUX_CONF.find("unbind -a -T copy-mode").unwrap()
+                < TMUX_CONF.find("bind -n WheelUpPane").unwrap()
+        );
     }
 
     #[test]

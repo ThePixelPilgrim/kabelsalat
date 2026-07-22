@@ -10,6 +10,8 @@ pub fn run() {
     let app = RelmApp::new(APP_ID);
     relm4::set_global_css(
         ".tmux-warning { color: #e5a50a; }
+         .select-hint { color: #3584e4; animation: ks-pulse 1s ease-in-out infinite; }
+         @keyframes ks-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
          .tab-crashed label { color: #e01b24; font-weight: bold; }
          button.tab-active label { font-weight: bold; }
          button.tab-active { background: alpha(currentColor, 0.12); }

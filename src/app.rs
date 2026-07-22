@@ -41,6 +41,13 @@ const SHORTCUTS: &[(&str, &str, Msg)] = &[
     ("F1", "Show this help", Msg::ShowHelp),
 ];
 
+/// How long the "hold Shift to select" icon stays up after a bare drag.
+const SELECT_HINT_SECS: u32 = 7;
+
+/// Drag distance, in pixels, below which a drag is treated as a shaky click
+/// rather than an attempted selection.
+const DRAG_THRESHOLD_PX: f64 = 8.0;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PickerMode {
     Move,
@@ -84,6 +91,13 @@ pub struct App {
     linger: LingerStatus,
     /// Whether the linger warning was permanently dismissed (persisted).
     linger_dismissed: bool,
+    /// Whether the "hold Shift to select" hint icon is currently showing.
+    /// Transient: never persisted, re-armed on every bare drag.
+    select_hint_visible: bool,
+    /// Generation counter for the hint's hide timer. A drag during the visible
+    /// window bumps it, so the earlier timeout fires into a stale generation
+    /// and is ignored instead of hiding the icon early.
+    select_hint_gen: u64,
     /// Watches the pane-died events dir; kept alive for its lifetime.
     monitor: Option<gio::FileMonitor>,
     /// Where the presentation model is persisted.
@@ -132,6 +146,14 @@ pub enum Msg {
     LingerEnabled(Result<LingerStatus, String>),
     /// Permanently hide the linger warning (persists the dismissal flag).
     DismissLingerWarning,
+    /// The user dragged in a terminal without Shift, so tmux ate the drag
+    /// instead of VTE selecting text. Shows the hint icon.
+    BareDragHint,
+    /// The hint's display window elapsed; the payload is the generation it was
+    /// armed for, so a superseded timer is a no-op.
+    HideSelectHint(u64),
+    /// Open the "hold Shift to select" explanation dialog.
+    ShowSelectHelp,
 }
 
 #[relm4::component(pub)]
@@ -181,6 +203,15 @@ impl SimpleComponent for App {
                         && model.linger == LingerStatus::Disabled
                         && !model.linger_dismissed,
                     connect_clicked => Msg::ShowLingerWarning,
+                },
+
+                pack_end = &gtk::Button {
+                    set_icon_name: "dialog-information-symbolic",
+                    add_css_class: "select-hint",
+                    set_tooltip_text: Some("Hold Shift to select text — click for details"),
+                    #[watch]
+                    set_visible: model.select_hint_visible,
+                    connect_clicked => Msg::ShowSelectHelp,
                 },
             },
 
@@ -336,6 +367,8 @@ impl SimpleComponent for App {
             availability,
             linger,
             linger_dismissed,
+            select_hint_visible: false,
+            select_hint_gen: 0,
             monitor: None,
             state_path: state::state_file(),
         };
@@ -446,6 +479,23 @@ impl SimpleComponent for App {
             Msg::EnableLinger => self.enable_linger(),
             Msg::LingerEnabled(result) => self.on_linger_enabled(result),
             Msg::DismissLingerWarning => self.linger_dismissed = true,
+            // The three hint messages are pure transient UI and fire as often
+            // as the user drags, so they return early to skip the save_state()
+            // at the bottom rather than rewriting the state file per drag.
+            Msg::BareDragHint => {
+                self.show_select_hint();
+                return;
+            }
+            Msg::HideSelectHint(generation) => {
+                if generation == self.select_hint_gen {
+                    self.select_hint_visible = false;
+                }
+                return;
+            }
+            Msg::ShowSelectHelp => {
+                self.show_select_help();
+                return;
+            }
             Msg::TitleChanged(id, title) => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
                     tab.title = title;
@@ -651,6 +701,25 @@ impl App {
         }
     }
 
+    /// Show the "hold Shift to select" icon and (re)arm its hide timer.
+    fn show_select_hint(&mut self) {
+        self.select_hint_visible = true;
+        self.select_hint_gen = self.select_hint_gen.wrapping_add(1);
+        let generation = self.select_hint_gen;
+        let input = self.input.clone();
+        gtk::glib::timeout_add_seconds_local_once(SELECT_HINT_SECS, move || {
+            let _ = input.send(Msg::HideSelectHint(generation));
+        });
+    }
+
+    /// Explain why a plain drag doesn't select, and what the wheel does now.
+    fn show_select_help(&self) {
+        let dialog =
+            adw::AlertDialog::new(Some("Hold Shift to select text"), Some(select_help_body()));
+        dialog.add_response("close", "Close");
+        dialog.present(Some(&self.window));
+    }
+
     /// Explain that crash-safe sessions need tmux >= 3.2, with install hints.
     fn show_tmux_warning(&self) {
         let body = tmux_warning_body(&self.availability);
@@ -844,9 +913,19 @@ impl App {
         crashed: Option<i32>,
         sender: &ComponentSender<Self>,
     ) -> usize {
-        let terminal = Terminal::builder().hexpand(true).vexpand(true).build();
+        // Fallback scrolling off: tmux keeps VTE permanently in the alternate
+        // screen, where VTE would otherwise translate the wheel into cursor-up
+        // /down keypresses that land in the shell. tmux owns the wheel now
+        // (`set -g mouse on`), and VTE's own scrollback is empty regardless.
+        let terminal = Terminal::builder()
+            .hexpand(true)
+            .vexpand(true)
+            .enable_fallback_scrolling(false)
+            .build();
         apply_scheme(&terminal, self.style.is_dark());
         spawn_backing(&terminal, &uuid, self.tmux.as_ref());
+
+        attach_drag_hint(&terminal, sender);
 
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -1333,6 +1412,56 @@ fn linger_warning_body() -> String {
         .to_string()
 }
 
+fn select_help_body() -> &'static str {
+    "Drag with Shift held to select text with the mouse.\n\n\
+     Shells run inside tmux, and tmux has to claim the mouse so the wheel can \
+     scroll the scrollback instead of typing arrow keys into your shell. \
+     Mouse reporting is all-or-nothing, so buttons go to tmux too \u{2014} \
+     holding Shift is the terminal's standard way to take them back for \
+     selection. Other terminals behave the same way under tmux.\n\n\
+     \u{2022} Shift+drag \u{2014} select text\n\
+     \u{2022} Wheel \u{2014} scroll the scrollback (Escape or q to leave)"
+}
+
+/// Detect a drag that the user probably meant as a text selection but which
+/// tmux will swallow, because Shift was not held.
+///
+/// Split out from the gesture wiring so it can be tested without a display:
+/// GTK gestures need a real GDK surface, this decision does not.
+fn should_hint(distance: f64, mods: gtk::gdk::ModifierType, already_fired: bool) -> bool {
+    !already_fired
+        && distance >= DRAG_THRESHOLD_PX
+        && !mods.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+}
+
+/// Watch for Shift-less drags on `terminal` and raise the selection hint.
+///
+/// The gesture sits in the capture phase so it sees the drag on the way down
+/// the widget tree, and never claims the sequence, so VTE (and through it
+/// tmux) still receives every event untouched.
+fn attach_drag_hint(terminal: &Terminal, sender: &ComponentSender<App>) {
+    let drag = gtk::GestureDrag::new();
+    drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    // One-shot per drag: a single gesture emits drag_update on every motion
+    // event, and the hint should appear once, not once per pixel.
+    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+    drag.connect_drag_update({
+        let sender = sender.clone();
+        let fired = fired.clone();
+        move |drag, off_x, off_y| {
+            let distance = (off_x * off_x + off_y * off_y).sqrt();
+            if should_hint(distance, drag.current_event_state(), fired.get()) {
+                fired.set(true);
+                let _ = sender.input_sender().send(Msg::BareDragHint);
+            }
+        }
+    });
+    drag.connect_drag_end(move |_, _, _| fired.set(false));
+
+    terminal.add_controller(drag);
+}
+
 fn apply_scheme(terminal: &Terminal, dark: bool) {
     let (fg, bg) = if dark {
         ("#deddda", "#1d1d20")
@@ -1409,6 +1538,48 @@ mod tests {
             pane_dead: false,
             dead_status: None,
         }
+    }
+
+    // --- Shift-select hint decision --------------------------------------
+
+    use gtk::gdk::ModifierType;
+
+    #[test]
+    fn hints_on_bare_drag_past_threshold() {
+        assert!(should_hint(20.0, ModifierType::empty(), false));
+    }
+
+    #[test]
+    fn no_hint_when_shift_held() {
+        // Shift+drag is a *working* selection — hinting would be wrong.
+        assert!(!should_hint(20.0, ModifierType::SHIFT_MASK, false));
+        // Shift alongside other modifiers still counts as held.
+        assert!(!should_hint(
+            20.0,
+            ModifierType::SHIFT_MASK | ModifierType::CONTROL_MASK,
+            false
+        ));
+    }
+
+    #[test]
+    fn no_hint_below_drag_threshold() {
+        // A click with a shaky hand is not an attempted selection.
+        assert!(!should_hint(
+            DRAG_THRESHOLD_PX - 0.1,
+            ModifierType::empty(),
+            false
+        ));
+    }
+
+    #[test]
+    fn no_hint_twice_within_one_drag() {
+        // drag_update fires per motion event; the hint must fire once.
+        assert!(!should_hint(500.0, ModifierType::empty(), true));
+    }
+
+    #[test]
+    fn hint_fires_exactly_at_threshold() {
+        assert!(should_hint(DRAG_THRESHOLD_PX, ModifierType::empty(), false));
     }
 
     // --- finding 1: session-gone decision -------------------------------
