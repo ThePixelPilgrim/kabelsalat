@@ -48,6 +48,32 @@ const SELECT_HINT_SECS: u32 = 7;
 /// rather than an attempted selection.
 const DRAG_THRESHOLD_PX: f64 = 8.0;
 
+/// Ceiling on the active tab button, so one verbose OSC title can't eat the
+/// whole bar and crush its siblings to the floor.
+const ACTIVE_TAB_MAX_CHARS: i32 = 40;
+
+/// Floor for the *active* tab. It is deliberately a floor and not a pin: GTK
+/// grows every child to its natural width before handing surplus to expanding
+/// children, so the active tab still renders in full whenever the bar has the
+/// room, and only gives ground when the window is genuinely too narrow. Pinning
+/// the minimum to the full width instead made the bar's own minimum 474px wide
+/// and forced it to overflow in narrow windows.
+const ACTIVE_TAB_MIN_CHARS: i32 = 8;
+
+/// Floor for inactive tab buttons: how narrow they may be squeezed before the
+/// tab bar starts scrolling instead.
+const TAB_MIN_CHARS: i32 = 3;
+
+/// Natural width of an inactive tab button. Surplus space beyond this is only
+/// handed out because the buttons hexpand; it is not a hard cap.
+const TAB_NATURAL_CHARS: i32 = 18;
+
+// The layout depends on these staying ordered: inactive tabs must be
+// squeezable below their natural width, which must not exceed the active
+// tab's ceiling, or the "active full, others share the rest" split inverts.
+const _: () = assert!(TAB_MIN_CHARS <= TAB_NATURAL_CHARS);
+const _: () = assert!(TAB_NATURAL_CHARS <= ACTIVE_TAB_MAX_CHARS);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PickerMode {
     Move,
@@ -80,6 +106,9 @@ pub struct App {
     style: adw::StyleManager,
     tab_list: gtk::ListBox,
     tab_bar: gtk::Box,
+    /// Scroll wrapper around `tab_bar`; owns the horizontal adjustment used to
+    /// keep the active tab on screen.
+    tab_scroller: gtk::ScrolledWindow,
     stack: gtk::Stack,
     window: gtk::ApplicationWindow,
     input: relm4::Sender<Msg>,
@@ -269,11 +298,22 @@ impl SimpleComponent for App {
                     set_orientation: gtk::Orientation::Vertical,
                     set_hexpand: true,
 
-                    append = &tab_bar.clone() {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 2,
-                        set_margin_all: 4,
+                    // The scroller is what lets the bar have a small minimum
+                    // width: past the point where inactive tabs hit their
+                    // character floor, the overflow scrolls instead of forcing
+                    // the window wider.
+                    append = &tab_scroller.clone() {
+                        set_hscrollbar_policy: gtk::PolicyType::External,
+                        set_vscrollbar_policy: gtk::PolicyType::Never,
+                        set_propagate_natural_height: true,
                         set_visible: false,
+
+                        #[wrap(Some)]
+                        set_child = &tab_bar.clone() {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 2,
+                            set_margin_all: 4,
+                        },
                     },
 
                     append = &stack.clone() {
@@ -360,6 +400,7 @@ impl SimpleComponent for App {
             style,
             tab_list: gtk::ListBox::new(),
             tab_bar: gtk::Box::new(gtk::Orientation::Horizontal, 2),
+            tab_scroller: gtk::ScrolledWindow::new(),
             stack: gtk::Stack::new(),
             window: root.clone(),
             input: sender.input_sender().clone(),
@@ -375,6 +416,7 @@ impl SimpleComponent for App {
 
         let tab_list = model.tab_list.clone();
         let tab_bar = model.tab_bar.clone();
+        let tab_scroller = model.tab_scroller.clone();
         let stack = model.stack.clone();
         let widgets = view_output!();
 
@@ -1161,6 +1203,7 @@ impl App {
             None => Vec::new(),
         };
         self.tab_bar.set_visible(members.len() > 1);
+        self.tab_scroller.set_visible(members.len() > 1);
         if members.len() <= 1 {
             return;
         }
@@ -1168,14 +1211,34 @@ impl App {
             .active_tab()
             .and_then(|t| self.groups.iter().find(|g| g.id == t.group))
             .map(|g| g.css);
+        let mut active_button = None;
         for tab in members {
-            let button = gtk::Button::builder().label(&tab.title).build();
+            let active = self.active == Some(tab.id);
+            // An explicit ellipsizing label is what gives the button a small
+            // minimum width; Button::builder().label() builds a plain label
+            // whose minimum is its full text, which is what pushed the bar
+            // past the window edge.
+            let (width_chars, max_width_chars) = tab_label_chars(tab.title.chars().count(), active);
+            let label = gtk::Label::builder()
+                .label(&tab.title)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .single_line_mode(true)
+                .width_chars(width_chars)
+                .max_width_chars(max_width_chars)
+                .build();
+
+            let button = gtk::Button::builder().child(&label).build();
             button.add_css_class("flat");
+            // Only inactive tabs expand: the active one keeps its natural
+            // width and the others divide whatever is left over.
+            button.set_hexpand(!active);
+            button.set_tooltip_text(Some(&tab.title));
             if let Some(css) = group_css {
                 button.add_css_class(css);
             }
-            if self.active == Some(tab.id) {
+            if active {
                 button.add_css_class("tab-active");
+                active_button = Some(button.clone());
             }
             if tab.crashed.is_some() {
                 button.add_css_class("tab-crashed");
@@ -1187,6 +1250,43 @@ impl App {
             });
             self.tab_bar.append(&button);
         }
+        if let Some(button) = active_button {
+            self.scroll_active_into_view(&button);
+        }
+    }
+
+    /// Bring the active tab button into the scroller's visible range.
+    ///
+    /// Deferred to an idle callback because the buttons were only just
+    /// appended: their allocations are undefined until GTK has laid the bar
+    /// out, so reading them synchronously here would scroll against zeroes.
+    fn scroll_active_into_view(&self, button: &gtk::Button) {
+        let scroller = self.tab_scroller.clone();
+        let bar = self.tab_bar.clone();
+        let button = button.clone();
+        gtk::glib::idle_add_local_once(move || {
+            // Bounds relative to the bar, not the viewport: those are the
+            // coordinates the horizontal adjustment is expressed in.
+            // A later rebuild may already have torn this button out of the bar
+            // — rebuild_tab_bar runs on every title change, and each run
+            // schedules one of these. Scrolling to a detached widget's bounds
+            // moves the bar to a garbage offset, which showed up as tabs
+            // clipped against the window edge after a title update.
+            if button.parent().as_ref() != Some(bar.upcast_ref::<gtk::Widget>()) {
+                return;
+            }
+            let Some(bounds) = button.compute_bounds(&bar) else {
+                return;
+            };
+            let (x, width) = (bounds.x() as f64, bounds.width() as f64);
+            let hadj = scroller.hadjustment();
+            let (value, page) = (hadj.value(), hadj.page_size());
+            if x < value {
+                hadj.set_value(x);
+            } else if x + width > value + page {
+                hadj.set_value(x + width - page);
+            }
+        });
     }
 
     fn make_row(
@@ -1412,6 +1512,25 @@ fn linger_warning_body() -> String {
         .to_string()
 }
 
+/// Width request for a tab button's label, as `(width_chars,
+/// max_width_chars)` — GTK reads those as the label's minimum and natural
+/// width.
+///
+/// The active tab asks for a natural width big enough to show its whole title
+/// (up to a cap) but keeps a small minimum, because GTK satisfies every child's
+/// natural width before handing surplus to expanding children: the active tab
+/// therefore renders in full whenever the bar has room, and degrades instead of
+/// forcing the bar to overflow when it does not. Inactive tabs ask for a floor
+/// of `TAB_MIN_CHARS`, and hexpand hands them an equal share of what is left.
+fn tab_label_chars(title_chars: usize, active: bool) -> (i32, i32) {
+    if active {
+        let natural = title_chars.min(ACTIVE_TAB_MAX_CHARS as usize) as i32;
+        (natural.min(ACTIVE_TAB_MIN_CHARS), natural)
+    } else {
+        (TAB_MIN_CHARS, TAB_NATURAL_CHARS)
+    }
+}
+
 fn select_help_body() -> &'static str {
     "Drag with Shift held to select text with the mouse.\n\n\
      Shells run inside tmux, and tmux has to claim the mouse so the wheel can \
@@ -1538,6 +1657,61 @@ mod tests {
             pane_dead: false,
             dead_status: None,
         }
+    }
+
+    // --- tab bar sizing --------------------------------------------------
+
+    #[test]
+    fn active_tab_asks_for_its_full_width_as_natural() {
+        // Natural == the title width, so GTK renders it in full when there is
+        // room; the minimum stays low so the bar can still shrink.
+        assert_eq!(tab_label_chars(20, true), (ACTIVE_TAB_MIN_CHARS, 20));
+    }
+
+    #[test]
+    fn active_tab_is_capped_for_long_titles() {
+        // A verbose OSC title must not eat the whole bar.
+        assert_eq!(
+            tab_label_chars(200, true),
+            (ACTIVE_TAB_MIN_CHARS, ACTIVE_TAB_MAX_CHARS)
+        );
+    }
+
+    #[test]
+    fn active_tab_minimum_never_exceeds_its_natural() {
+        // Regression: pinning minimum to the full width made the bar's own
+        // minimum 474px, so any narrower window overflowed and clipped tabs.
+        for chars in [0, 1, 5, 8, 9, 40, 200] {
+            let (min, natural) = tab_label_chars(chars, true);
+            assert!(min <= natural, "min {min} > natural {natural} at {chars}");
+            assert!(min <= ACTIVE_TAB_MIN_CHARS);
+        }
+    }
+
+    #[test]
+    fn short_active_title_does_not_inflate_the_minimum() {
+        // A 3-char title must not request an 8-char floor.
+        assert_eq!(tab_label_chars(3, true), (3, 3));
+    }
+
+    #[test]
+    fn inactive_tabs_ask_for_floor_and_natural() {
+        // Small minimum is the whole point: it lets the bar shrink at all.
+        assert_eq!(
+            tab_label_chars(200, false),
+            (TAB_MIN_CHARS, TAB_NATURAL_CHARS)
+        );
+        // Title length is irrelevant when inactive — short titles still
+        // expand to share the surplus.
+        assert_eq!(
+            tab_label_chars(2, false),
+            (TAB_MIN_CHARS, TAB_NATURAL_CHARS)
+        );
+    }
+
+    #[test]
+    fn empty_title_does_not_underflow() {
+        assert_eq!(tab_label_chars(0, true), (0, 0));
     }
 
     // --- Shift-select hint decision --------------------------------------
