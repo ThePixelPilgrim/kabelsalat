@@ -34,6 +34,11 @@ pub struct SavedState {
     pub tabs: Vec<SavedTab>,
     pub active: Option<String>, // uuid of the active tab
     pub sidebar_visible: bool,
+    /// Whether the user permanently dismissed the linger (logout survival)
+    /// warning. `serde(default)` so state files predating this field load
+    /// with `false` (warning still shown).
+    #[serde(default)]
+    pub linger_warning_dismissed: bool,
 }
 
 impl Default for SavedState {
@@ -43,6 +48,7 @@ impl Default for SavedState {
             tabs: Vec::new(),
             active: None,
             sidebar_visible: true,
+            linger_warning_dismissed: false,
         }
     }
 }
@@ -195,6 +201,7 @@ mod tests {
             ],
             active: Some("bbb".into()),
             sidebar_visible: false,
+            linger_warning_dismissed: true,
         }
     }
 
@@ -213,6 +220,31 @@ mod tests {
         let state = sample_state();
         let json = serde_json::to_string(&state).unwrap();
         let back: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+    }
+
+    #[test]
+    fn old_state_without_linger_flag_defaults_to_not_dismissed() {
+        // A state file written before the linger flag existed must still load,
+        // with the warning not dismissed.
+        let json = r#"{
+            "groups": [],
+            "tabs": [],
+            "active": null,
+            "sidebar_visible": true
+        }"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert!(!state.linger_warning_dismissed);
+        assert_eq!(state, SavedState::default());
+    }
+
+    #[test]
+    fn linger_flag_round_trips() {
+        let mut state = sample_state();
+        state.linger_warning_dismissed = true;
+        let json = serde_json::to_string(&state).unwrap();
+        let back: SavedState = serde_json::from_str(&json).unwrap();
+        assert!(back.linger_warning_dismissed);
         assert_eq!(back, state);
     }
 

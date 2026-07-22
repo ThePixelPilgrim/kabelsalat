@@ -78,6 +78,87 @@ pub fn detect() -> TmuxAvailability {
     }
 }
 
+/// Whether lingering (logout survival) is enabled for the current user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LingerStatus {
+    /// `Linger=yes` — shells already survive logout; no icon.
+    Enabled,
+    /// `Linger=no` — offer to enable it; show the warning icon.
+    Disabled,
+    /// loginctl missing, non-systemd system, no user, or any error — no icon.
+    NotApplicable,
+}
+
+/// Parse the value from `loginctl show-user <user> --property=Linger` output.
+/// `Linger=yes` → `Some(true)`, `Linger=no` → `Some(false)`, anything else
+/// (garbage, empty, missing property) → `None`.
+pub fn parse_linger(output: &str) -> Option<bool> {
+    for line in output.lines() {
+        if let Some(value) = line.trim().strip_prefix("Linger=") {
+            return match value.trim() {
+                "yes" => Some(true),
+                "no" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// The current user's login name, from `$USER` or `$LOGNAME`.
+pub fn current_user() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .filter(|u| !u.is_empty())
+}
+
+/// Whether `systemd-run` is available to start the tmux server in its own
+/// transient user scope (so session-scope cleanup at logout cannot kill it).
+pub fn has_systemd_run() -> bool {
+    Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check whether lingering is enabled for the current user. A missing
+/// `loginctl` (non-systemd system), no resolvable user, or any error all map
+/// to `NotApplicable` (no icon) — never surfaced as an error dialog.
+pub fn detect_linger() -> LingerStatus {
+    let Some(user) = current_user() else {
+        return LingerStatus::NotApplicable;
+    };
+    let output = match Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return LingerStatus::NotApplicable,
+    };
+    match parse_linger(&String::from_utf8_lossy(&output.stdout)) {
+        Some(true) => LingerStatus::Enabled,
+        Some(false) => LingerStatus::Disabled,
+        None => LingerStatus::NotApplicable,
+    }
+}
+
+/// Enable lingering for the current user (`loginctl enable-linger <user>`).
+pub fn enable_linger() -> Result<(), TmuxError> {
+    let user = current_user().ok_or_else(|| TmuxError::Command("no current user".into()))?;
+    let output = Command::new("loginctl")
+        .args(["enable-linger", &user])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(TmuxError::Command(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
 /// Errors from tmux wrapper operations.
 #[derive(Debug)]
 pub enum TmuxError {
@@ -133,7 +214,13 @@ unbind -a -T copy-mode
 unbind -a -T copy-mode-vi
 set -g mouse off
 set -g detach-on-destroy on
-set -s exit-empty on
+# exit-empty must stay OFF: ensure_server() pre-claims the socket with a
+# detached, out-of-scope `start-server` that holds zero sessions, so later
+# VTE clients only attach instead of implicitly starting the server inside
+# the GUI's session scope. With exit-empty on, that empty server would exit
+# immediately, defeating logout survival. Keeping it off leaves a small
+# server running with no sessions, which is the intended tradeoff.
+set -s exit-empty off
 set -g remain-on-exit failed
 set -g history-limit 100000
 set -g default-terminal xterm-256color
@@ -195,6 +282,55 @@ impl TmuxCtl {
             format!("{SESSION_PREFIX}{uuid}"),
             shell,
         ]
+    }
+
+    /// Argv that starts the private tmux server. When `use_systemd_run` is
+    /// true the server is launched inside its own transient user scope
+    /// (`systemd-run --user --scope --collect …`) so that session-scope
+    /// cleanup at logout (e.g. GNOME/Wayland) cannot kill it; otherwise a
+    /// plain `tmux … start-server`.
+    ///
+    /// This must run once, before any VTE client's `new-session -A`: a client's
+    /// implicit server start would place the server inside the GUI's session
+    /// scope. An explicit detached `start-server` claims the socket first, and
+    /// later clients merely attach to the already-running server.
+    pub fn server_start_argv(&self, use_systemd_run: bool) -> Vec<String> {
+        let tmux = vec![
+            "tmux".to_string(),
+            "-S".into(),
+            self.socket.to_string_lossy().into_owned(),
+            "-f".into(),
+            self.conf.to_string_lossy().into_owned(),
+            "start-server".into(),
+        ];
+        if use_systemd_run {
+            let mut argv = vec![
+                "systemd-run".to_string(),
+                "--user".into(),
+                "--scope".into(),
+                "--collect".into(),
+            ];
+            argv.extend(tmux);
+            argv
+        } else {
+            tmux
+        }
+    }
+
+    /// Start the detached tmux server. Idempotent: `start-server` against an
+    /// already-running socket just connects and exits. Best-effort — a failure
+    /// only means clients will start the server themselves (attached, so it
+    /// won't survive logout), which is the pre-existing fallback behavior.
+    pub fn ensure_server(&self, use_systemd_run: bool) -> Result<(), TmuxError> {
+        let argv = self.server_start_argv(use_systemd_run);
+        let output = Command::new(&argv[0]).args(&argv[1..]).output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(TmuxError::Command(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ))
+        }
     }
 
     /// List live `ks-*` sessions with their pane-dead state.
@@ -356,6 +492,53 @@ mod tests {
     }
 
     #[test]
+    fn server_start_argv_plain() {
+        let dir = temp_dir("srv-plain");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.server_start_argv(false);
+        assert_eq!(argv[0], "tmux");
+        assert_eq!(argv[1], "-S");
+        assert!(argv[2].ends_with("run/tmux.sock"));
+        assert_eq!(argv[3], "-f");
+        assert!(argv[4].ends_with("state/tmux.conf"));
+        assert_eq!(argv[5], "start-server");
+        assert_eq!(argv.len(), 6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn server_start_argv_via_systemd_run() {
+        let dir = temp_dir("srv-systemd");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.server_start_argv(true);
+        assert_eq!(
+            &argv[..4],
+            ["systemd-run", "--user", "--scope", "--collect"]
+        );
+        // The full tmux start-server invocation follows the scope wrapper.
+        assert_eq!(argv[4], "tmux");
+        assert_eq!(argv.last().unwrap(), "start-server");
+        assert_eq!(argv[5..], ctl.server_start_argv(false)[1..]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_linger_yes_no() {
+        assert_eq!(parse_linger("Linger=yes"), Some(true));
+        assert_eq!(parse_linger("Linger=no\n"), Some(false));
+        assert_eq!(parse_linger("Linger=yes\n"), Some(true));
+    }
+
+    #[test]
+    fn parse_linger_garbage_and_empty() {
+        assert_eq!(parse_linger(""), None);
+        assert_eq!(parse_linger("Linger="), None);
+        assert_eq!(parse_linger("Linger=maybe"), None);
+        assert_eq!(parse_linger("Something=yes"), None);
+        assert_eq!(parse_linger("garbage without equals"), None);
+    }
+
+    #[test]
     fn writes_config_with_events_dir() {
         let dir = temp_dir("conf");
         let ctl = test_ctl(&dir);
@@ -397,7 +580,10 @@ mod tests {
 
     #[test]
     fn tmux_conf_pins_exit_empty() {
-        assert!(TMUX_CONF.contains("set -s exit-empty on"));
+        // Must be OFF so the detached, out-of-scope server pre-claimed by
+        // ensure_server() survives with zero sessions; exit-empty on would
+        // make it exit immediately and defeat logout survival.
+        assert!(TMUX_CONF.contains("set -s exit-empty off"));
     }
 
     #[test]

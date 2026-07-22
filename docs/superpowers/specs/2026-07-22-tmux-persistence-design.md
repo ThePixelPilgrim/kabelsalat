@@ -44,8 +44,13 @@ Embedded in the binary, written to `<state_dir>/tmux.conf` at startup:
   keybindings visible to the user
 - `set -g mouse off` — mouse events pass through to applications
 - `set -g detach-on-destroy on`
-- `set -s exit-empty on` — server exits when the last session ends;
-  no lingering daemon
+- `set -s exit-empty off` — the server must survive holding zero
+  sessions: section 8's detached `start-server` pre-claims the socket
+  before any session exists; with `exit-empty on` that empty server
+  would exit instantly and the first client would silently restart it
+  inside the GUI's session scope, defeating logout survival. Trade-off:
+  an idle tmux server can outlive the last closed tab (negligible
+  footprint; killed by `kill-server` or reboot).
 - `set -g remain-on-exit failed` (tmux ≥ 3.2) — clean shell exit
   destroys the session; non-zero exit keeps the pane dead with its
   final screen intact and the real exit code in `#{pane_dead_status}`
