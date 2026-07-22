@@ -222,6 +222,10 @@ set -g detach-on-destroy on
 # server running with no sessions, which is the intended tradeoff.
 set -s exit-empty off
 set -g remain-on-exit failed
+# Forward the shell's OSC title to the outer terminal (VTE), which feeds
+# the GUI tab titles; without set-titles tmux swallows it into pane_title.
+set -g set-titles on
+set -g set-titles-string \"#{pane_title}\"
 set -g history-limit 100000
 set -g default-terminal xterm-256color
 set-hook -g pane-died 'run-shell \"printf \\\"%s %s\\\" \\\"#{session_name}\\\" \\\"#{pane_dead_status}\\\" > \\\"{events_dir}/#{session_name}\\\"\"'
@@ -565,6 +569,15 @@ mod tests {
         // xterm-256color and the app never overrides it, so this line must
         // stay pinned; a future TERM override should force revisiting it.
         assert!(TMUX_CONF.contains("default-terminal xterm-256color"));
+    }
+
+    #[test]
+    fn tmux_conf_forwards_shell_titles_to_outer_terminal() {
+        // Regression (v0.2.1): without set-titles, tmux swallows the shell's
+        // OSC title into pane_title and VTE never sees it, so GUI tab titles
+        // stopped updating under tmux backing.
+        assert!(TMUX_CONF.contains("set -g set-titles on"));
+        assert!(TMUX_CONF.contains("set-titles-string \"#{pane_title}\""));
     }
 
     #[test]

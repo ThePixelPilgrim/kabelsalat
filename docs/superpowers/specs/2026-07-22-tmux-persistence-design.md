@@ -56,6 +56,9 @@ Embedded in the binary, written to `<state_dir>/tmux.conf` at startup:
   final screen intact and the real exit code in `#{pane_dead_status}`
 - `set-hook -g pane-died 'run-shell "..."'` — writes
   `<uuid> <exit-code>` to `<runtime_dir>/events/` (see Crash detection)
+- `set -g set-titles on` + `set-titles-string "#{pane_title}"` — forward
+  the shell's OSC title through tmux to VTE, which feeds the GUI tab
+  titles; without this tmux swallows titles into `pane_title`
 - generous `history-limit`
 - `default-terminal` matching VTE's TERM
 
