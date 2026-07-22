@@ -1,13 +1,16 @@
 use relm4::RelmApp;
 
 mod app;
+pub mod state;
+pub mod tmuxctl;
 
 pub const APP_ID: &str = "de.nereide.kabelsalat";
 
 pub fn run() {
     let app = RelmApp::new(APP_ID);
     relm4::set_global_css(
-        ".tab-crashed label { color: #e01b24; font-weight: bold; }
+        ".tmux-warning { color: #e5a50a; }
+         .tab-crashed label { color: #e01b24; font-weight: bold; }
          button.tab-active label { font-weight: bold; }
          button.tab-active { background: alpha(currentColor, 0.12); }
          button.group-c0, button.group-c1, button.group-c2,

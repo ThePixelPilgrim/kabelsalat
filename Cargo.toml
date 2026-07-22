@@ -1,6 +1,6 @@
 [package]
 name = "kabelsalat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [[bin]]
@@ -11,3 +11,5 @@ path = "src/main.rs"
 libadwaita = { version = "0.9.2", features = ["v1_5"] }
 relm4 = { version = "0.11.0", features = ["libadwaita"] }
 vte4 = { version = "0.10.0", features = ["gtk_v4_18", "v0_82"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
