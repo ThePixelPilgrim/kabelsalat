@@ -286,10 +286,14 @@ impl TmuxCtl {
     }
 
     /// Argv for spawning (or reattaching) the backing session of a tab:
-    /// `tmux -S <sock> -f <conf> new-session -A -s ks-<uuid> $SHELL`.
-    pub fn spawn_argv(&self, uuid: &str) -> Vec<String> {
+    /// `tmux -S <sock> -f <conf> new-session -A [-c <cwd>] -s ks-<uuid> $SHELL`.
+    ///
+    /// When `cwd` is set, `-c <dir>` sets the new session's working directory so
+    /// a fresh shell starts there. `new-session -A` ignores `-c` when the
+    /// session already exists, so reattach/restore paths pass `None`.
+    pub fn spawn_argv(&self, uuid: &str, cwd: Option<&Path>) -> Vec<String> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        vec![
+        let mut argv = vec![
             "tmux".into(),
             "-S".into(),
             self.socket.to_string_lossy().into_owned(),
@@ -297,10 +301,41 @@ impl TmuxCtl {
             self.conf.to_string_lossy().into_owned(),
             "new-session".into(),
             "-A".into(),
-            "-s".into(),
-            format!("{SESSION_PREFIX}{uuid}"),
-            shell,
-        ]
+        ];
+        if let Some(dir) = cwd {
+            argv.push("-c".into());
+            argv.push(dir.to_string_lossy().into_owned());
+        }
+        argv.push("-s".into());
+        argv.push(format!("{SESSION_PREFIX}{uuid}"));
+        argv.push(shell);
+        argv
+    }
+
+    /// The current working directory of a tab's tmux pane, via
+    /// `display-message -p -t ks-<uuid> '#{pane_current_path}'`. An empty
+    /// reply (no such pane) is a `Parse` error rather than a bogus path.
+    pub fn pane_current_path(&self, uuid: &str) -> Result<PathBuf, TmuxError> {
+        let output = Command::new("tmux")
+            .args(["-S", &self.socket.to_string_lossy()])
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{SESSION_PREFIX}{uuid}"),
+                "#{pane_current_path}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(TmuxError::Command(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ));
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return Err(TmuxError::Parse("empty pane_current_path".into()));
+        }
+        Ok(PathBuf::from(path))
     }
 
     /// Argv that starts the private tmux server. When `use_systemd_run` is
@@ -448,6 +483,46 @@ fn is_no_server_stderr(stderr: &str) -> bool {
     stderr.contains("no server running") || stderr.contains("No such file")
 }
 
+/// Parse a `file://` URI (as reported by VTE's `current-directory-uri`) into a
+/// filesystem path: require the `file:` scheme, drop an optional `//hostname`
+/// authority, and percent-decode the path. Any other scheme → `None`.
+pub fn parse_file_uri(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // Drop the authority (hostname) up to the first '/', which begins the path.
+    let path = {
+        let slash = rest.find('/')?;
+        &rest[slash..]
+    };
+    Some(PathBuf::from(percent_decode(path)))
+}
+
+/// Percent-decode a URI path component, leaving malformed escapes untouched.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("kabelsalat"))
 }
@@ -513,7 +588,7 @@ mod tests {
     fn spawn_argv_shape() {
         let dir = temp_dir("argv");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("1234-abcd");
+        let argv = ctl.spawn_argv("1234-abcd", None);
         assert_eq!(argv[0], "tmux");
         assert_eq!(argv[1], "-S");
         assert!(argv[2].ends_with("run/tmux.sock"));
@@ -522,6 +597,54 @@ mod tests {
         assert_eq!(&argv[5..9], ["new-session", "-A", "-s", "ks-1234-abcd"]);
         assert!(!argv[9].is_empty()); // $SHELL or /bin/bash
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_argv_with_cwd_inserts_c_flag() {
+        let dir = temp_dir("argv-cwd");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")));
+        // -c <dir> sits in the new-session portion, before -s, so it only
+        // affects a freshly created session (ignored on reattach).
+        assert_eq!(
+            &argv[5..11],
+            ["new-session", "-A", "-c", "/home/user/proj", "-s", "ks-1234-abcd"]
+        );
+        assert!(!argv[11].is_empty()); // $SHELL or /bin/bash
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_file_uri_plain() {
+        assert_eq!(
+            parse_file_uri("file:///home/user/proj"),
+            Some(PathBuf::from("/home/user/proj"))
+        );
+    }
+
+    #[test]
+    fn parse_file_uri_percent_encoded() {
+        assert_eq!(
+            parse_file_uri("file:///home/user/my%20code%2Fsub"),
+            Some(PathBuf::from("/home/user/my code/sub"))
+        );
+    }
+
+    #[test]
+    fn parse_file_uri_with_hostname() {
+        // VTE emits file://<hostname>/path; the authority is stripped.
+        assert_eq!(
+            parse_file_uri("file://myhost/home/user/proj"),
+            Some(PathBuf::from("/home/user/proj"))
+        );
+    }
+
+    #[test]
+    fn parse_file_uri_rejects_bad_scheme() {
+        assert_eq!(parse_file_uri("http://example.com/x"), None);
+        assert_eq!(parse_file_uri("/home/user/proj"), None);
+        // file:// with an authority but no path has nothing to return.
+        assert_eq!(parse_file_uri("file://myhost"), None);
     }
 
     #[test]
@@ -752,7 +875,7 @@ mod tests {
         }
         let dir = temp_dir("live");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("itest");
+        let argv = ctl.spawn_argv("itest", None);
         // Run detached (-d) instead of attaching a client.
         let status = Command::new(&argv[0])
             .args(&argv[1..6])

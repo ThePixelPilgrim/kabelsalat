@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use relm4::adw;
 use relm4::adw::prelude::{AdwDialogExt, AlertDialogExt};
@@ -494,7 +494,9 @@ impl SimpleComponent for App {
                         if gone {
                             self.close_tab(id);
                         } else if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
-                            spawn_backing(&tab.terminal, &uuid, Some(tmux));
+                            // Reattach: -A ignores -c, and we want the existing
+                            // session's directory anyway, so no cwd.
+                            spawn_backing(&tab.terminal, &uuid, Some(tmux), None);
                         }
                     }
                 } else if gtk::glib::spawn_check_wait_status(status).is_ok() {
@@ -668,6 +670,7 @@ impl App {
                 tab.group,
                 Some(tab.title.clone()),
                 dead_exit(&tab.uuid),
+                None,
                 sender,
             );
         }
@@ -686,6 +689,7 @@ impl App {
                     gid,
                     Some(title),
                     orphan.dead_exit,
+                    None,
                     sender,
                 );
             }
@@ -942,10 +946,31 @@ impl App {
     }
 
     /// Fresh user-initiated tab: new UUID, backing session spawned, activated.
+    /// The new shell inherits the working directory of the tab that is active
+    /// right now — captured before `activate` moves focus to the new tab.
     fn open_tab(&mut self, group: usize, sender: &ComponentSender<Self>) {
+        let cwd = self.active_tab_cwd();
         let uuid = gtk::glib::uuid_string_random().to_string();
-        let id = self.add_tab(uuid, group, None, None, sender);
+        let id = self.add_tab(uuid, group, None, None, cwd.as_deref(), sender);
         self.activate(id);
+    }
+
+    /// Working directory of the currently active tab, for seeding a new tab.
+    /// Prefers tmux's `pane_current_path`; falls back to the VTE terminal's
+    /// `current-directory-uri` when there is no tmux backing. Any failure —
+    /// no active tab, a tmux/parse error, or a directory that no longer
+    /// exists — yields `None`, so the new shell simply starts in `$HOME`.
+    fn active_tab_cwd(&self) -> Option<PathBuf> {
+        let tab = self.active_tab()?;
+        let path = match &self.tmux {
+            Some(ctl) => ctl.pane_current_path(&tab.uuid).ok()?,
+            None => {
+                #[allow(deprecated)] // successor termprop API needs VTE >= 0.78 feature gates
+                let uri = tab.terminal.current_directory_uri()?;
+                tmuxctl::parse_file_uri(&uri)?
+            }
+        };
+        path.is_dir().then_some(path)
     }
 
     /// Create a tab backed by `uuid` (spawning its tmux session, or a direct
@@ -957,6 +982,7 @@ impl App {
         group: usize,
         title: Option<String>,
         crashed: Option<i32>,
+        cwd: Option<&Path>,
         sender: &ComponentSender<Self>,
     ) -> usize {
         // Fallback scrolling off: tmux keeps VTE permanently in the alternate
@@ -969,7 +995,7 @@ impl App {
             .enable_fallback_scrolling(false)
             .build();
         apply_scheme(&terminal, self.style.is_dark());
-        spawn_backing(&terminal, &uuid, self.tmux.as_ref());
+        spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd);
 
         attach_drag_hint(&terminal, sender);
 
@@ -1025,7 +1051,7 @@ impl App {
                     return;
                 }
             }
-            None => spawn_shell(&terminal),
+            None => spawn_shell(&terminal, None),
         }
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.crashed = None;
@@ -1748,12 +1774,12 @@ fn decode_exit(status: i32) -> i32 {
 
 /// Spawn a tab's backing process: the tmux client for its session when tmux is
 /// available (`new-session -A` attaches or creates), else a direct $SHELL.
-fn spawn_backing(terminal: &Terminal, uuid: &str, tmux: Option<&TmuxCtl>) {
+fn spawn_backing(terminal: &Terminal, uuid: &str, tmux: Option<&TmuxCtl>, cwd: Option<&Path>) {
     let Some(ctl) = tmux else {
-        spawn_shell(terminal);
+        spawn_shell(terminal, cwd);
         return;
     };
-    let argv = ctl.spawn_argv(uuid);
+    let argv = ctl.spawn_argv(uuid, cwd);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     terminal.spawn_async(
         PtyFlags::DEFAULT,
@@ -1772,11 +1798,12 @@ fn spawn_backing(terminal: &Terminal, uuid: &str, tmux: Option<&TmuxCtl>) {
     );
 }
 
-fn spawn_shell(terminal: &Terminal) {
+fn spawn_shell(terminal: &Terminal, cwd: Option<&Path>) {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let working_dir = cwd.map(|p| p.to_string_lossy().into_owned());
     terminal.spawn_async(
         PtyFlags::DEFAULT,
-        None,
+        working_dir.as_deref(),
         &[&shell],
         &[],
         gtk::glib::SpawnFlags::DEFAULT,
