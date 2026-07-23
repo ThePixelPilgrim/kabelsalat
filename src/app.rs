@@ -536,11 +536,15 @@ impl SimpleComponent for App {
                 self.show_select_help();
                 return;
             }
+            // Title changes arrive at animation rate from some programs
+            // (spinners/progress in the title). Rebuilding the sidebar and
+            // tab bar per change kept the main thread busy and replaced the
+            // very buttons a click was landing on, swallowing the click. So:
+            // touch only the affected labels, and early-return to skip the
+            // state-file write — the next layout mutation persists the title.
             Msg::TitleChanged(id, title) => {
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
-                    tab.title = title;
-                    self.rebuild_list();
-                }
+                self.update_title(id, title);
+                return;
             }
             Msg::MoveTabPicker => self.show_group_picker(PickerMode::Move),
             Msg::MoveTabTo(target) => self.move_active_tab(target),
@@ -1348,6 +1352,104 @@ impl App {
         });
     }
 
+    /// Apply a title change by mutating the existing labels instead of
+    /// rebuilding the sidebar and tab bar. Rebuilding tears down every row,
+    /// button, and drag controller — per title change, at whatever rate the
+    /// running program emits OSC titles — which stalls the main loop and
+    /// destroys buttons mid-click (press on the old widget, release over its
+    /// replacement: no click). Label mutation is cheap, and GTK's frame clock
+    /// coalesces any number of them into one paint per frame.
+    fn update_title(&mut self, id: usize, title: String) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if tab.title == title {
+            return;
+        }
+        tab.title = title;
+        let tab = self.tabs.iter().find(|t| t.id == id).unwrap();
+        self.refresh_sidebar_label(tab);
+        self.refresh_tab_bar_label(tab);
+    }
+
+    /// Update the sidebar row that displays `tab`, if any: its own row when
+    /// its group is expanded, the group's representative row when collapsed
+    /// (and only if `tab` is that representative — otherwise it isn't shown).
+    fn refresh_sidebar_label(&self, tab: &Tab) {
+        let (row_name, text) = if Some(tab.group) == self.active_group() {
+            (
+                tab.id.to_string(),
+                row_label_text(&tab.title, tab.crashed, None),
+            )
+        } else {
+            let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == tab.group).collect();
+            let last_active = self
+                .groups
+                .iter()
+                .find(|g| g.id == tab.group)
+                .map(|g| g.last_active);
+            let representative = members
+                .iter()
+                .find(|t| Some(t.id) == last_active)
+                .unwrap_or(&members[0]);
+            if representative.id != tab.id {
+                return;
+            }
+            (
+                tab.id.to_string(),
+                row_label_text(&tab.title, tab.crashed, Some(members.len())),
+            )
+        };
+        let mut i = 0;
+        while let Some(row) = self.tab_list.row_at_index(i) {
+            if row.widget_name() == row_name {
+                // Row structure per make_row: ListBoxRow > Box > [Label, ...].
+                if let Some(label) = row
+                    .child()
+                    .and_then(|b| b.first_child())
+                    .and_then(|w| w.downcast::<gtk::Label>().ok())
+                {
+                    label.set_label(&text);
+                }
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Update `tab`'s button in the horizontal tab bar, which mirrors the
+    /// active group in member order (rebuild_tab_bar appends one button per
+    /// member). Hidden or foreign-group bars simply walk to nothing.
+    fn refresh_tab_bar_label(&self, tab: &Tab) {
+        if Some(tab.group) != self.active_group() {
+            return;
+        }
+        let Some(index) = self
+            .tabs
+            .iter()
+            .filter(|t| t.group == tab.group)
+            .position(|t| t.id == tab.id)
+        else {
+            return;
+        };
+        let mut child = self.tab_bar.first_child();
+        for _ in 0..index {
+            child = child.and_then(|c| c.next_sibling());
+        }
+        let Some(button) = child.and_then(|c| c.downcast::<gtk::Button>().ok()) else {
+            return;
+        };
+        button.set_tooltip_text(Some(&tab.title));
+        if let Some(label) = button
+            .child()
+            .and_then(|w| w.downcast::<gtk::Label>().ok())
+        {
+            let active = self.active == Some(tab.id);
+            label.set_width_chars(tab_label_min_chars(tab.title.chars().count(), active));
+            label.set_label(&tab.title);
+        }
+    }
+
     /// A group header row: a drag handle plus the group's name, or a muted
     /// placeholder title for unnamed groups. The whole row is a drag source
     /// (reorders the group) and a drop target (accepts a group to reorder, or
@@ -1416,10 +1518,7 @@ impl App {
         group: &Group,
         collapsed_count: Option<usize>,
     ) -> gtk::ListBoxRow {
-        let label = match collapsed_count {
-            Some(n) => format!("{} ({n})", tab.title),
-            None => crashed_tab_label(&tab.title, tab.crashed),
-        };
+        let label = row_label_text(&tab.title, tab.crashed, collapsed_count);
         let row_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -1627,6 +1726,17 @@ fn crashed_tab_label(title: &str, crashed: Option<i32>) -> String {
         Some(code) if code < 0 => format!("{title} [exit ?]"),
         Some(code) => format!("{title} [exit {code}]"),
         None => title.to_string(),
+    }
+}
+
+/// Text of a sidebar row for a tab: the crash-marked title when the row is
+/// one tab of the expanded group, or "title (n)" when the row stands in for
+/// a collapsed group of n tabs. Shared by row construction and the in-place
+/// title update so the two can never drift apart.
+fn row_label_text(title: &str, crashed: Option<i32>, collapsed_count: Option<usize>) -> String {
+    match collapsed_count {
+        Some(n) => format!("{title} ({n})"),
+        None => crashed_tab_label(title, crashed),
     }
 }
 
@@ -1971,6 +2081,21 @@ mod tests {
     #[test]
     fn label_not_crashed_is_plain_title() {
         assert_eq!(crashed_tab_label("bash", None), "bash");
+    }
+
+    // --- sidebar row label text ------------------------------------------
+
+    #[test]
+    fn expanded_row_shows_title_with_crash_marker() {
+        assert_eq!(row_label_text("bash", Some(3), None), "bash [exit 3]");
+        assert_eq!(row_label_text("bash", None, None), "bash");
+    }
+
+    #[test]
+    fn collapsed_row_shows_title_with_count() {
+        // A collapsed group's row shows its member count, never the crash
+        // marker (the representative stands in for the whole group).
+        assert_eq!(row_label_text("bash", Some(3), Some(4)), "bash (4)");
     }
 
     // --- finding 5: pane-died event-file parsing ------------------------
