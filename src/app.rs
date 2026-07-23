@@ -869,12 +869,18 @@ impl App {
         let mut first_row: Option<gtk::ListBoxRow> = None;
         for group in self.groups.iter().filter(|g| g.id != current_group) {
             let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == group.id).collect();
-            let representative = members
-                .iter()
-                .find(|t| t.id == group.last_active)
-                .unwrap_or(&members[0]);
+            let name = if group.name.is_empty() {
+                // unnamed group: fall back to its last-active tab's title
+                &members
+                    .iter()
+                    .find(|t| t.id == group.last_active)
+                    .unwrap_or(&members[0])
+                    .title
+            } else {
+                &group.name
+            };
             let label = gtk::Label::builder()
-                .label(format!("{} ({})", representative.title, members.len()))
+                .label(format!("{} ({})", name, members.len()))
                 .halign(gtk::Align::Start)
                 .margin_start(6)
                 .build();
