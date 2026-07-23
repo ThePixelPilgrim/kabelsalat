@@ -150,6 +150,16 @@ pub enum Msg {
         src: usize,
         dest: usize,
     },
+    /// Reorder groups: move group `src` to sit before group `dest`.
+    DropGroup {
+        src: usize,
+        dest: usize,
+    },
+    /// Move tab `src` into `group`, appended at the end of its tabs.
+    DropTabOnGroup {
+        src: usize,
+        group: usize,
+    },
     RenameDialog,
     RenameGroup(usize, String),
     NavNext,
@@ -553,6 +563,8 @@ impl SimpleComponent for App {
                 }
             }
             Msg::DropTab { src, dest } => self.drop_tab(src, dest),
+            Msg::DropGroup { src, dest } => self.drop_group(src, dest),
+            Msg::DropTabOnGroup { src, group } => self.drop_tab_on_group(src, group),
             Msg::RenameDialog => self.show_rename_dialog(),
             Msg::RenameGroup(id, name) => {
                 if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
@@ -1120,6 +1132,45 @@ impl App {
         self.rebuild_list();
     }
 
+    /// Reorder groups by drag-and-drop: move `src` before `dest`. The render
+    /// order is `self.groups` order, so reordering it persists via save_state.
+    fn drop_group(&mut self, src: usize, dest: usize) {
+        let mut order: Vec<usize> = self.groups.iter().map(|g| g.id).collect();
+        reorder_groups(&mut order, src, dest);
+        // Stable sort by the new position; a no-op reorder leaves it untouched.
+        self.groups
+            .sort_by_key(|g| order.iter().position(|&id| id == g.id).unwrap());
+        self.rebuild_list();
+    }
+
+    /// Drop a tab onto a group header: move it into that group, appended after
+    /// the group's current last member. Mirrors drop_tab's last_active and
+    /// empty-group cleanup so both drop paths leave the model consistent.
+    fn drop_tab_on_group(&mut self, src: usize, group: usize) {
+        let Some(si) = self.tabs.iter().position(|t| t.id == src) else {
+            return;
+        };
+        if !self.groups.iter().any(|g| g.id == group) {
+            return;
+        }
+        let mut tab = self.tabs.remove(si);
+        tab.group = group;
+        let insert_at = self
+            .tabs
+            .iter()
+            .rposition(|t| t.group == group)
+            .map_or(self.tabs.len(), |p| p + 1);
+        self.tabs.insert(insert_at, tab);
+        if self.active == Some(src)
+            && let Some(group) = self.groups.iter_mut().find(|g| g.id == group)
+        {
+            group.last_active = src;
+        }
+        self.groups
+            .retain(|g| self.tabs.iter().any(|t| t.group == g.id));
+        self.rebuild_list();
+    }
+
     /// Jump to the first tab of the next/previous group, wrapping around.
     fn navigate_group(&mut self, step: isize) {
         let Some(current) = self.active_group() else {
@@ -1149,19 +1200,7 @@ impl App {
             if members.is_empty() {
                 continue;
             }
-            if !group.name.is_empty() {
-                let label = gtk::Label::builder()
-                    .label(&group.name)
-                    .halign(gtk::Align::Start)
-                    .build();
-                let header = gtk::ListBoxRow::builder()
-                    .child(&label)
-                    .selectable(false)
-                    .activatable(false)
-                    .build();
-                header.add_css_class("group-header");
-                self.tab_list.append(&header);
-            }
+            self.tab_list.append(&self.make_group_header(group));
             if Some(group.id) == active_group {
                 for tab in &members {
                     self.tab_list.append(&self.make_row(tab, group, None));
@@ -1289,6 +1328,68 @@ impl App {
         });
     }
 
+    /// A group header row: a drag handle plus the group's name, or a muted
+    /// placeholder title for unnamed groups. The whole row is a drag source
+    /// (reorders the group) and a drop target (accepts a group to reorder, or
+    /// a tab to move into this group).
+    fn make_group_header(&self, group: &Group) -> gtk::ListBoxRow {
+        let (title, named) = if group.name.is_empty() {
+            // ids are 1-based, so the id doubles as a stable group number.
+            (format!("Tab group {}", group.id), false)
+        } else {
+            (group.name.clone(), true)
+        };
+
+        let row_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(6)
+            .build();
+        // The symbolic handle may be absent in a sparse icon theme; fall back
+        // to a menu glyph so the affordance never renders as a broken image.
+        let handle_icon = if gtk::IconTheme::default().has_icon("list-drag-handle-symbolic") {
+            "list-drag-handle-symbolic"
+        } else {
+            "open-menu-symbolic"
+        };
+        row_box.append(&gtk::Image::from_icon_name(handle_icon));
+        row_box.append(
+            &gtk::Label::builder()
+                .label(&title)
+                .halign(gtk::Align::Start)
+                .build(),
+        );
+
+        let header = gtk::ListBoxRow::builder()
+            .child(&row_box)
+            .selectable(false)
+            .activatable(false)
+            .build();
+        header.add_css_class("group-header");
+        header.add_css_class(group.css);
+        if !named {
+            header.add_css_class("group-header-placeholder");
+        }
+
+        let drag = gtk::DragSource::builder()
+            .actions(gtk::gdk::DragAction::MOVE)
+            .build();
+        let src_group = group.id;
+        drag.connect_prepare(move |_, _, _| {
+            Some(gtk::gdk::ContentProvider::for_value(
+                &format!("group:{src_group}").to_value(),
+            ))
+        });
+        header.add_controller(drag);
+
+        let drop = gtk::DropTarget::new(gtk::glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        let target = SidebarDropTarget::Header { group: group.id };
+        let input = self.input.clone();
+        drop.connect_drop(move |_, value, _, _| dispatch_sidebar_drop(&input, value, target));
+        header.add_controller(drop);
+
+        header
+    }
+
     fn make_row(
         &self,
         tab: &Tab,
@@ -1353,22 +1454,18 @@ impl App {
         let src_id = tab.id;
         drag.connect_prepare(move |_, _, _| {
             Some(gtk::gdk::ContentProvider::for_value(
-                &src_id.to_string().to_value(),
+                &format!("tab:{src_id}").to_value(),
             ))
         });
         row.add_controller(drag);
 
         let drop = gtk::DropTarget::new(gtk::glib::Type::STRING, gtk::gdk::DragAction::MOVE);
-        let dest_id = tab.id;
+        let target = SidebarDropTarget::Tab {
+            tab: tab.id,
+            group: group.id,
+        };
         let input = self.input.clone();
-        drop.connect_drop(move |_, value, _, _| {
-            let Ok(src) = value.get::<String>() else {
-                return false;
-            };
-            let Ok(src) = src.parse() else { return false };
-            let _ = input.send(Msg::DropTab { src, dest: dest_id });
-            true
-        });
+        drop.connect_drop(move |_, value, _, _| dispatch_sidebar_drop(&input, value, target));
         row.add_controller(drop);
 
         row
@@ -1435,6 +1532,62 @@ impl App {
         dialog.add_response("close", "Close");
         dialog.present(Some(&self.window));
     }
+}
+
+/// Which sidebar row a drop landed on. A tab row can host a tab (reorder) or a
+/// group (reorder groups); a header can host a tab (move into the group) or a
+/// group (reorder groups).
+#[derive(Debug, Clone, Copy)]
+enum SidebarDropTarget {
+    Tab { tab: usize, group: usize },
+    Header { group: usize },
+}
+
+/// Parse a namespaced sidebar DnD payload ("tab:<id>" / "group:<id>") and send
+/// the message appropriate to where it was dropped. Returns whether the drop
+/// was accepted. A missing prefix or unparsable id is rejected.
+fn dispatch_sidebar_drop(
+    input: &relm4::Sender<Msg>,
+    value: &gtk::glib::Value,
+    target: SidebarDropTarget,
+) -> bool {
+    let Ok(payload) = value.get::<String>() else {
+        return false;
+    };
+    let Some((kind, id)) = payload.split_once(':') else {
+        return false;
+    };
+    let Ok(src) = id.parse::<usize>() else {
+        return false;
+    };
+    let msg = match (kind, target) {
+        ("tab", SidebarDropTarget::Tab { tab, .. }) => Msg::DropTab { src, dest: tab },
+        ("tab", SidebarDropTarget::Header { group }) => Msg::DropTabOnGroup { src, group },
+        ("group", SidebarDropTarget::Tab { group, .. } | SidebarDropTarget::Header { group }) => {
+            Msg::DropGroup { src, dest: group }
+        }
+        _ => return false,
+    };
+    let _ = input.send(msg);
+    true
+}
+
+/// Reorder a list of group ids by removing `src` and reinserting it immediately
+/// before `dest`. A no-op when src == dest or either id is absent. Pure so the
+/// reorder can be tested without GTK widgets.
+fn reorder_groups(order: &mut Vec<usize>, src: usize, dest: usize) {
+    if src == dest {
+        return;
+    }
+    let Some(si) = order.iter().position(|&id| id == src) else {
+        return;
+    };
+    let id = order.remove(si);
+    let Some(di) = order.iter().position(|&d| d == dest) else {
+        order.insert(si, id); // dest vanished; leave order unchanged
+        return;
+    };
+    order.insert(di, id);
 }
 
 /// Whether a `list-sessions` result *definitively* proves the tab's backing
@@ -1754,6 +1907,38 @@ mod tests {
     #[test]
     fn hint_fires_exactly_at_threshold() {
         assert!(should_hint(DRAG_THRESHOLD_PX, ModifierType::empty(), false));
+    }
+
+    // --- group reorder (drag-and-drop) ----------------------------------
+
+    #[test]
+    fn reorder_moves_src_before_dest() {
+        let mut order = vec![1, 2, 3, 4];
+        reorder_groups(&mut order, 4, 2);
+        assert_eq!(order, [1, 4, 2, 3]);
+    }
+
+    #[test]
+    fn reorder_earlier_before_later() {
+        let mut order = vec![1, 2, 3, 4];
+        reorder_groups(&mut order, 1, 3);
+        assert_eq!(order, [2, 1, 3, 4]);
+    }
+
+    #[test]
+    fn reorder_same_is_noop() {
+        let mut order = vec![1, 2, 3];
+        reorder_groups(&mut order, 2, 2);
+        assert_eq!(order, [1, 2, 3]);
+    }
+
+    #[test]
+    fn reorder_missing_id_is_noop() {
+        let mut order = vec![1, 2, 3];
+        reorder_groups(&mut order, 9, 2);
+        assert_eq!(order, [1, 2, 3]);
+        reorder_groups(&mut order, 2, 9);
+        assert_eq!(order, [1, 2, 3]);
     }
 
     // --- finding 1: session-gone decision -------------------------------

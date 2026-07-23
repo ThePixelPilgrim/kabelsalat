@@ -30,6 +30,7 @@ pub fn run() {
          button.group-c5 { border-bottom-color: #986a44; }
          row.group-header { min-height: 0; padding-top: 1px; padding-bottom: 1px; background: alpha(currentColor, 0.08); }
          row.group-header label { font-size: 0.75em; font-weight: bold; opacity: 0.6; margin-left: 6px; }
+         row.group-header-placeholder label { font-weight: normal; font-style: italic; opacity: 0.35; }
          .group-c0 { border-left: 4px solid #3584e4; }
          .group-c1 { border-left: 4px solid #33d17a; }
          .group-c2 { border-left: 4px solid #ff7800; }
