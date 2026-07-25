@@ -12,6 +12,7 @@ use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
 use crate::browser::{self, Browser, ProfileDisposition};
+use crate::control;
 use crate::state::{self, SavedGroup, SavedState, SavedTab};
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
 
@@ -255,6 +256,17 @@ pub enum Msg {
     PollBrowsers,
     /// Restart restore: bring up this group's browser, then queue the next.
     RestoreBrowser(usize),
+    /// A `kabelsalat run` invocation: create a tab in the group with this
+    /// uuid, running `argv` in `cwd`. Deliberately inert otherwise — it does
+    /// not activate the tab, raise the window, change the active group, or
+    /// touch the group's browser pane, because the user may be typing
+    /// somewhere else when an agent fires this.
+    SpawnCommand {
+        group_uuid: String,
+        tab_uuid: String,
+        cwd: PathBuf,
+        argv: Vec<String>,
+    },
 }
 
 #[relm4::component(pub)]
@@ -589,6 +601,7 @@ impl SimpleComponent for App {
             }
         }
 
+        control::register(sender.input_sender().clone());
         // `restore_or_fresh` runs `start_browser_maintenance` itself, on both
         // of its exits, *before* it persists — otherwise that first save would
         // write browser_open=false for every restored group (no `Browser` yet,
@@ -740,6 +753,39 @@ impl SimpleComponent for App {
                 for tab in &self.tabs {
                     apply_scheme(&tab.terminal, self.style.is_dark());
                 }
+            }
+            Msg::SpawnCommand {
+                group_uuid,
+                tab_uuid,
+                cwd,
+                argv,
+            } => {
+                // The snapshot the CLI validated against is a copy, so the
+                // group can in principle be gone by the time this arrives.
+                let Some(group_id) = self
+                    .groups
+                    .iter()
+                    .find(|g| g.uuid == group_uuid)
+                    .map(|g| g.id)
+                else {
+                    eprintln!("spawn request for unknown group {group_uuid}");
+                    return;
+                };
+                let title = crate::cli::command_title(&argv);
+                self.add_tab(
+                    tab_uuid,
+                    group_id,
+                    Some(title),
+                    None,
+                    Some(&cwd),
+                    Some(&argv),
+                    &sender,
+                );
+                // add_tab alone leaves the sidebar stale; the usual funnel for
+                // that is activate(), which we deliberately do not call. The
+                // bottom-of-update save_state() below still runs, since this
+                // arm does not return early.
+                self.rebuild_list();
             }
         }
         // Every layout mutation persists; writes are atomic and human-paced.
@@ -984,6 +1030,19 @@ impl App {
             linger_warning_dismissed: self.linger_dismissed,
         };
         self.persist(&state);
+        // Same choke point as the save, so the CLI always sees what was last
+        // written rather than a separately maintained copy.
+        control::publish(
+            state
+                .groups
+                .iter()
+                .map(|g| crate::cli::GroupInfo {
+                    uuid: g.uuid.clone(),
+                    name: g.name.clone(),
+                    tabs: state.tabs.iter().filter(|t| t.group == g.id).count(),
+                })
+                .collect(),
+        );
     }
 
     /// Write `state` to disk and account for the outcome. A success clears
