@@ -279,9 +279,11 @@ Manual verification, since none of the D-Bus path is unit-testable:
 
 ## Risks
 
-- `RelmApp::from_app` does not call `relm4::init()` the way `RelmApp::new` does.
-  The implementation must confirm initialisation still happens (call
-  `relm4::init()` explicitly if needed) or the GUI path breaks.
+- `RelmApp::from_app` does not call relm4's `init()` the way `RelmApp::new`
+  does, and that function is private, so the GUI path must call `gtk::init()`
+  and `adw::init()` itself before `set_global_css` builds a `CssProvider`.
+  Only on that path: constructing the `adw::Application` needs no display, so
+  a subcommand still works without one.
 - Setting `HANDLES_COMMAND_LINE` changes activation semantics for the existing
   plain-launch path. Manual check 6 exists specifically to catch a regression
   there.
