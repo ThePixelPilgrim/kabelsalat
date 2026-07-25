@@ -1492,6 +1492,10 @@ impl App {
     /// the new tab id. `title = None` uses the default "Terminal N".
     /// `command = None` starts an interactive shell; `Some(argv)` runs that
     /// instead, which is what `kabelsalat run` uses.
+    // Each parameter represents an independent fact about the tab being created.
+    // Bundling them into a struct would add indirection at only three call sites
+    // without improving clarity of intent.
+    #[allow(clippy::too_many_arguments)]
     fn add_tab(
         &mut self,
         uuid: String,
