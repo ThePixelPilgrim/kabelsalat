@@ -2477,7 +2477,7 @@ fn spawn_backing(terminal: &Terminal, uuid: &str, tmux: Option<&TmuxCtl>, cwd: O
         spawn_shell(terminal, cwd);
         return;
     };
-    let argv = ctl.spawn_argv(uuid, cwd);
+    let argv = ctl.spawn_argv(uuid, cwd, None);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     terminal.spawn_async(
         PtyFlags::DEFAULT,

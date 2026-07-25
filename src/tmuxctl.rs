@@ -286,13 +286,23 @@ impl TmuxCtl {
     }
 
     /// Argv for spawning (or reattaching) the backing session of a tab:
-    /// `tmux -S <sock> -f <conf> new-session -A [-c <cwd>] -s ks-<uuid> $SHELL`.
+    /// `tmux -S <sock> -f <conf> new-session -A [-c <cwd>] -s ks-<uuid> <cmd>`,
+    /// where `<cmd>` is `$SHELL` unless `command` overrides it.
     ///
     /// When `cwd` is set, `-c <dir>` sets the new session's working directory so
     /// a fresh shell starts there. `new-session -A` ignores `-c` when the
     /// session already exists, so reattach/restore paths pass `None`.
-    pub fn spawn_argv(&self, uuid: &str, cwd: Option<&Path>) -> Vec<String> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    ///
+    /// `command` is what `kabelsalat run` passes. It arrives as argv but tmux
+    /// wants a single shell-command string, so it is quoted and joined here
+    /// rather than handed to tmux as separate words (tmux would re-join them
+    /// on spaces and lose the original boundaries).
+    pub fn spawn_argv(
+        &self,
+        uuid: &str,
+        cwd: Option<&Path>,
+        command: Option<&[String]>,
+    ) -> Vec<String> {
         let mut argv = vec![
             "tmux".into(),
             "-S".into(),
@@ -308,7 +318,10 @@ impl TmuxCtl {
         }
         argv.push("-s".into());
         argv.push(format!("{SESSION_PREFIX}{uuid}"));
-        argv.push(shell);
+        argv.push(match command {
+            Some(command) if !command.is_empty() => shell_quote_argv(command),
+            _ => std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()),
+        });
         argv
     }
 
@@ -525,6 +538,29 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Join argv into the single shell-command string tmux expects, quoting every
+/// word so spaces, quotes, `$` and `;` reach the program instead of the shell.
+pub(crate) fn shell_quote_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// POSIX single-quote a word: wrap it, and end/escape/reopen for each `'`.
+/// Words made only of characters no shell treats specially are left bare so
+/// the common case stays readable in `tmux list-panes` output.
+fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(&b));
+    if safe {
+        return word.to_string();
+    }
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
 fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("kabelsalat"))
 }
@@ -590,7 +626,7 @@ mod tests {
     fn spawn_argv_shape() {
         let dir = temp_dir("argv");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("1234-abcd", None);
+        let argv = ctl.spawn_argv("1234-abcd", None, None);
         assert_eq!(argv[0], "tmux");
         assert_eq!(argv[1], "-S");
         assert!(argv[2].ends_with("run/tmux.sock"));
@@ -605,7 +641,7 @@ mod tests {
     fn spawn_argv_with_cwd_inserts_c_flag() {
         let dir = temp_dir("argv-cwd");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")));
+        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")), None);
         // -c <dir> sits in the new-session portion, before -s, so it only
         // affects a freshly created session (ignored on reattach).
         assert_eq!(
@@ -620,6 +656,62 @@ mod tests {
             ]
         );
         assert!(!argv[11].is_empty()); // $SHELL or /bin/bash
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_argv_with_a_command_replaces_the_shell() {
+        let dir = temp_dir("argv-cmd");
+        let ctl = test_ctl(&dir);
+        let command = vec![
+            "claude".to_string(),
+            "--model".to_string(),
+            "opus".to_string(),
+        ];
+        let argv = ctl.spawn_argv("1234-abcd", None, Some(&command));
+        assert_eq!(&argv[5..9], ["new-session", "-A", "-s", "ks-1234-abcd"]);
+        assert_eq!(argv[9], "claude --model opus");
+        assert_eq!(argv.len(), 10);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_quoting_survives_spaces_quotes_and_expansion() {
+        // tmux hands the string to sh, so anything the shell would interpret
+        // has to be quoted here or the command silently changes meaning.
+        assert_eq!(shell_quote_argv(&["ls".to_string()]), "ls");
+        assert_eq!(
+            shell_quote_argv(&["echo".to_string(), "two words".to_string()]),
+            "echo 'two words'"
+        );
+        assert_eq!(
+            shell_quote_argv(&["echo".to_string(), "$HOME".to_string()]),
+            "echo '$HOME'"
+        );
+        assert_eq!(
+            shell_quote_argv(&["echo".to_string(), "it's".to_string()]),
+            r#"echo 'it'\''s'"#
+        );
+        assert_eq!(
+            shell_quote_argv(&["echo".to_string(), "a;rm -rf /".to_string()]),
+            "echo 'a;rm -rf /'"
+        );
+        assert_eq!(shell_quote_argv(&["".to_string()]), "''");
+        assert_eq!(
+            shell_quote_argv(&["/usr/bin/env".to_string(), "PATH=/x:/y".to_string()]),
+            "/usr/bin/env PATH=/x:/y"
+        );
+    }
+
+    #[test]
+    fn spawn_argv_without_a_command_is_unchanged() {
+        // Regression guard: the GUI's own new-tab path must keep spawning $SHELL.
+        let dir = temp_dir("argv-nocmd");
+        let ctl = test_ctl(&dir);
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let argv = ctl.spawn_argv("1234-abcd", None, None);
+        assert_eq!(argv[9], shell);
+        assert_eq!(ctl.spawn_argv("1234-abcd", None, Some(&[])), argv);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -884,7 +976,7 @@ mod tests {
         }
         let dir = temp_dir("live");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("itest", None);
+        let argv = ctl.spawn_argv("itest", None, None);
         // Run detached (-d) instead of attaching a client.
         let status = Command::new(&argv[0])
             .args(&argv[1..6])
