@@ -12,8 +12,13 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use relm4::adw;
+use relm4::gtk::gio;
+use relm4::gtk::glib;
+use relm4::gtk::prelude::*;
+
 use crate::app::Msg;
-use crate::cli::{GroupInfo, SpawnRequest};
+use crate::cli::{self, Cli, GroupInfo, SpawnRequest};
 
 struct Control {
     groups: Arc<Mutex<Vec<GroupInfo>>>,
@@ -68,13 +73,6 @@ pub fn request_spawn(request: SpawnRequest, tab_uuid: String) -> bool {
         .is_ok()
 }
 
-use relm4::adw;
-use relm4::gtk::gio;
-use relm4::gtk::gio::prelude::*;
-use relm4::gtk::glib;
-
-use crate::cli::{self, Cli};
-
 /// Handle one invocation — the local one on a plain GUI start, or a remote
 /// one forwarded over the session bus by a second launch of the binary.
 ///
@@ -121,7 +119,9 @@ pub fn handle_command_line(
 
     if let Some(request) = outcome.spawn {
         // The tab's uuid is minted here, where glib is available, and echoed
-        // so the caller has a token proving the tab was created.
+        // so the caller has the identity of the requested tab to correlate
+        // with — not a guarantee it was created; request_spawn only queues
+        // the message on the relm4 channel.
         let tab_uuid = glib::uuid_string_random().to_string();
         if !request_spawn(request, tab_uuid.clone()) {
             command_line.printerr_literal("kabelsalat: no window to spawn into\n");

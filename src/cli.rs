@@ -90,7 +90,7 @@ pub fn help_text() -> &'static str {
     "kabelsalat — terminal groups with crash-safe tmux sessions
 
 Usage:
-  kabelsalat                                   Start or raise the GUI
+  kabelsalat                                   Start the GUI, or activate the running instance
   kabelsalat groups                            List groups: uuid, name, tab count
   kabelsalat run -g <group> [--cwd DIR] -- CMD [ARGS...]
                                                Run CMD in a new tab of <group>

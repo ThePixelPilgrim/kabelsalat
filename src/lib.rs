@@ -1,6 +1,7 @@
 use relm4::RelmApp;
 use relm4::adw;
 use relm4::gtk::gio;
+use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 mod app;
@@ -11,6 +12,41 @@ pub mod state;
 pub mod tmuxctl;
 
 pub const APP_ID: &str = "de.nereide.kabelsalat";
+
+/// Whether some process already owns `APP_ID` on the session bus.
+///
+/// This is a direct `org.freedesktop.DBus.NameHasOwner` call, not
+/// `app.register()` followed by `app.is_remote()`. Registering has a side
+/// effect: if nobody else owns the name yet, registering makes *this*
+/// process the primary instance, which fires `GtkApplication`'s `startup`
+/// signal, which calls `gtk_init()`. `gtk_init()` fails hard when there is no
+/// display — it prints `Gtk-WARNING: Failed to open display` and calls
+/// `exit(1)` from inside GTK, before our own "not running" message ever gets
+/// a chance to print. A bus query never touches GTK, so it is safe to run
+/// before we know whether a display exists at all (ssh session, tty, systemd
+/// user unit, ...). Do not "simplify" this back to register()/is_remote().
+fn instance_is_running() -> Result<bool, String> {
+    let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+        .map_err(|err| err.to_string())?;
+    let args = glib::Variant::tuple_from_iter([APP_ID.to_variant()]);
+    let reply = bus
+        .call_sync(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "NameHasOwner",
+            Some(&args),
+            None,
+            gio::DBusCallFlags::NONE,
+            -1,
+            gio::Cancellable::NONE,
+        )
+        .map_err(|err| err.to_string())?;
+    reply
+        .child_value(0)
+        .get::<bool>()
+        .ok_or_else(|| "unexpected reply to NameHasOwner".to_string())
+}
 
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
@@ -39,16 +75,28 @@ pub fn run() {
     app.connect_command_line(control::handle_command_line);
 
     if parsed.needs_instance() {
-        // A subcommand must never start a GUI. Registering tells us whether
-        // somebody else already owns the name: if not, we are alone and there
-        // is nothing to talk to, so bail out before `startup` builds a window.
-        if app.register(gio::Cancellable::NONE).is_err() || !app.is_remote() {
-            eprintln!("kabelsalat: not running");
-            std::process::exit(cli::EXIT_NOT_RUNNING.into());
+        // A subcommand must never start a GUI. See instance_is_running for why
+        // this is a bus query rather than app.register()/app.is_remote().
+        match instance_is_running() {
+            Ok(true) => {
+                // RelmApp::run drops this exit code, so drive the application
+                // directly. run_with_args registers as a remote instance
+                // itself and forwards the command line to the primary one.
+                let code = app.run_with_args(&args);
+                std::process::exit(code.get().into());
+            }
+            Ok(false) => {
+                eprintln!("kabelsalat: not running");
+                std::process::exit(cli::EXIT_NOT_RUNNING.into());
+            }
+            Err(err) => {
+                // Bus unreachable, call failed, or reply undecodable — either
+                // way there is nobody to talk to, but say why so a broken bus
+                // is distinguishable from nothing running.
+                eprintln!("kabelsalat: not running ({err})");
+                std::process::exit(cli::EXIT_NOT_RUNNING.into());
+            }
         }
-        // RelmApp::run drops this exit code, so drive the application directly.
-        let code = app.run_with_args(&args);
-        std::process::exit(code.get().into());
     }
 
     // RelmApp::new calls relm4's private init(); from_app does not, and
