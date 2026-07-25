@@ -68,6 +68,71 @@ pub fn request_spawn(request: SpawnRequest, tab_uuid: String) -> bool {
         .is_ok()
 }
 
+use relm4::adw;
+use relm4::gtk::gio;
+use relm4::gtk::gio::prelude::*;
+use relm4::gtk::glib;
+
+use crate::cli::{self, Cli};
+
+/// Handle one invocation — the local one on a plain GUI start, or a remote
+/// one forwarded over the session bus by a second launch of the binary.
+///
+/// With `HANDLES_COMMAND_LINE` set, GApplication stops emitting `activate` on
+/// its own, so the no-arguments path has to do it explicitly or no window ever
+/// appears.
+pub fn handle_command_line(
+    app: &adw::Application,
+    command_line: &gio::ApplicationCommandLine,
+) -> glib::ExitCode {
+    let args: Vec<String> = command_line
+        .arguments()
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+
+    let parsed = match cli::parse(&args) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            command_line.printerr_literal(&format!("kabelsalat: {}\n", err.0));
+            command_line.printerr_literal(cli::help_text());
+            return glib::ExitCode::new(cli::EXIT_USAGE);
+        }
+    };
+
+    if parsed == Cli::Gui {
+        app.activate();
+        return glib::ExitCode::SUCCESS;
+    }
+
+    // The caller's directory, forwarded by GApplication. Falling back to "/"
+    // only matters if the caller's cwd was deleted underneath it.
+    let cwd = command_line
+        .cwd()
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let outcome = cli::dispatch(&parsed, &snapshot(), &cwd);
+
+    if !outcome.stdout.is_empty() {
+        command_line.print_literal(&outcome.stdout);
+    }
+    if !outcome.stderr.is_empty() {
+        command_line.printerr_literal(&outcome.stderr);
+    }
+
+    if let Some(request) = outcome.spawn {
+        // The tab's uuid is minted here, where glib is available, and echoed
+        // so the caller has a token proving the tab was created.
+        let tab_uuid = glib::uuid_string_random().to_string();
+        if !request_spawn(request, tab_uuid.clone()) {
+            command_line.printerr_literal("kabelsalat: no window to spawn into\n");
+            return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
+        }
+        command_line.print_literal(&format!("{tab_uuid}\n"));
+    }
+
+    glib::ExitCode::new(outcome.code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
