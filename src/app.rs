@@ -638,7 +638,7 @@ impl SimpleComponent for App {
                         } else if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
                             // Reattach: -A ignores -c, and we want the existing
                             // session's directory anyway, so no cwd.
-                            spawn_backing(&tab.terminal, &uuid, Some(tmux), None);
+                            spawn_backing(&tab.terminal, &uuid, Some(tmux), None, None);
                         }
                     }
                 } else if gtk::glib::spawn_check_wait_status(status).is_ok() {
@@ -888,6 +888,7 @@ impl App {
                 Some(tab.title.clone()),
                 dead_exit(&tab.uuid),
                 None,
+                None,
                 sender,
             );
         }
@@ -906,6 +907,7 @@ impl App {
                     gid,
                     Some(title),
                     orphan.dead_exit,
+                    None,
                     None,
                     sender,
                 );
@@ -1463,7 +1465,7 @@ impl App {
     fn open_tab(&mut self, group: usize, sender: &ComponentSender<Self>) {
         let cwd = self.active_tab_cwd();
         let uuid = gtk::glib::uuid_string_random().to_string();
-        let id = self.add_tab(uuid, group, None, None, cwd.as_deref(), sender);
+        let id = self.add_tab(uuid, group, None, None, cwd.as_deref(), None, sender);
         self.activate(id);
     }
 
@@ -1488,6 +1490,8 @@ impl App {
     /// Create a tab backed by `uuid` (spawning its tmux session, or a direct
     /// $SHELL in the fallback path) without changing the active tab. Returns
     /// the new tab id. `title = None` uses the default "Terminal N".
+    /// `command = None` starts an interactive shell; `Some(argv)` runs that
+    /// instead, which is what `kabelsalat run` uses.
     fn add_tab(
         &mut self,
         uuid: String,
@@ -1495,6 +1499,7 @@ impl App {
         title: Option<String>,
         crashed: Option<i32>,
         cwd: Option<&Path>,
+        command: Option<&[String]>,
         sender: &ComponentSender<Self>,
     ) -> usize {
         // Fallback scrolling off: tmux keeps VTE permanently in the alternate
@@ -1507,7 +1512,7 @@ impl App {
             .enable_fallback_scrolling(false)
             .build();
         apply_scheme(&terminal, self.style.is_dark());
-        spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd);
+        spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd, command);
 
         attach_drag_hint(&terminal, sender);
 
@@ -1563,7 +1568,7 @@ impl App {
                     return;
                 }
             }
-            None => spawn_shell(&terminal, None),
+            None => spawn_shell(&terminal, None, None),
         }
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.crashed = None;
@@ -2472,12 +2477,19 @@ fn decode_exit(status: i32) -> i32 {
 
 /// Spawn a tab's backing process: the tmux client for its session when tmux is
 /// available (`new-session -A` attaches or creates), else a direct $SHELL.
-fn spawn_backing(terminal: &Terminal, uuid: &str, tmux: Option<&TmuxCtl>, cwd: Option<&Path>) {
+/// `command`, when set, replaces the shell in either path.
+fn spawn_backing(
+    terminal: &Terminal,
+    uuid: &str,
+    tmux: Option<&TmuxCtl>,
+    cwd: Option<&Path>,
+    command: Option<&[String]>,
+) {
     let Some(ctl) = tmux else {
-        spawn_shell(terminal, cwd);
+        spawn_shell(terminal, cwd, command);
         return;
     };
-    let argv = ctl.spawn_argv(uuid, cwd, None);
+    let argv = ctl.spawn_argv(uuid, cwd, command);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     terminal.spawn_async(
         PtyFlags::DEFAULT,
@@ -2496,13 +2508,19 @@ fn spawn_backing(terminal: &Terminal, uuid: &str, tmux: Option<&TmuxCtl>, cwd: O
     );
 }
 
-fn spawn_shell(terminal: &Terminal, cwd: Option<&Path>) {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+fn spawn_shell(terminal: &Terminal, cwd: Option<&Path>, command: Option<&[String]>) {
+    // Without tmux there is no re-joining to worry about: VTE takes argv
+    // directly, so the command's word boundaries survive exactly.
+    let argv: Vec<String> = match command {
+        Some(command) if !command.is_empty() => command.to_vec(),
+        _ => vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())],
+    };
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let working_dir = cwd.map(|p| p.to_string_lossy().into_owned());
     terminal.spawn_async(
         PtyFlags::DEFAULT,
         working_dir.as_deref(),
-        &[&shell],
+        &refs,
         &[],
         gtk::glib::SpawnFlags::DEFAULT,
         || {},
