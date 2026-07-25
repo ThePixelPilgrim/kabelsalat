@@ -2,6 +2,7 @@ use relm4::RelmApp;
 
 mod app;
 pub mod browser;
+mod cli;
 pub mod state;
 pub mod tmuxctl;
 
