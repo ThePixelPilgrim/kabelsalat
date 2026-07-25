@@ -73,13 +73,18 @@ New `Msg` variants: `ToggleBrowser`, `CloseBrowser`, `BrowserDied(usize)`.
 
 ### `src/state.rs`
 
-`SavedGroup` gains two fields, both `#[serde(default)]` for backward
+`SavedGroup` gains three fields, all `#[serde(default)]` for backward
 compatibility, following the `linger_warning_dismissed` precedent:
 
 ```rust
+pub uuid: String,
 pub browser_open: bool,
 pub browser_split: f64,
 ```
+
+`uuid` is the stable per-group identity, exactly as tabs already carry one. A
+`state.json` written by an older build has no `uuid`; a group loading without one
+gets a fresh uuid generated on load and keeps it from then on.
 
 No URLs or tab state are persisted — Chromium owns that. `state.rs` remains
 pure logic: no GTK, no process handling.
@@ -151,10 +156,13 @@ inside the browser. klamottenkiste cannot detect this: `startup_error()` and
 `is_running()` describe the compositor only.
 
 kabelsalat polls `child.try_wait()` on a timer. On exit it sends
-`BrowserDied(group)`, which tears the browser down exactly as **Close browser**
-does. The group returns to having no browser, the icon disappears, and the next
-`Alt-2` spawns a fresh one. Quitting Chromium is therefore a legitimate way to
-close a group's browser.
+`BrowserDied(group)`, which closes the pane, drops the `Browser`, and clears
+`browser_open`. The group returns to having no browser and the icon disappears.
+
+An unexpected exit is **not** the same intent as **Close browser**: the profile
+directory is kept. The next `Alt-2` relaunches Chromium into the same profile,
+so it restores the session that was open when it died. Only a deliberate
+**Close browser** from the overflow menu discards the profile.
 
 ## Chromium launch
 
@@ -174,23 +182,43 @@ dialog rather than leaving a blank pane.
 Session restore is entirely Chromium's own mechanism, driven by the persistent
 profile directory.
 
+### Termination
+
+Chromium only writes its session state on a clean shutdown, so it is never
+killed outright. Teardown sends `SIGTERM` first and waits a short, bounded time
+for the child to exit. `SIGKILL` follows only as escalation when that wait
+expires. The child is reaped in every case, including after `SIGKILL`, so no
+zombie is left behind. The pane is closed after the child is gone.
+
+At app shutdown this is not repeated per browser. All browsers are `SIGTERM`'d
+first, then awaited against **one** shared deadline; whoever has not exited when
+it expires is `SIGKILL`'d. Quit cost is therefore the grace period once, not once
+per browser.
+
 ## Profile directories
 
-Location: `$XDG_STATE_HOME/kabelsalat/browsers/<group-id>`.
+Location: `$XDG_STATE_HOME/kabelsalat/browsers/<group-uuid>`.
 
-Group ids come from a monotonic counter and are persisted, so they are stable
-across restarts and are a valid key. The directories are disposable cache, not
-user data — they persist across restarts only because Chromium session restore
-requires it.
+The key is the group's stable uuid, not its id: ids are recycled — deleting the
+highest-numbered group makes the next new group reuse that id — so an id-keyed
+profile can be deleted out from under a new group that happens to reuse the id.
+The directories are disposable cache, not user data — they persist across
+restarts only because Chromium session restore requires it.
 
 They are removed when the browser is closed via the overflow menu, when the
-group is pruned, and by the startup sweep below.
+group is pruned or deleted, and by the startup sweep below. They are **not**
+removed when Chromium exits on its own — that profile is what the next `Alt-2`
+restores from. Such a kept profile is still reclaimed as soon as its group is
+deleted; it does not have to wait for the next startup sweep.
+
+Removal runs off the main thread: a Chromium profile is large enough that
+deleting it synchronously stalls the UI.
 
 ## Restart
 
 1. Groups load from `state.json` as today.
 2. A worker thread sweeps `browsers/`, deleting every directory whose name does
-   not match a live group id. This is pure filesystem IO with no GTK
+   not match a live group uuid. This is pure filesystem IO with no GTK
    involvement and cannot race the UI, since it only touches directories no
    group refers to.
 3. Groups with `browser_open: true` are restored **sequentially**, the active
@@ -212,9 +240,12 @@ racing them to be ready buys nothing visible.
 | `pane.startup_error()` is set (compositor failed) | drop the pane, report in a dialog, group keeps no browser |
 | Chromium binary not found | drop the pane, report in a dialog |
 | Chromium spawn fails | drop the pane, report in a dialog |
-| Chromium exits later | tear the browser down (see above), silently |
+| Chromium exits later | tear the pane down, keep the profile (see above), silently |
 | profile dir cannot be created | treat as spawn failure |
 | profile dir cannot be removed | log, continue — the startup sweep retries |
+
+Profile removal is dispatched to a worker thread rather than done inline; a
+failed removal is logged and left to the startup sweep.
 
 The app must keep working when klamottenkiste cannot start at all (no DRM render
 node, no EGL). This degrades to "Alt-2 reports an error and does nothing",

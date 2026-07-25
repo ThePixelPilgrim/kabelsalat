@@ -11,12 +11,93 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Default divider position (px from the left) of the terminal/browser split.
+pub const DEFAULT_BROWSER_SPLIT: f64 = 800.0;
+
 /// A tab group as persisted: stable id, display name, palette color index.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` only, not `Eq`: `browser_split` is a float.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedGroup {
+    /// Stable UUID assigned at group creation, in the same hyphenated v4 form
+    /// as `SavedTab::uuid`. Group *ids* are reused (the next id is
+    /// `max(id) + 1`, so deleting the highest group hands its id to the next
+    /// one), therefore anything that owns per-group data on disk — the browser
+    /// profile directory — must key off this uuid, never off `id`.
+    /// `serde(default)` so state files predating this field load with an empty
+    /// string; `load()` backfills a fresh uuid for every such group.
+    #[serde(default)]
+    pub uuid: String,
     pub id: usize,
     pub name: String, // empty = unnamed, no header shown
     pub palette: usize,
+    /// Whether this group had a browser pane when the app last exited. Restored
+    /// browsers are spawned fresh; Chromium restores its own session from the
+    /// profile directory. `serde(default)` so older state files load with
+    /// `false` (no browser).
+    #[serde(default)]
+    pub browser_open: bool,
+    /// Divider position of the terminal/browser split, in pixels.
+    /// `serde(default)` so older state files load with the default split.
+    #[serde(default = "default_browser_split")]
+    pub browser_split: f64,
+}
+
+fn default_browser_split() -> f64 {
+    DEFAULT_BROWSER_SPLIT
+}
+
+impl SavedGroup {
+    /// A group with a freshly generated uuid and the default split.
+    pub fn new(id: usize, name: String, palette: usize) -> Self {
+        Self {
+            uuid: new_uuid(),
+            id,
+            name,
+            palette,
+            browser_open: false,
+            browser_split: DEFAULT_BROWSER_SPLIT,
+        }
+    }
+}
+
+/// Generate a random UUID string in the same shape as the tab uuids
+/// (`xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`, lowercase hex, RFC 4122 v4).
+///
+/// Kept pure: no GTK, no processes. Entropy comes from `RandomState`, which the
+/// std library seeds per process from the OS, mixed with a monotonically
+/// increasing counter and the wall clock so that repeated calls within one
+/// process never collide.
+pub fn new_uuid() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let word = || {
+        let mut hasher = RandomState::new().build_hasher();
+        COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .hash(&mut hasher);
+        hasher.finish()
+    };
+    let (hi, lo) = (word(), word());
+    // Set the version (4) and variant (RFC 4122) bits.
+    let hi = (hi & 0xffff_ffff_ffff_0fff) | 0x0000_0000_0000_4000;
+    let lo = (lo & 0x3fff_ffff_ffff_ffff) | 0x8000_0000_0000_0000;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hi >> 32) as u32,
+        (hi >> 16) as u16,
+        hi as u16,
+        (lo >> 48) as u16,
+        lo & 0xffff_ffff_ffff,
+    )
 }
 
 /// A tab as persisted. Order within the containing vec is the display order.
@@ -28,7 +109,9 @@ pub struct SavedTab {
 }
 
 /// The whole persisted presentation model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` only, not `Eq`: `SavedGroup::browser_split` is a float.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedState {
     pub groups: Vec<SavedGroup>,
     pub tabs: Vec<SavedTab>,
@@ -50,6 +133,30 @@ impl Default for SavedState {
             sidebar_visible: true,
             linger_warning_dismissed: false,
         }
+    }
+}
+
+impl SavedState {
+    /// Give every group a non-empty, unique uuid. Groups loaded from a state
+    /// file written before uuids existed have an empty one; a duplicate can
+    /// only come from a hand-edited or externally merged file. Both get a
+    /// fresh uuid so the browser profile keys stay one-to-one with groups.
+    ///
+    /// Returns whether any uuid was actually minted. A `true` here means the
+    /// in-memory state no longer matches the file on disk, and the caller must
+    /// get it persisted before anything keys destructive work (the browser
+    /// profile sweep) off these uuids.
+    pub fn ensure_group_uuids(&mut self) -> bool {
+        let mut backfilled = false;
+        let mut seen: Vec<String> = Vec::with_capacity(self.groups.len());
+        for group in &mut self.groups {
+            if group.uuid.is_empty() || seen.contains(&group.uuid) {
+                group.uuid = new_uuid();
+                backfilled = true;
+            }
+            seen.push(group.uuid.clone());
+        }
+        backfilled
     }
 }
 
@@ -85,20 +192,47 @@ pub fn save(state: &SavedState, path: &Path) -> std::io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// What [`load_detailed`] found, beyond the state itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadOutcome {
+    pub state: SavedState,
+    /// At least one group got a freshly minted uuid during this load, so the
+    /// returned state differs from the file on disk. Until it is written back
+    /// successfully, these uuids are not stable across restarts.
+    pub uuids_backfilled: bool,
+}
+
 /// Load state from `path`. A missing file yields the empty default. A corrupt
 /// file is renamed aside (to `<path>.corrupt`) and also yields the default —
 /// running shells must never be lost over a bad JSON file.
 pub fn load(path: &Path) -> SavedState {
+    load_detailed(path).state
+}
+
+/// [`load`], plus whether group uuids had to be backfilled. Callers that key
+/// destructive work off the uuids must use this and check `uuids_backfilled`.
+pub fn load_detailed(path: &Path) -> LoadOutcome {
+    let default = |uuids_backfilled: bool| LoadOutcome {
+        state: SavedState::default(),
+        uuids_backfilled,
+    };
     let data = match fs::read(path) {
         Ok(data) => data,
-        Err(_) => return SavedState::default(),
+        Err(_) => return default(false),
     };
-    match serde_json::from_slice(&data) {
-        Ok(state) => state,
+    match serde_json::from_slice::<SavedState>(&data) {
+        Ok(mut state) => {
+            // Backfill uuids for groups written before the field existed.
+            let uuids_backfilled = state.ensure_group_uuids();
+            LoadOutcome {
+                state,
+                uuids_backfilled,
+            }
+        }
         Err(_) => {
             let aside = path.with_extension("json.corrupt");
             let _ = fs::rename(path, &aside);
-            SavedState::default()
+            default(false)
         }
     }
 }
@@ -172,14 +306,20 @@ mod tests {
         SavedState {
             groups: vec![
                 SavedGroup {
+                    uuid: "g-aaa".into(),
                     id: 0,
                     name: String::new(),
                     palette: 0,
+                    browser_open: false,
+                    browser_split: DEFAULT_BROWSER_SPLIT,
                 },
                 SavedGroup {
+                    uuid: "g-bbb".into(),
                     id: 1,
                     name: "work".into(),
                     palette: 2,
+                    browser_open: true,
+                    browser_split: 640.0,
                 },
             ],
             tabs: vec![
@@ -224,6 +364,145 @@ mod tests {
     }
 
     #[test]
+    fn legacy_state_without_group_uuids_gets_fresh_unique_ones() {
+        // Written before SavedGroup carried a uuid: must still load, and every
+        // group must come out with a non-empty, unique uuid.
+        let json = r#"{
+            "groups": [
+                {"id": 0, "name": "", "palette": 0},
+                {"id": 1, "name": "work", "palette": 2, "browser_open": true},
+                {"id": 2, "name": "play", "palette": 3}
+            ],
+            "tabs": [],
+            "active": null,
+            "sidebar_visible": true
+        }"#;
+        let dir = tmp_dir("legacy-group-uuid");
+        let path = dir.join("state.json");
+        fs::write(&path, json).unwrap();
+
+        let state = load(&path);
+        assert_eq!(state.groups.len(), 3);
+        let uuids: Vec<&str> = state.groups.iter().map(|g| g.uuid.as_str()).collect();
+        assert!(uuids.iter().all(|u| !u.is_empty()));
+        let mut sorted = uuids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "group uuids must be unique: {uuids:?}");
+        // Non-uuid fields survive untouched.
+        assert_eq!(state.groups[1].name, "work");
+        assert!(state.groups[1].browser_open);
+        assert_eq!(state.groups[0].browser_split, DEFAULT_BROWSER_SPLIT);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_detailed_reports_a_backfill() {
+        let json = r#"{
+            "groups": [{"id": 0, "name": "", "palette": 0}],
+            "tabs": [], "active": null, "sidebar_visible": true
+        }"#;
+        let dir = tmp_dir("load-detailed-backfill");
+        let path = dir.join("state.json");
+        fs::write(&path, json).unwrap();
+
+        let outcome = load_detailed(&path);
+        assert!(outcome.uuids_backfilled);
+        assert!(!outcome.state.groups[0].uuid.is_empty());
+
+        // Writing the backfilled state back makes the next load clean.
+        save(&outcome.state, &path).unwrap();
+        let again = load_detailed(&path);
+        assert!(!again.uuids_backfilled);
+        assert_eq!(again.state, outcome.state);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_detailed_reports_no_backfill_for_missing_or_corrupt_files() {
+        let dir = tmp_dir("load-detailed-nofile");
+        // Missing: nothing was minted, so nothing needs persisting.
+        assert!(!load_detailed(&dir.join("state.json")).uuids_backfilled);
+        // Corrupt: the default state has no groups, so likewise.
+        let path = dir.join("bad.json");
+        fs::write(&path, b"{ nope").unwrap();
+        let outcome = load_detailed(&path);
+        assert!(!outcome.uuids_backfilled);
+        assert_eq!(outcome.state, SavedState::default());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_group_uuids_is_idempotent_and_reports_it() {
+        let mut state = sample_state();
+        assert!(!state.ensure_group_uuids(), "already-valid uuids stay put");
+        state.groups[1].uuid = state.groups[0].uuid.clone();
+        assert!(state.ensure_group_uuids(), "a duplicate is a backfill");
+        assert!(!state.ensure_group_uuids());
+    }
+
+    #[test]
+    fn group_uuids_survive_save_load_roundtrip() {
+        let dir = tmp_dir("group-uuid-roundtrip");
+        let path = dir.join("state.json");
+        let state = sample_state();
+        save(&state, &path).unwrap();
+
+        let back = load(&path);
+        assert_eq!(back, state);
+        let uuids: Vec<&str> = back.groups.iter().map(|g| g.uuid.as_str()).collect();
+        assert_eq!(uuids, ["g-aaa", "g-bbb"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_group_uuids_are_regenerated_on_load() {
+        // Only reachable through a hand-edited or merged file, but a duplicate
+        // would make two groups share one browser profile directory.
+        let mut state = SavedState {
+            groups: vec![
+                SavedGroup::new(0, String::new(), 0),
+                SavedGroup::new(1, "work".into(), 1),
+            ],
+            ..SavedState::default()
+        };
+        state.groups[1].uuid = state.groups[0].uuid.clone();
+        state.ensure_group_uuids();
+        assert_ne!(state.groups[0].uuid, state.groups[1].uuid);
+        assert!(!state.groups[1].uuid.is_empty());
+    }
+
+    #[test]
+    fn new_uuid_is_unique_and_well_formed() {
+        let a = new_uuid();
+        let b = new_uuid();
+        assert_ne!(a, b);
+        for u in [&a, &b] {
+            assert_eq!(u.len(), 36, "{u}");
+            let parts: Vec<&str> = u.split('-').collect();
+            assert_eq!(
+                parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+                vec![8, 4, 4, 4, 12],
+                "{u}"
+            );
+            assert!(u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'), "{u}");
+        }
+    }
+
+    #[test]
+    fn saved_group_new_generates_a_uuid() {
+        let g = SavedGroup::new(7, "x".into(), 3);
+        assert!(!g.uuid.is_empty());
+        assert_eq!(g.id, 7);
+        assert_eq!(g.palette, 3);
+        assert!(!g.browser_open);
+        assert_eq!(g.browser_split, DEFAULT_BROWSER_SPLIT);
+    }
+
+    #[test]
     fn old_state_without_linger_flag_defaults_to_not_dismissed() {
         // A state file written before the linger flag existed must still load,
         // with the warning not dismissed.
@@ -246,6 +525,47 @@ mod tests {
         let back: SavedState = serde_json::from_str(&json).unwrap();
         assert!(back.linger_warning_dismissed);
         assert_eq!(back, state);
+    }
+
+    #[test]
+    fn old_group_without_browser_fields_loads() {
+        // A state.json written before the browser pane existed.
+        let json = r#"{
+            "groups": [{ "id": 3, "name": "work", "palette": 1 }],
+            "tabs": [],
+            "active": null,
+            "sidebar_visible": true
+        }"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].id, 3);
+        assert_eq!(state.groups[0].name, "work");
+        assert_eq!(state.groups[0].palette, 1);
+        assert!(!state.groups[0].browser_open);
+        assert_eq!(state.groups[0].browser_split, DEFAULT_BROWSER_SPLIT);
+    }
+
+    #[test]
+    fn browser_fields_round_trip() {
+        let state = sample_state();
+        let json = serde_json::to_string(&state).unwrap();
+        let back: SavedState = serde_json::from_str(&json).unwrap();
+        assert!(!back.groups[0].browser_open);
+        assert!(back.groups[1].browser_open);
+        assert_eq!(back.groups[1].browser_split, 640.0);
+        assert_eq!(back, state);
+    }
+
+    #[test]
+    fn browser_fields_survive_save_and_load() {
+        let dir = tmp_dir("browserfields");
+        let path = dir.join("state.json");
+        let state = sample_state();
+        save(&state, &path).unwrap();
+        let back = load(&path);
+        assert!(back.groups[1].browser_open);
+        assert_eq!(back.groups[1].browser_split, 640.0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

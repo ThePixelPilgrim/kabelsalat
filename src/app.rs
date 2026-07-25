@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use relm4::adw;
@@ -9,6 +11,7 @@ use relm4::gtk::prelude::*;
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
+use crate::browser::{self, Browser, ProfileDisposition};
 use crate::state::{self, SavedGroup, SavedState, SavedTab};
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
 
@@ -38,8 +41,25 @@ const SHORTCUTS: &[(&str, &str, Msg)] = &[
     ("<Alt>1", "Toggle tab pane", Msg::ToggleSidebar),
     ("<Alt><Shift>1", "Toggle tab pane", Msg::ToggleSidebar),
     ("<Alt>exclam", "Toggle tab pane", Msg::ToggleSidebar),
+    ("<Alt>2", "Toggle browser pane", Msg::ToggleBrowser),
+    ("<Alt><Shift>2", "Toggle browser pane", Msg::ToggleBrowser),
+    ("<Alt>at", "Toggle browser pane", Msg::ToggleBrowser),
+    ("<Alt>quotedbl", "Toggle browser pane", Msg::ToggleBrowser),
     ("F1", "Show this help", Msg::ShowHelp),
 ];
+
+/// Triggers that exist only as keyboard-layout aliases of another entry; the
+/// F1 help lists each shortcut once, so these are filtered out there.
+const SHORTCUT_ALIASES: &[&str] = &[
+    "<Alt><Shift>1",
+    "<Alt>exclam",
+    "<Alt><Shift>2",
+    "<Alt>at",
+    "<Alt>quotedbl",
+];
+
+/// How often the hosted Chromium processes are reaped for exit.
+const BROWSER_POLL_SECS: u32 = 2;
 
 /// How long the "hold Shift to select" icon stays up after a bare drag.
 const SELECT_HINT_SECS: u32 = 7;
@@ -77,9 +97,21 @@ pub struct Tab {
 
 pub struct Group {
     id: usize,
+    /// Stable, never-reused identity of this group. Group *ids* are reused
+    /// (`max(id) + 1` after a delete), so anything that outlives the group —
+    /// above all the browser profile directory — is keyed by this instead.
+    uuid: String,
     name: String, // empty = unnamed, no header shown
     css: &'static str,
     last_active: usize,
+    /// The group's browser, if it has one. Dropping it kills Chromium, closes
+    /// the pane and removes the profile directory (see `browser::Browser`).
+    browser: Option<Browser>,
+    /// Whether the browser is shown rather than hidden. Only meaningful while
+    /// `browser` is `Some`; a hidden browser keeps running.
+    browser_visible: bool,
+    /// Divider position of the terminal/browser split, in pixels.
+    browser_split: f64,
 }
 
 pub struct App {
@@ -96,6 +128,24 @@ pub struct App {
     /// keep the active tab on screen.
     tab_scroller: gtk::ScrolledWindow,
     stack: gtk::Stack,
+    /// Splits the terminal content box (start) from the active group's browser
+    /// pane (end). The end child is attached and detached imperatively — only
+    /// the active group's pane is ever parented.
+    browser_paned: gtk::Paned,
+    /// Popover behind the header bar's browser overflow button.
+    browser_menu: gtk::Popover,
+    /// Which group's pane is currently the paned's end child, if any. Tracked
+    /// explicitly so detaching works even after the group was pruned.
+    attached_browser: Option<usize>,
+    /// Groups still waiting for their browser to be restored after a restart,
+    /// active group first. Drained one per idle callback.
+    pending_browser_restore: Vec<usize>,
+    /// Whether the try_wait poll timer is running (started with the first
+    /// browser, never restarted).
+    browser_poll_running: bool,
+    /// Whether a restore failure was already reported; keeps a broken setup
+    /// from stacking one dialog per group.
+    browser_restore_error_shown: bool,
     window: gtk::ApplicationWindow,
     input: relm4::Sender<Msg>,
     /// tmux backing, present only when a usable tmux (>= 3.2) was found.
@@ -117,6 +167,16 @@ pub struct App {
     monitor: Option<gio::FileMonitor>,
     /// Where the presentation model is persisted.
     state_path: PathBuf,
+    /// The state directory; browser profiles live under `browsers/` in it.
+    state_dir: PathBuf,
+    /// Group uuids were minted during this run's `state::load` and have not
+    /// reached disk yet. While this is set, the uuids are not stable across
+    /// restarts, so nothing may be deleted on the strength of them — see
+    /// [`profile_sweep_allowed`]. `Cell` because `save_state` takes `&self`.
+    uuids_unpersisted: Cell<bool>,
+    /// Whether the "could not save state" notice was already shown; keeps a
+    /// full disk from stacking one dialog per layout change.
+    save_error_shown: Cell<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +239,22 @@ pub enum Msg {
     HideSelectHint(u64),
     /// Open the "hold Shift to select" explanation dialog.
     ShowSelectHelp,
+    /// Alt-2: spawn the active group's browser if it has none, otherwise
+    /// toggle it between shown and hidden.
+    ToggleBrowser,
+    /// Tear down the active group's browser: kill Chromium, close the pane,
+    /// remove the profile directory. The next Alt-2 spawns a fresh one.
+    CloseBrowser,
+    /// The Chromium hosted by this group's browser exited on its own. Tears
+    /// down like `CloseBrowser`, but keeps the profile directory so the
+    /// session survives the crash.
+    BrowserDied(usize),
+    /// The user dragged the terminal/browser divider.
+    BrowserSplitChanged,
+    /// Timer tick: reap exited Chromium processes.
+    PollBrowsers,
+    /// Restart restore: bring up this group's browser, then queue the next.
+    RestoreBrowser(usize),
 }
 
 #[relm4::component(pub)]
@@ -238,6 +314,35 @@ impl SimpleComponent for App {
                     set_visible: model.select_hint_visible,
                     connect_clicked => Msg::ShowSelectHelp,
                 },
+
+                pack_end = &gtk::Button {
+                    set_icon_name: "web-browser-symbolic",
+                    add_css_class: "browser-hidden",
+                    set_tooltip_text: Some("Browser hidden — click to show it (Alt+2)"),
+                    #[watch]
+                    set_visible: model.active_browser_hidden(),
+                    connect_clicked => Msg::ToggleBrowser,
+                },
+
+                pack_end = &gtk::MenuButton {
+                    set_icon_name: "view-more-symbolic",
+                    set_tooltip_text: Some("Browser options"),
+                    #[watch]
+                    set_visible: model.active_group_has_browser(),
+
+                    #[wrap(Some)]
+                    set_popover = &browser_menu.clone() {
+                        #[wrap(Some)]
+                        set_child = &gtk::Button {
+                            set_label: "Close browser",
+                            add_css_class: "flat",
+                            connect_clicked[sender, browser_menu] => move |_| {
+                                browser_menu.popdown();
+                                sender.input(Msg::CloseBrowser);
+                            },
+                        },
+                    },
+                },
             },
 
             gtk::Paned {
@@ -289,8 +394,17 @@ impl SimpleComponent for App {
                         },
                 },
 
+                // The browser split. Its end child is the active group's
+                // WaylandPane, attached and detached imperatively; with no
+                // browser showing, the terminal box takes the full width.
                 #[wrap(Some)]
-                set_end_child = &gtk::Box {
+                set_end_child = &browser_paned.clone() {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_resize_end_child: false,
+                    set_shrink_end_child: false,
+
+                #[wrap(Some)]
+                set_start_child = &gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
                     set_hexpand: true,
 
@@ -316,6 +430,7 @@ impl SimpleComponent for App {
                         set_hexpand: true,
                         set_vexpand: true,
                     },
+                },
                 },
             },
         }
@@ -398,6 +513,12 @@ impl SimpleComponent for App {
             tab_bar: gtk::Box::new(gtk::Orientation::Horizontal, 2),
             tab_scroller: gtk::ScrolledWindow::new(),
             stack: gtk::Stack::new(),
+            browser_paned: gtk::Paned::new(gtk::Orientation::Horizontal),
+            browser_menu: gtk::Popover::new(),
+            attached_browser: None,
+            pending_browser_restore: Vec::new(),
+            browser_poll_running: false,
+            browser_restore_error_shown: false,
             window: root.clone(),
             input: sender.input_sender().clone(),
             tmux,
@@ -408,13 +529,29 @@ impl SimpleComponent for App {
             select_hint_gen: 0,
             monitor: None,
             state_path: state::state_file(),
+            state_dir: state::state_dir(),
+            // Set for real in `restore_or_fresh`, which is the load that the
+            // model is actually built from.
+            uuids_unpersisted: Cell::new(false),
+            save_error_shown: Cell::new(false),
         };
 
         let tab_list = model.tab_list.clone();
         let tab_bar = model.tab_bar.clone();
         let tab_scroller = model.tab_scroller.clone();
         let stack = model.stack.clone();
+        let browser_paned = model.browser_paned.clone();
+        let browser_menu = model.browser_menu.clone();
         let widgets = view_output!();
+
+        // The divider lives in the widget; mirror it into the active group as
+        // it moves so quitting right after a resize keeps the new position.
+        {
+            let input = sender.input_sender().clone();
+            model.browser_paned.connect_position_notify(move |_| {
+                let _ = input.send(Msg::BrowserSplitChanged);
+            });
+        }
 
         // Watch the pane-died events directory before reconciling so no crash
         // report is missed; clear stale files from previous runs first.
@@ -452,6 +589,11 @@ impl SimpleComponent for App {
             }
         }
 
+        // `restore_or_fresh` runs `start_browser_maintenance` itself, on both
+        // of its exits, *before* it persists — otherwise that first save would
+        // write browser_open=false for every restored group (no `Browser` yet,
+        // `pending_browser_restore` not yet filled), and a crash inside that
+        // window would lose every browser flag.
         model.restore_or_fresh(&sender);
         ComponentParts { model, widgets }
     }
@@ -536,6 +678,29 @@ impl SimpleComponent for App {
                 self.show_select_help();
                 return;
             }
+            Msg::ToggleBrowser => self.toggle_browser(),
+            Msg::CloseBrowser => {
+                if let Some(group) = self.active_group() {
+                    // Deliberate close: the user is done with this browser, so
+                    // the profile goes with it.
+                    self.close_browser(group, ProfileDisposition::Remove);
+                }
+            }
+            // Unexpected death: keep the profile so the next Alt-2 relaunches
+            // into it and Chromium restores the session, cookies and logins.
+            Msg::BrowserDied(group) => self.close_browser(group, ProfileDisposition::Keep),
+            Msg::BrowserSplitChanged => {
+                self.on_browser_split_changed();
+                return;
+            }
+            // Pure bookkeeping: any actual death comes back as BrowserDied,
+            // which persists. Ticking every BROWSER_POLL_SECS seconds must not
+            // rewrite state.
+            Msg::PollBrowsers => {
+                self.poll_browsers();
+                return;
+            }
+            Msg::RestoreBrowser(group) => self.restore_browser(group),
             // Title changes arrive at animation rate from some programs
             // (spinners/progress in the title). Rebuilding the sidebar and
             // tab bar per change kept the main thread busy and replaced the
@@ -580,6 +745,29 @@ impl SimpleComponent for App {
         // Every layout mutation persists; writes are atomic and human-paced.
         self.save_state();
     }
+
+    /// On app exit, kill every hosted Chromium but keep its profile directory:
+    /// the group still exists in the saved state and its browser is restored
+    /// on the next start from exactly that profile.
+    fn shutdown(&mut self, _widgets: &mut Self::Widgets, _output: relm4::Sender<Self::Output>) {
+        // Read the live divider back into its group *before* detaching, then
+        // clear the attachment so the position notify from unparenting cannot
+        // overwrite it with a meaningless value.
+        self.on_browser_split_changed();
+        self.attached_browser = None;
+        self.browser_paned.set_end_child(gtk::Widget::NONE);
+        // One shared SIGTERM deadline for all of them: serial teardown cost
+        // `n * TERM_GRACE` of frozen UI, this costs at most TERM_GRACE however
+        // many browsers there are. `Keep` preserves every profile for restore.
+        browser::shutdown_all(
+            self.groups.iter_mut().filter_map(|g| g.browser.as_mut()),
+            browser::TERM_GRACE,
+            ProfileDisposition::Keep,
+        );
+        // `update()` does not run on the way out, so persist here: without
+        // this, a resize followed by a quit loses the new divider position.
+        self.save_state();
+    }
 }
 
 impl App {
@@ -605,9 +793,13 @@ impl App {
         self.next_group_id += 1;
         self.groups.push(Group {
             id,
+            uuid: state::new_uuid(),
             name: String::new(),
             css: GROUP_PALETTE[(id - 1) % GROUP_PALETTE.len()],
             last_active: 0,
+            browser: None,
+            browser_visible: false,
+            browser_split: state::DEFAULT_BROWSER_SPLIT,
         });
         id
     }
@@ -620,7 +812,17 @@ impl App {
     /// Startup reconciliation: restore the saved layout against live tmux
     /// sessions, or fall back to a fresh single tab. Persists the result.
     fn restore_or_fresh(&mut self, sender: &ComponentSender<Self>) {
-        let saved = state::load(&self.state_path);
+        let loaded = state::load_detailed(&self.state_path);
+        let saved = loaded.state;
+        self.uuids_unpersisted.set(loaded.uuids_backfilled);
+        // Get freshly minted uuids onto disk *now*, before anything keys off
+        // them. Written verbatim: this is exactly the file that was read, plus
+        // the uuids, so it cannot lose anything the model has not seen yet. If
+        // it fails, `uuids_unpersisted` stays set and the profile sweep below
+        // stands down instead of deleting every profile it cannot match.
+        if loaded.uuids_backfilled {
+            self.persist(&saved);
+        }
         self.sidebar_visible = saved.sidebar_visible;
 
         // Live sessions (and which panes are dead) from our private server.
@@ -650,6 +852,9 @@ impl App {
             // Empty state and no sessions → current fresh-start behavior.
             self.sidebar_visible = true;
             self.open_group(sender);
+            // No group ever had a browser here, but the stale-profile sweep
+            // must still run.
+            self.start_browser_maintenance();
             self.save_state();
             return;
         }
@@ -658,9 +863,17 @@ impl App {
         for group in &saved.groups {
             self.groups.push(Group {
                 id: group.id,
+                // Backfilled by `state::load` for legacy/duplicate entries, so
+                // this is always a unique, non-empty uuid.
+                uuid: group.uuid.clone(),
                 name: group.name.clone(),
                 css: GROUP_PALETTE[group.palette % GROUP_PALETTE.len()],
                 last_active: 0,
+                browser: None,
+                // Restored as "wanted"; the actual pane comes up later, one
+                // group at a time, in start_browser_maintenance().
+                browser_visible: group.browser_open,
+                browser_split: group.browser_split,
             });
         }
         self.next_group_id = saved.groups.iter().map(|g| g.id).max().map_or(1, |m| m + 1);
@@ -700,8 +913,7 @@ impl App {
         }
 
         // Drop any group that ended up empty, then restore the active tab.
-        self.groups
-            .retain(|g| self.tabs.iter().any(|t| t.group == g.id));
+        self.prune_empty_groups();
         let active_id = saved
             .active
             .as_ref()
@@ -710,18 +922,43 @@ impl App {
         if let Some(id) = active_id {
             self.activate(id);
         }
+        // Before the save, not after: this fills `pending_browser_restore`, so
+        // the state written below already records every restored group as
+        // browser_open (see `browser_open_desired`). Reversing the order would
+        // persist browser_open=false for all of them until the first
+        // RestoreBrowser save.
+        self.start_browser_maintenance();
         self.save_state();
     }
 
     /// Serialize the current presentation model to disk (atomic write).
     fn save_state(&self) {
+        // The attached group's divider lives in the widget, not the model, so
+        // read it back here rather than on every drag of the handle.
+        let live_split = self.browser_paned.position() as f64;
         let groups = self
             .groups
             .iter()
             .map(|g| SavedGroup {
+                uuid: g.uuid.clone(),
                 id: g.id,
                 name: g.name.clone(),
                 palette: GROUP_PALETTE.iter().position(|c| *c == g.css).unwrap_or(0),
+                // The DESIRED state, not the live one: restore is sequential
+                // and idle-driven, so a group still queued in
+                // `pending_browser_restore` has no `Browser` yet but must
+                // still be written as open — otherwise any save inside the
+                // restore window silently forgets it.
+                browser_open: browser_open_desired(
+                    g.browser.is_some(),
+                    &self.pending_browser_restore,
+                    g.id,
+                ),
+                browser_split: if self.attached_browser == Some(g.id) {
+                    live_split
+                } else {
+                    g.browser_split
+                },
             })
             .collect();
         let tabs = self
@@ -744,9 +981,281 @@ impl App {
             sidebar_visible: self.sidebar_visible,
             linger_warning_dismissed: self.linger_dismissed,
         };
-        if let Err(err) = state::save(&state, &self.state_path) {
-            eprintln!("failed to save state: {err}");
+        self.persist(&state);
+    }
+
+    /// Write `state` to disk and account for the outcome. A success clears
+    /// `uuids_unpersisted` — whatever uuids the model carries are now on disk.
+    /// A failure keeps the flag (so no profile sweep will trust them) and, on
+    /// its first occurrence, tells the user, like every other browser-affecting
+    /// failure does.
+    fn persist(&self, state: &SavedState) {
+        match state::save(state, &self.state_path) {
+            Ok(()) => self.uuids_unpersisted.set(false),
+            Err(err) => {
+                eprintln!("failed to save state: {err}");
+                if !self.save_error_shown.replace(true) {
+                    self.show_notice(&format!(
+                        "Could not save the session layout: {err}\n\n\
+                         Tabs and browser sessions will not be restored \
+                         correctly after a restart."
+                    ));
+                }
+            }
         }
+    }
+
+    // ---- browser pane ---------------------------------------------------
+
+    /// Does the active group have a browser at all? Drives the overflow menu.
+    fn active_group_has_browser(&self) -> bool {
+        self.active_group()
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .is_some_and(|g| g.browser.is_some())
+    }
+
+    /// Does the active group have a browser that is currently hidden? Drives
+    /// the header-bar indicator.
+    fn active_browser_hidden(&self) -> bool {
+        self.active_group()
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .is_some_and(|g| g.browser.is_some() && !g.browser_visible)
+    }
+
+    /// Make the split show exactly the active group's browser, if it has a
+    /// visible one. The outgoing pane's divider position is saved and the pane
+    /// is hidden and unparented — the compositor and Chromium keep running, so
+    /// coming back to the group is instant with page state intact.
+    fn sync_browser_pane(&mut self) {
+        let want = self.active_group().filter(|id| {
+            self.groups
+                .iter()
+                .any(|g| g.id == *id && g.browser.is_some() && g.browser_visible)
+        });
+        if self.attached_browser == want {
+            return;
+        }
+        if let Some(previous) = self.attached_browser.take() {
+            let split = self.browser_paned.position() as f64;
+            if let Some(group) = self.groups.iter_mut().find(|g| g.id == previous) {
+                group.browser_split = split;
+                if let Some(browser) = &group.browser {
+                    browser.set_visible(false);
+                }
+            }
+            self.browser_paned.set_end_child(gtk::Widget::NONE);
+        }
+        if let Some(id) = want
+            && let Some(group) = self.groups.iter().find(|g| g.id == id)
+            && let Some(browser) = &group.browser
+        {
+            let split = group.browser_split as i32;
+            let widget = browser.widget().clone();
+            browser.set_visible(true);
+            self.browser_paned.set_end_child(Some(&widget));
+            self.browser_paned.set_position(split);
+            self.attached_browser = Some(id);
+        }
+    }
+
+    /// Alt-2: no browser → spawn and show; hidden → show; shown → hide.
+    /// Never panics: a failure to spawn leaves the group without a browser and
+    /// reports the reason, mirroring how the app degrades without tmux.
+    fn toggle_browser(&mut self) {
+        let Some(id) = self.active_group() else {
+            return;
+        };
+        let Some(group) = self.groups.iter().find(|g| g.id == id) else {
+            return;
+        };
+        if group.browser.is_some() {
+            let visible = group.browser_visible;
+            if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                group.browser_visible = !visible;
+            }
+        } else {
+            // Keyed by the group's uuid: ids are reused, so an id-keyed
+            // profile could be one the startup sweep is still deleting.
+            let uuid = group.uuid.clone();
+            match Browser::spawn(&uuid, &self.state_dir) {
+                Ok(browser) => {
+                    if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                        group.browser = Some(browser);
+                        group.browser_visible = true;
+                    }
+                    self.start_browser_poll();
+                }
+                Err(err) => {
+                    self.show_notice(&err.to_string());
+                    return;
+                }
+            }
+        }
+        self.sync_browser_pane();
+    }
+
+    /// Tear a group's browser down: terminate and reap Chromium, close the
+    /// pane, then either remove the profile directory (deliberate close) or
+    /// keep it (unexpected death, so the session can come back).
+    ///
+    /// Idempotent: a second call for a group whose browser is already gone —
+    /// e.g. a duplicate `BrowserDied` from the exit poll — is a no-op.
+    fn close_browser(&mut self, id: usize, disposition: ProfileDisposition) {
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
+            return;
+        };
+        let Some(mut browser) = group.browser.take() else {
+            return;
+        };
+        group.browser_visible = false;
+        if self.attached_browser == Some(id) {
+            self.browser_paned.set_end_child(gtk::Widget::NONE);
+            self.attached_browser = None;
+        }
+        browser.teardown(disposition);
+        drop(browser);
+        self.sync_browser_pane();
+    }
+
+    /// Remember the divider position of the split the user just dragged, on
+    /// the group it belongs to. Persisting happens with the next layout
+    /// mutation or at shutdown, not per drag step.
+    fn on_browser_split_changed(&mut self) {
+        let Some(id) = self.attached_browser else {
+            return;
+        };
+        let position = self.browser_paned.position() as f64;
+        if position <= 0.0 {
+            return;
+        }
+        if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+            group.browser_split = position;
+        }
+    }
+
+    /// Start the exit poll once, on the first browser. klamottenkiste cannot
+    /// report the hosted client's exit, so `try_wait` on a timer is the only
+    /// way to notice a crash or the user quitting from inside Chromium.
+    fn start_browser_poll(&mut self) {
+        if self.browser_poll_running {
+            return;
+        }
+        self.browser_poll_running = true;
+        let input = self.input.clone();
+        gtk::glib::timeout_add_seconds_local(BROWSER_POLL_SECS, move || {
+            match input.send(Msg::PollBrowsers) {
+                Ok(()) => gtk::glib::ControlFlow::Continue,
+                // The component is gone; stop ticking.
+                Err(_) => gtk::glib::ControlFlow::Break,
+            }
+        });
+    }
+
+    /// Reap exited Chromium processes; each one comes back as `BrowserDied`.
+    fn poll_browsers(&mut self) {
+        let mut dead = Vec::new();
+        for group in self.groups.iter_mut() {
+            let id = group.id;
+            if let Some(browser) = &mut group.browser {
+                match browser.has_exited() {
+                    Ok(true) => dead.push(id),
+                    Ok(false) => {}
+                    Err(err) => eprintln!("kabelsalat: browser {id} could not be polled: {err}"),
+                }
+            }
+        }
+        for id in dead {
+            let _ = self.input.send(Msg::BrowserDied(id));
+        }
+    }
+
+    /// Post-restore browser work: sweep stale profile directories on a worker
+    /// thread (pure filesystem IO, no GTK), then bring restored browsers up
+    /// sequentially, the active group first, one per idle callback so the
+    /// window is interactive immediately.
+    fn start_browser_maintenance(&mut self) {
+        // Keyed by uuid: a never-reused key means a freshly created group can
+        // never claim a directory this sweep is concurrently deleting.
+        let live: HashSet<String> = self.groups.iter().map(|g| g.uuid.clone()).collect();
+        let state_dir = self.state_dir.clone();
+        // The sweep decides purely by uuid, so it is only safe while the uuids
+        // it compares against are the ones the next start will see too.
+        if profile_sweep_allowed(self.uuids_unpersisted.get()) {
+            std::thread::spawn(move || {
+                if let Err(err) = browser::sweep_profiles(&state_dir, &live) {
+                    eprintln!("kabelsalat: stale browser profiles: {err}");
+                }
+            });
+        } else {
+            eprintln!(
+                "kabelsalat: skipping the stale browser profile sweep — group ids \
+                 could not be persisted, so no profile can be proven stale"
+            );
+        }
+
+        let active = self.active_group();
+        let mut pending: Vec<usize> = self
+            .groups
+            .iter()
+            .filter(|g| g.browser_visible && g.browser.is_none())
+            .map(|g| g.id)
+            .collect();
+        // The browser the user can actually see becomes usable first.
+        pending.sort_by_key(|id| Some(*id) != active);
+        // Only the active group's browser is shown; the rest come back hidden
+        // and announce themselves with the header-bar icon.
+        for group in self.groups.iter_mut() {
+            if Some(group.id) != active {
+                group.browser_visible = false;
+            }
+        }
+        self.pending_browser_restore = pending;
+        self.queue_browser_restore();
+    }
+
+    /// Ask for the next pending restore on an idle callback.
+    fn queue_browser_restore(&self) {
+        let Some(id) = self.pending_browser_restore.first().copied() else {
+            return;
+        };
+        let input = self.input.clone();
+        gtk::glib::idle_add_local_once(move || {
+            let _ = input.send(Msg::RestoreBrowser(id));
+        });
+    }
+
+    /// Bring one restored group's browser up, then queue the next. A group
+    /// that vanished (or gained a browser) meanwhile is simply skipped.
+    fn restore_browser(&mut self, id: usize) {
+        self.pending_browser_restore.retain(|&g| g != id);
+        let wanted = self
+            .groups
+            .iter()
+            .find(|g| g.id == id && g.browser.is_none())
+            .map(|g| g.uuid.clone());
+        if let Some(uuid) = wanted {
+            match Browser::spawn(&uuid, &self.state_dir) {
+                Ok(browser) => {
+                    if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                        group.browser = Some(browser);
+                    }
+                    self.start_browser_poll();
+                }
+                Err(err) => {
+                    eprintln!("kabelsalat: restoring browser for group {id}: {err}");
+                    if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                        group.browser_visible = false;
+                    }
+                    // One dialog, however many groups fail for the same reason.
+                    if !self.browser_restore_error_shown {
+                        self.browser_restore_error_shown = true;
+                        self.show_notice(&err.to_string());
+                    }
+                }
+            }
+        }
+        self.sync_browser_pane();
+        self.queue_browser_restore();
     }
 
     /// Show the "hold Shift to select" icon and (re)arm its hide timer.
@@ -858,8 +1367,7 @@ impl App {
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == target) {
             group.last_active = active;
         }
-        self.groups
-            .retain(|g| self.tabs.iter().any(|t| t.group == g.id));
+        self.prune_empty_groups();
         self.rebuild_list();
     }
 
@@ -1063,6 +1571,49 @@ impl App {
         self.rebuild_list();
     }
 
+    /// Drop every group that has no tabs left. A pruned group's `Browser` goes
+    /// with it (kill Chromium, close the pane, remove the profile dir), so its
+    /// widget must be unparented first.
+    fn prune_empty_groups(&mut self) {
+        let live: HashSet<usize> = self.tabs.iter().map(|t| t.group).collect();
+        if self.groups.iter().all(|g| live.contains(&g.id)) {
+            return;
+        }
+        if let Some(attached) = self.attached_browser
+            && !live.contains(&attached)
+        {
+            self.browser_paned.set_end_child(gtk::Widget::NONE);
+            self.attached_browser = None;
+        }
+        // A group that lost its browser to an unexpected Chromium exit keeps
+        // its profile while the group lives (so the next Alt-2 restores the
+        // session). Once the group itself goes away there is no `Browser` left
+        // to dispose of it, so reclaim it here — otherwise it would survive
+        // until the next startup sweep.
+        for uuid in reclaimable_profiles(
+            self.groups
+                .iter()
+                .map(|g| (g.id, g.uuid.as_str(), g.browser.is_some())),
+            &live,
+        ) {
+            browser::remove_profile_in_background(&browser::profile_dir(&self.state_dir, &uuid));
+        }
+        // One shared SIGTERM deadline for all doomed browsers. Dropping the
+        // groups below would tear each one down serially instead, costing
+        // `k * TERM_GRACE` of frozen UI when k groups empty at once; this
+        // costs at most TERM_GRACE. `shutdown_all` leaves each `Browser`
+        // already torn down, so the later `Drop` is a no-op.
+        browser::shutdown_all(
+            self.groups
+                .iter_mut()
+                .filter(|g| !live.contains(&g.id))
+                .filter_map(|g| g.browser.as_mut()),
+            browser::TERM_GRACE,
+            ProfileDisposition::Remove,
+        );
+        self.groups.retain(|g| live.contains(&g.id));
+    }
+
     fn activate(&mut self, id: usize) {
         if self.active == Some(id) {
             return; // also breaks the select_row → row-selected → Select cycle
@@ -1077,6 +1628,9 @@ impl App {
         self.stack.set_visible_child(&tab.terminal);
         tab.terminal.grab_focus();
         self.rebuild_list();
+        // A group change always implies a tab change, so this is the single
+        // funnel for swapping the parented browser pane.
+        self.sync_browser_pane();
     }
 
     fn close_tab(&mut self, id: usize) {
@@ -1092,8 +1646,7 @@ impl App {
             eprintln!("failed to kill session {}: {err}", tab.uuid);
         }
         self.stack.remove(&tab.terminal);
-        self.groups
-            .retain(|g| self.tabs.iter().any(|t| t.group == g.id));
+        self.prune_empty_groups();
 
         if self.tabs.is_empty() {
             relm4::main_application().quit();
@@ -1149,8 +1702,7 @@ impl App {
         {
             group.last_active = src;
         }
-        self.groups
-            .retain(|g| self.tabs.iter().any(|t| t.group == g.id));
+        self.prune_empty_groups();
         self.rebuild_list();
     }
 
@@ -1188,8 +1740,7 @@ impl App {
         {
             group.last_active = src;
         }
-        self.groups
-            .retain(|g| self.tabs.iter().any(|t| t.group == g.id));
+        self.prune_empty_groups();
         self.rebuild_list();
     }
 
@@ -1440,10 +1991,7 @@ impl App {
             return;
         };
         button.set_tooltip_text(Some(&tab.title));
-        if let Some(label) = button
-            .child()
-            .and_then(|w| w.downcast::<gtk::Label>().ok())
-        {
+        if let Some(label) = button.child().and_then(|w| w.downcast::<gtk::Label>().ok()) {
             let active = self.active == Some(tab.id);
             label.set_width_chars(tab_label_min_chars(tab.title.chars().count(), active));
             label.set_label(&tab.title);
@@ -1634,7 +2182,7 @@ impl App {
     fn show_help(&self) {
         let body: String = SHORTCUTS
             .iter()
-            .filter(|(t, _, _)| *t != "<Alt><Shift>1" && *t != "<Alt>exclam")
+            .filter(|(t, _, _)| !SHORTCUT_ALIASES.contains(t))
             .map(|(trigger, desc, _)| {
                 format!(
                     "{}  —  {desc}\n",
@@ -1707,6 +2255,46 @@ fn reorder_groups(order: &mut Vec<usize>, src: usize, dest: usize) {
         return;
     };
     order.insert(di, id);
+}
+
+/// Should a group be persisted as having its browser open? True while it has a
+/// live `Browser`, and also while it is still queued for restore — restore is
+/// sequential and idle-driven, so several groups are legitimately "open but not
+/// yet spawned" at once, and a save in that window must not forget them.
+fn browser_open_desired(has_browser: bool, pending_restore: &[usize], id: usize) -> bool {
+    has_browser || pending_restore.contains(&id)
+}
+
+/// Uuids whose profile directory nobody will dispose of when the groups not in
+/// `live` are dropped. Pure.
+///
+/// A group that still holds a `Browser` needs no entry here: dropping the
+/// `Browser` removes the profile itself. A group whose browser already died
+/// (profile deliberately kept) has nothing left to run that cleanup, so its
+/// profile is named here instead.
+fn reclaimable_profiles<'a, I>(groups: I, live: &HashSet<usize>) -> Vec<String>
+where
+    I: IntoIterator<Item = (usize, &'a str, bool)>,
+{
+    groups
+        .into_iter()
+        .filter(|(id, _, has_browser)| !has_browser && !live.contains(id))
+        .map(|(_, uuid, _)| uuid.to_string())
+        .collect()
+}
+
+/// May the stale-profile sweep run? Only when the group uuids in the loaded
+/// state are known to be on disk. Pure.
+///
+/// The sweep deletes every profile directory whose name is not a live group
+/// uuid. That is only sound while the uuids are stable across restarts. When
+/// `state::load` had to backfill uuids and writing them back failed, the next
+/// start mints *different* ones — so today's "live" set is provably worthless
+/// as a liveness oracle, and every existing profile would look stale. Standing
+/// down leaves at most some genuinely stale directories on disk, which the next
+/// successful start sweeps up; the alternative destroys live sessions.
+fn profile_sweep_allowed(uuids_unpersisted: bool) -> bool {
+    !uuids_unpersisted
 }
 
 /// Whether a `list-sessions` result *definitively* proves the tab's backing
@@ -1931,6 +2519,89 @@ fn spawn_shell(terminal: &Terminal, cwd: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_browser_is_persisted_as_open() {
+        assert!(browser_open_desired(true, &[], 1));
+    }
+
+    #[test]
+    fn group_queued_for_restore_is_persisted_as_open() {
+        // The regression: a save inside the sequential restore window must
+        // not write browser_open=false for groups not spawned yet.
+        assert!(browser_open_desired(false, &[2, 3], 3));
+        assert!(browser_open_desired(false, &[2, 3], 2));
+    }
+
+    #[test]
+    fn group_without_browser_and_not_queued_is_persisted_as_closed() {
+        assert!(!browser_open_desired(false, &[2, 3], 4));
+        assert!(!browser_open_desired(false, &[], 1));
+    }
+
+    // --- profile reclamation on group deletion ---------------------------
+
+    fn live_ids(ids: &[usize]) -> HashSet<usize> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_deleted_group_whose_browser_already_died_gets_its_profile_reclaimed() {
+        // The regression: after BrowserDied the profile is kept on purpose,
+        // but then no Browser remains to dispose of it when the group goes.
+        let groups = [(1, "uuid-1", false), (2, "uuid-2", false)];
+        assert_eq!(
+            reclaimable_profiles(groups.iter().copied(), &live_ids(&[1])),
+            vec!["uuid-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_deleted_group_with_a_live_browser_is_left_to_its_browser() {
+        // Dropping the `Browser` removes the profile; queueing it here too
+        // would delete a path twice.
+        let groups = [(2, "uuid-2", true)];
+        assert!(reclaimable_profiles(groups.iter().copied(), &live_ids(&[])).is_empty());
+    }
+
+    #[test]
+    fn surviving_groups_never_lose_their_profile() {
+        let groups = [(1, "uuid-1", false), (2, "uuid-2", true)];
+        assert!(reclaimable_profiles(groups.iter().copied(), &live_ids(&[1, 2])).is_empty());
+    }
+
+    // --- profile keys are uuids, never reusable ids -----------------------
+
+    #[test]
+    fn profile_paths_are_keyed_by_uuid_so_a_reused_id_cannot_collide() {
+        // app.rs rebuilds next_group_id as max(id) + 1, so deleting the
+        // highest group makes the next one reuse that id. Two such groups must
+        // still get different profile directories.
+        let old = state::SavedGroup::new(3, "old".to_string(), 0);
+        let new = state::SavedGroup::new(3, "new".to_string(), 0);
+        assert_eq!(old.id, new.id);
+        assert_ne!(old.uuid, new.uuid);
+        let dir = std::path::Path::new("/state");
+        assert_ne!(
+            browser::profile_dir(dir, &old.uuid),
+            browser::profile_dir(dir, &new.uuid)
+        );
+    }
+
+    #[test]
+    fn a_group_uuid_survives_the_save_load_roundtrip_into_the_profile_path() {
+        let saved = state::SavedGroup::new(1, "g".to_string(), 0);
+        let restored_uuid = saved.uuid.clone();
+        let dir = std::path::Path::new("/state");
+        assert_eq!(
+            browser::profile_dir(dir, &restored_uuid),
+            browser::profile_dir(dir, &saved.uuid)
+        );
+        // And the sweep considers exactly that key live.
+        let live: HashSet<String> = std::iter::once(restored_uuid.clone()).collect();
+        assert!(!browser::is_stale_profile(&restored_uuid, &live));
+        assert!(browser::is_stale_profile("1", &live));
+    }
 
     fn session(uuid: &str) -> SessionInfo {
         SessionInfo {
@@ -2179,5 +2850,47 @@ mod tests {
     fn linger_body_mentions_reversibility_via_disable_linger() {
         let body = linger_warning_body();
         assert!(body.contains("disable-linger"));
+    }
+
+    #[test]
+    fn sweep_is_allowed_when_uuids_are_known_to_be_on_disk() {
+        assert!(profile_sweep_allowed(false));
+    }
+
+    #[test]
+    fn sweep_stands_down_when_backfilled_uuids_were_not_persisted() {
+        // The regression: a failed state write used to leave freshly minted
+        // uuids in memory only, and the sweep then deleted every profile
+        // directory as "stale" — destroying live browser sessions.
+        assert!(!profile_sweep_allowed(true));
+    }
+
+    #[test]
+    fn a_backfilled_but_successfully_persisted_load_still_sweeps() {
+        // Backfill alone must not disable cleanup forever: once the write
+        // lands, the uuids are stable and the sweep is sound again.
+        let dir =
+            std::env::temp_dir().join(format!("kabelsalat-sweep-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(
+            &path,
+            br#"{"groups":[{"id":0,"name":"","palette":0}],"tabs":[],"active":null,"sidebar_visible":true}"#,
+        )
+        .unwrap();
+
+        let loaded = state::load_detailed(&path);
+        assert!(loaded.uuids_backfilled);
+        assert!(!profile_sweep_allowed(loaded.uuids_backfilled));
+
+        // This is what `restore_or_fresh` does with the backfilled state.
+        state::save(&loaded.state, &path).unwrap();
+        let again = state::load_detailed(&path);
+        assert!(!again.uuids_backfilled);
+        assert!(profile_sweep_allowed(again.uuids_backfilled));
+        assert_eq!(again.state.groups[0].uuid, loaded.state.groups[0].uuid);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

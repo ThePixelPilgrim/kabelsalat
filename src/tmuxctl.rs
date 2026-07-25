@@ -502,12 +502,14 @@ fn percent_decode(input: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(hi << 4 | lo);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+            continue;
+        }
         out.push(bytes[i]);
         i += 1;
     }
@@ -608,7 +610,14 @@ mod tests {
         // affects a freshly created session (ignored on reattach).
         assert_eq!(
             &argv[5..11],
-            ["new-session", "-A", "-c", "/home/user/proj", "-s", "ks-1234-abcd"]
+            [
+                "new-session",
+                "-A",
+                "-c",
+                "/home/user/proj",
+                "-s",
+                "ks-1234-abcd"
+            ]
         );
         assert!(!argv[11].is_empty()); // $SHELL or /bin/bash
         std::fs::remove_dir_all(&dir).ok();

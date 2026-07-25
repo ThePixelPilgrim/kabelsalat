@@ -1,6 +1,7 @@
 use relm4::RelmApp;
 
 mod app;
+pub mod browser;
 pub mod state;
 pub mod tmuxctl;
 
@@ -10,6 +11,7 @@ pub fn run() {
     let app = RelmApp::new(APP_ID);
     relm4::set_global_css(
         ".tmux-warning { color: #e5a50a; }
+         .browser-hidden { color: #3584e4; }
          .select-hint { color: #3584e4; animation: ks-pulse 1s ease-in-out infinite; }
          @keyframes ks-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
          .tab-crashed label { color: #e01b24; font-weight: bold; }
