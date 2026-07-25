@@ -10,5 +10,13 @@ dest="${HOME}/.claude/skills/kabelsalat"
 
 [ -d "$src" ] || { echo "no skill at $src" >&2; exit 1; }
 mkdir -p "$(dirname "$dest")"
+
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+	if [ ! -L "$dest" ]; then
+		echo "refusing to overwrite $dest: not a symlink (remove or move it first)" >&2
+		exit 1
+	fi
+fi
+
 ln -sfn "$src" "$dest"
 echo "linked $dest -> $src"

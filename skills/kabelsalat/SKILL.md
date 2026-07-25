@@ -1,6 +1,6 @@
 ---
 name: kabelsalat
-description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess. Launches it in a named group of the user's running kabelsalat terminal.
+description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess; not for commands whose output you need to capture or read back. Launches it in a named group of the user's running kabelsalat terminal.
 ---
 
 # Launching terminals in kabelsalat
