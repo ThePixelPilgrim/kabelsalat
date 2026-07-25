@@ -53,6 +53,22 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
 | `Alt+1` | Toggle the tab pane |
 | `F1` | Show the shortcut list |
 
+## Command line
+
+With kabelsalat running, a second invocation talks to it instead of opening a
+second window:
+
+    kabelsalat groups                      # uuid, name and tab count per group
+    kabelsalat run -g web -- npm run dev   # new tab in the "web" group
+
+`--group` takes a group name or uuid; `--cwd` overrides the working directory,
+which defaults to the caller's. Everything after `--` is the command. The new
+tab does not steal focus. Exit codes: 0 success, 1 not running, 2 usage,
+3 no such group.
+
+`scripts/install-skill.sh` links `skills/kabelsalat` into `~/.claude/skills/`
+so Claude Code knows how to use this.
+
 ## Requirements
 
 - Rust 1.85 or newer (edition 2024)

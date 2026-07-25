@@ -19,6 +19,12 @@ This file provides guidance to Claude Code when working with code in this reposi
 - `src/tmuxctl.rs` never panics: every fallible path returns `Result`. No `unwrap`/`expect` on tmux interaction.
 - `src/app.rs` is the relm4 component holding all GUI state and side effects.
 - The app must keep working when tmux is missing or older than 3.2 — it degrades to plain shells without session survival rather than erroring out.
+- `src/cli.rs` is pure logic — argv parsing, group resolution, and the decision
+  of what an invocation prints and exits with. No GTK, no gio, no tmux, no I/O;
+  it is where the CLI's unit tests live. `src/control.rs` holds the gio glue and
+  the group snapshot the command-line handler reads.
+- A CLI-created tab must not steal focus: no activate, no window raise, no
+  active-group change, and no touching the group's browser pane.
 
 ## Runtime facts
 
