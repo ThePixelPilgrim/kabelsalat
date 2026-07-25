@@ -40,6 +40,49 @@ impl Cli {
     }
 }
 
+/// One group as the CLI sees it: the stable uuid, the (possibly empty,
+/// possibly duplicated) name, and how many tabs it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupInfo {
+    pub uuid: String,
+    pub name: String,
+    pub tabs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    NotFound,
+    /// The name matched several groups; these are their uuids, in list order.
+    Ambiguous(Vec<String>),
+}
+
+/// Find the group a `--group` value refers to.
+///
+/// A uuid always wins, so a group whose *name* happens to equal another
+/// group's uuid can never shadow it. Names are matched exactly and
+/// case-sensitively — no prefix or fuzzy matching, so `web` and `web-2` can
+/// never be confused. Unnamed groups are reachable only by uuid: an empty
+/// selector matches nothing rather than matching all of them.
+pub fn resolve_group<'a>(
+    groups: &'a [GroupInfo],
+    selector: &str,
+) -> Result<&'a GroupInfo, ResolveError> {
+    if let Some(group) = groups.iter().find(|g| g.uuid == selector) {
+        return Ok(group);
+    }
+    if selector.is_empty() {
+        return Err(ResolveError::NotFound);
+    }
+    let matches: Vec<&GroupInfo> = groups.iter().filter(|g| g.name == selector).collect();
+    match matches.as_slice() {
+        [] => Err(ResolveError::NotFound),
+        [only] => Ok(only),
+        many => Err(ResolveError::Ambiguous(
+            many.iter().map(|g| g.uuid.clone()).collect(),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageError(pub String);
 
@@ -217,5 +260,89 @@ mod tests {
     fn unknown_commands_and_flags_are_usage_errors() {
         assert!(parse(&args(&["frobnicate"])).is_err());
         assert!(parse(&args(&["run", "--verbose", "-g", "web", "--", "ls"])).is_err());
+    }
+
+    fn sample_groups() -> Vec<GroupInfo> {
+        vec![
+            GroupInfo {
+                uuid: "aaa-111".into(),
+                name: "web".into(),
+                tabs: 2,
+            },
+            GroupInfo {
+                uuid: "bbb-222".into(),
+                name: "api".into(),
+                tabs: 1,
+            },
+            GroupInfo {
+                uuid: "ccc-333".into(),
+                name: "api".into(),
+                tabs: 3,
+            },
+            GroupInfo {
+                uuid: "ddd-444".into(),
+                name: String::new(),
+                tabs: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn resolves_a_uuid() {
+        let groups = sample_groups();
+        assert_eq!(resolve_group(&groups, "ccc-333").unwrap().uuid, "ccc-333");
+    }
+
+    #[test]
+    fn resolves_a_unique_name() {
+        let groups = sample_groups();
+        assert_eq!(resolve_group(&groups, "web").unwrap().uuid, "aaa-111");
+    }
+
+    #[test]
+    fn a_duplicate_name_is_ambiguous_and_lists_candidates() {
+        let groups = sample_groups();
+        match resolve_group(&groups, "api") {
+            Err(ResolveError::Ambiguous(uuids)) => {
+                assert_eq!(uuids, vec!["bbb-222".to_string(), "ccc-333".to_string()]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_selector_is_not_found() {
+        let groups = sample_groups();
+        assert_eq!(resolve_group(&groups, "nope"), Err(ResolveError::NotFound));
+    }
+
+    #[test]
+    fn an_unnamed_group_is_reachable_only_by_uuid() {
+        let groups = sample_groups();
+        assert_eq!(resolve_group(&groups, "ddd-444").unwrap().tabs, 1);
+        assert_eq!(resolve_group(&groups, ""), Err(ResolveError::NotFound));
+    }
+
+    #[test]
+    fn a_uuid_beats_a_name_that_collides_with_it() {
+        let groups = vec![
+            GroupInfo {
+                uuid: "xyz".into(),
+                name: "other".into(),
+                tabs: 1,
+            },
+            GroupInfo {
+                uuid: "qqq".into(),
+                name: "xyz".into(),
+                tabs: 1,
+            },
+        ];
+        assert_eq!(resolve_group(&groups, "xyz").unwrap().uuid, "xyz");
+    }
+
+    #[test]
+    fn name_matching_is_case_sensitive() {
+        let groups = sample_groups();
+        assert_eq!(resolve_group(&groups, "Web"), Err(ResolveError::NotFound));
     }
 }
