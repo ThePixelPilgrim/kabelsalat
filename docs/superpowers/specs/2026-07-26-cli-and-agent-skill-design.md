@@ -19,16 +19,25 @@ kabelsalat group, and see which groups exist in order to pick one.
 ## Non-goals
 
 Listing tabs, creating groups, closing tabs, focusing tabs, sending input to an
-existing tab, reading a tab's output. The surface stays at two commands; more
-can be added once the transport exists.
+existing tab, reading a tab's output. The surface stays at two working
+subcommands plus `help`; more can be added once the transport exists.
 
 ## CLI surface
 
 ```
-kabelsalat                                    # unchanged: start or raise the GUI
+kabelsalat                                    # unchanged: start the GUI, or activate the running one
 kabelsalat groups                             # list groups
 kabelsalat run --group <name|uuid> [--cwd DIR] -- <command> [args...]
+kabelsalat help | --help | -h                 # usage
 ```
+
+A plain `kabelsalat` does not *raise* the existing window — relm4's activate
+handler only sets it visible, which is a no-op on a window that already is. That
+was true before this work too; it is stated here because it is easy to document
+as "raise" and be wrong.
+
+`help` is answered locally and never contacts the bus, so it works with or
+without a running instance.
 
 `groups` prints one line per group, tab-separated, no header:
 
@@ -92,7 +101,9 @@ the exit status back to the caller.
 
 ```rust
 pub fn run() {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let cli = cli::parse(&args);          // usage errors exit 2 here
 
     let app = adw::Application::builder()
@@ -101,15 +112,18 @@ pub fn run() {
         .build();
     app.connect_command_line(handle_command_line);
 
-    if cli.is_subcommand() {
+    if cli.needs_instance() {
         // Never start a GUI for a subcommand.
-        if app.register(gio::Cancellable::NONE).is_err() || !app.is_remote() {
-            eprintln!("kabelsalat is not running");
-            std::process::exit(1);
+        match instance_is_running() {
+            Ok(true) => std::process::exit(app.run_with_args(&args).get().into()),
+            Ok(false) => eprintln!("kabelsalat: not running"),
+            Err(err) => eprintln!("kabelsalat: not running ({err})"),
         }
-        std::process::exit(app.run_with_args(&args).value());
+        std::process::exit(cli::EXIT_NOT_RUNNING.into());
     }
 
+    relm4::gtk::init()?;
+    adw::init()?;
     relm4::set_global_css(...);
     RelmApp::from_app(app).with_args(args).run::<app::App>(());
 }
@@ -130,9 +144,27 @@ With `HANDLES_COMMAND_LINE` set, GApplication no longer emits `activate` by
 itself, so the no-subcommand branch of the handler must call `app.activate()`
 explicitly or the window never becomes visible.
 
-`register()` + `is_remote()` is the "is it running?" test. When not remote, the
-process has briefly taken the bus name and then exits — it never reaches
-`startup`, so no window is created.
+The "is it running?" test is a `NameHasOwner` call for `APP_ID` on the session
+bus, made before any GTK contact.
+
+The obvious test — `register()` then `is_remote()` — is wrong, and it took a
+review to see why: `g_application_register()` emits `startup` as a side effect
+when the process becomes the *primary* instance, and `GtkApplication`'s startup
+calls `gtk_init()`, which prints `Gtk-WARNING: Failed to open display` and calls
+`exit(1)` from inside GTK when there is no display. So `kabelsalat groups` on a
+tty, over ssh, or in a systemd unit died inside GTK and never printed our own
+message; the exit code was 1 only because GTK happens to choose 1. Querying the
+bus for name ownership decides the same question without ever constructing a
+GTK anything.
+
+A bus that cannot be reached, a failed call, and an undecodable reply all mean
+the same thing operationally — there is no instance to talk to — so all three
+exit `EXIT_NOT_RUNNING`, with the underlying error included in the message so a
+broken bus stays distinguishable from an absent app.
+
+One race remains and is accepted: if the GUI exits between the ownership check
+and `run_with_args`, this process can still become primary. No D-Bus API offers
+an atomic connect-only-if-owned, so any check-then-act scheme has this window.
 
 ### Answering without deadlocking
 
@@ -170,9 +202,15 @@ The handler therefore:
    uuid, and exits 0.
 
 Validation happens before the message is sent, so the exit code is meaningful
-without a reply channel. A `run` that resolves but then fails to spawn (a tmux
-error, say) surfaces in the GUI as a crashed tab, exactly as a GUI-initiated
-tab would.
+without a reply channel. Be precise about what that does *not* promise: exit 0
+means the request was validated against the snapshot and queued, not that the
+tab exists. If the group disappears in the moment between the two, the handler
+gives up and reports to the GUI's stderr, invisible to a caller that has already
+been told 0. The window is sub-millisecond and the human-scale `groups`-then-
+`run` sequence is unaffected, because a rename or close republishes the snapshot
+and the next `run` then fails cleanly with exit 3. A `run` that resolves but
+fails to spawn for other reasons (a tmux error, say) surfaces in the GUI as a
+crashed tab, exactly as a GUI-initiated tab would.
 
 ## Spawn path
 
@@ -187,14 +225,30 @@ into `spawn_backing`:
 - **no-tmux path**: `spawn_shell(terminal, cwd, command)` passes argv straight
   to VTE, which is exact. The app keeps working without tmux, as required.
 
+The working directory needs escaping of its own, which is not obvious: tmux runs
+`format_single()` over the `-c` argument, and tmux's format syntax includes
+`#(shell-command)`. An unescaped `#(...)` in a path therefore *executes*, and
+does so even when the directory does not exist, because tmux tolerates a bad
+`-c`. `spawn_argv` escapes `#` as `##` before handing the path over. This
+matters more here than it used to: before the CLI, `cwd` only ever came from
+`active_tab_cwd()` — a real path read back from tmux or VTE — whereas now it is
+caller-supplied text. The escaping lives in `spawn_argv` so the GUI's own
+new-tab path is covered by the same guard.
+
 The initial tab title is the basename of `argv[0]` (e.g. `claude`), until the
 program sets its own title via OSC.
 
 Nothing new is persisted. `SavedTab` gains no field: the tmux session survives
 restarts and reattaches with its command intact, and `respawn-pane` re-runs the
-pane's original command. When the command exits, the existing `remain-on-exit`
-behaviour keeps the tab visible with its exit status, and the existing
-`RestartTab` path re-runs it.
+pane's original command.
+
+What happens when the command finishes depends on how it finished, because the
+tmux config sets `remain-on-exit failed` rather than `on`: a **non-zero** exit
+keeps the pane, so the tab stays visible showing its status and the existing
+`RestartTab` path re-runs it, while a **clean** exit ends the session, and
+`Msg::ChildExited` then closes the tab and prunes the group if it emptied. The
+skill documents this distinction, since an agent that promises the user a tab
+which has already vanished is the failure mode worth preventing.
 
 ## GUI side effects: none
 
@@ -213,7 +267,8 @@ typing into another tab.
 
 | File | Change |
 |------|--------|
-| `src/cli.rs` | **new**, pure: argv → `Cli` enum, group resolution over `&[GroupInfo]`. No GTK, no tmux, no I/O. Unit-tested like `state.rs`. |
+| `src/cli.rs` | **new**, pure: argv → `Cli` enum, group resolution over `&[GroupInfo]`, and `dispatch` deciding what to print and exit with. No GTK, no gio, no tmux, no I/O. Unit-tested like `state.rs`. |
+| `src/control.rs` | **new**, the gio glue: the `CONTROL` snapshot, the one-way spawn request, and the `command-line` handler that feeds `cli::dispatch` and prints its outcome. |
 | `src/lib.rs` | Build the `adw::Application` with the flag, register the `command-line` handler, implement the not-running check and the remote exit-status path. |
 | `src/app.rs` | Publish the `CONTROL` snapshot; handle `Msg::SpawnCommand`; thread the command parameter through `add_tab`/`spawn_backing`/`spawn_shell`. |
 | `src/tmuxctl.rs` | `spawn_argv` accepts an optional command; add shell quoting. Still never panics, still returns `Result`. |
@@ -224,6 +279,14 @@ typing into another tab.
 Argument parsing is hand-rolled. The surface is two subcommands and three flags;
 `clap` would add a dependency tree for roughly sixty lines of code, and the
 parser is pure and directly unit-testable either way.
+
+One dependency line did change, against the "no new crates" rule: `Cargo.toml`
+gains `gio = { version = "0.22", features = ["v2_80"] }`. No crate is added —
+`gio` was already in the tree via gtk4, `Cargo.lock` gains only a dependency
+edge, and the version range is the one gtk4 itself declares, so unification is
+guaranteed rather than lucky. The entry exists solely to enable the feature
+gating `ApplicationCommandLine::print_literal`/`printerr_literal`. It raises no
+floor: `v2_80` means glib ≥ 2.80, which GTK 4.18 already requires.
 
 ## Skill
 
