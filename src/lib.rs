@@ -49,7 +49,13 @@ fn instance_is_running() -> Result<bool, String> {
 }
 
 pub fn run() {
-    let args: Vec<String> = std::env::args().collect();
+    // args_os + lossy conversion, not args(): the latter panics on non-UTF-8
+    // arguments, which would abort with an undocumented exit code instead of
+    // one of cli::EXIT_*. handle_command_line in control.rs already does the
+    // same lossy conversion for forwarded arguments.
+    let args: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     // Usage errors are decided here, before anything touches the bus, so a
     // typo reports as a typo whether or not a GUI is running.
     let parsed = match cli::parse(&args) {

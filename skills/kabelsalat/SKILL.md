@@ -63,4 +63,6 @@ and the user's current tab keeps their keystrokes. So always tell the user
 which group the tab appeared in, or they will not notice it.
 
 You cannot read the tab's output, send input to it, or close it. If the
-command exits, the tab stays visible showing its exit status.
+command fails (non-zero exit), the tab stays visible showing its exit status
+and can be restarted. If it exits successfully (status 0), its tab closes on
+its own — do not tell the user to go look for it.

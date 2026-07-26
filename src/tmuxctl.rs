@@ -314,7 +314,7 @@ impl TmuxCtl {
         ];
         if let Some(dir) = cwd {
             argv.push("-c".into());
-            argv.push(dir.to_string_lossy().into_owned());
+            argv.push(escape_tmux_format(&dir.to_string_lossy()));
         }
         argv.push("-s".into());
         argv.push(format!("{SESSION_PREFIX}{uuid}"));
@@ -538,6 +538,16 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Escape `#` as `##` so tmux's `format_single()` cannot expand the string it
+/// is fed as `-c <dir>`. tmux runs *every* `-c`/`-t` style argument through
+/// its format parser before use, and that parser supports `#(shell-command)`
+/// — a directory name is enough to run an arbitrary command. `##` is tmux's
+/// own escape for a literal `#`, so this changes no legitimate path and must
+/// not be "cleaned up" as redundant quoting.
+fn escape_tmux_format(value: &str) -> String {
+    value.replace('#', "##")
+}
+
 /// Join argv into the single shell-command string tmux expects, quoting every
 /// word so spaces, quotes, `$` and `;` reach the program instead of the shell.
 pub(crate) fn shell_quote_argv(argv: &[String]) -> String {
@@ -656,6 +666,44 @@ mod tests {
             ]
         );
         assert!(!argv[11].is_empty()); // $SHELL or /bin/bash
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_argv_escapes_format_expansion_in_cwd() {
+        // finding 1: tmux format-expands the -c argument, so a directory
+        // containing "#(...)" would run a shell command unless "#" is
+        // escaped as "##" first.
+        let dir = temp_dir("argv-cwd-fmt");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_argv(
+            "1234-abcd",
+            Some(Path::new("/tmp/#(touch /tmp/PWNED)")),
+            None,
+        );
+        assert_eq!(argv[8], "/tmp/##(touch /tmp/PWNED)");
+        // No unescaped '#' survives: stripping every doubled "##" (tmux's
+        // literal-# escape) must leave nothing behind.
+        assert!(!argv[8].replace("##", "").contains('#'));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_argv_escapes_bare_hash_in_cwd() {
+        let dir = temp_dir("argv-cwd-hash");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/tmp/#weird")), None);
+        assert_eq!(argv[8], "/tmp/##weird");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_argv_leaves_ordinary_cwd_unchanged() {
+        // Regression guard: the escaping must not alter paths without '#'.
+        let dir = temp_dir("argv-cwd-plain");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")), None);
+        assert_eq!(argv[8], "/home/user/proj");
         std::fs::remove_dir_all(&dir).ok();
     }
 

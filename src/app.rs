@@ -772,12 +772,19 @@ impl SimpleComponent for App {
                     return;
                 };
                 let title = crate::cli::command_title(&argv);
+                // Without tmux, VTE's spawn just fails for a nonexistent
+                // directory and the callback only logs to stderr, leaving a
+                // permanently empty tab even though the CLI already printed a
+                // uuid and exited 0. Drop the cwd so the tab starts in the
+                // default location instead (tmux itself tolerates a missing
+                // -c directory, so this only matters for the no-tmux path).
+                let cwd = cwd.is_dir().then_some(cwd);
                 self.add_tab(
                     tab_uuid,
                     group_id,
                     Some(title),
                     None,
-                    Some(&cwd),
+                    cwd.as_deref(),
                     Some(&argv),
                     &sender,
                 );
