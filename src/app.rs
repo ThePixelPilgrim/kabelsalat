@@ -65,6 +65,15 @@ const BROWSER_POLL_SECS: u32 = 2;
 /// How long the "hold Shift to select" icon stays up after a bare drag.
 const SELECT_HINT_SECS: u32 = 7;
 
+/// Frame-clock ticks to wait for a window allocation wide enough to hold a restored
+/// browser split. `GtkPaned::set_position` clamps to the current width and keeps the
+/// clamped value, so applying a split before the window has settled pins the pane to a
+/// one-pixel sliver. ~1s at 60 Hz is far longer than a startup allocation takes.
+const SPLIT_SETTLE_TICKS: u32 = 60;
+
+/// Width the browser pane keeps when the window is too narrow for its stored split.
+const MIN_BROWSER_PX: i32 = 200;
+
 /// Drag distance, in pixels, below which a drag is treated as a shaky click
 /// rather than an attempted selection.
 const DRAG_THRESHOLD_PX: f64 = 8.0;
@@ -1121,9 +1130,53 @@ impl App {
             let widget = browser.widget().clone();
             browser.set_visible(true);
             self.browser_paned.set_end_child(Some(&widget));
-            self.browser_paned.set_position(split);
+            self.apply_browser_split(split, widget.upcast());
             self.attached_browser = Some(id);
         }
+    }
+
+    /// Restore a split, waiting for an allocation that can actually hold it.
+    ///
+    /// `GtkPaned::set_position` clamps to the paned's *current* width and keeps the
+    /// clamped value — it is not re-derived when the window later grows. Restoring a
+    /// browser happens on an idle callback, before the window has its final size, so
+    /// setting the position straight away pinned the pane to a one-pixel sliver that
+    /// only a mouse drag could undo. Wait for a wide enough allocation instead.
+    fn apply_browser_split(&self, split: i32, widget: gtk::Widget) {
+        if split <= 0 {
+            return;
+        }
+        let paned = self.browser_paned.clone();
+        if paned.width() > split {
+            paned.set_position(split);
+            return;
+        }
+        let target = paned.clone();
+        // `add_tick_callback` takes an `Fn`, so the counter needs interior mutability.
+        let waited = Cell::new(0u32);
+        paned.add_tick_callback(move |_, _| {
+            // A group switch may have swapped this pane out meanwhile; that group's
+            // own split owns the divider now.
+            if target.end_child().as_ref() != Some(&widget) {
+                return gtk::glib::ControlFlow::Break;
+            }
+            if target.width() > split {
+                target.set_position(split);
+                return gtk::glib::ControlFlow::Break;
+            }
+            waited.set(waited.get() + 1);
+            if waited.get() < SPLIT_SETTLE_TICKS {
+                return gtk::glib::ControlFlow::Continue;
+            }
+            // The window is genuinely narrower than the split was saved at, so the
+            // stored value can never be honoured. Give the browser a usable strip
+            // rather than leaving it a sliver — the same outcome a user would drag to.
+            let width = target.width();
+            if width > 0 {
+                target.set_position((width - MIN_BROWSER_PX).max(0));
+            }
+            gtk::glib::ControlFlow::Break
+        });
     }
 
     /// Hand the keyboard to whichever half the user just asked for.
@@ -1141,7 +1194,10 @@ impl App {
             .and_then(|g| g.browser.as_ref());
         if let Some(browser) = browser {
             browser.widget().grab_focus();
-        } else if let Some(tab) = self.active.and_then(|id| self.tabs.iter().find(|t| t.id == id)) {
+        } else if let Some(tab) = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|t| t.id == id))
+        {
             tab.terminal.grab_focus();
         }
     }
