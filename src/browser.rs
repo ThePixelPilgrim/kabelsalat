@@ -26,6 +26,37 @@ pub const BROWSER_CANDIDATES: &[&str] = &["chromium", "chromium-browser", "googl
 /// never reused, which makes that collision impossible.
 pub const PROFILES_SUBDIR: &str = "browsers";
 
+/// Sentinel Chromium looks for in a user-data-dir to decide whether this is a
+/// first run. Its presence — not its contents — is what matters.
+const FIRST_RUN_SENTINEL: &str = "First Run";
+
+/// Chromium's default profile directory inside a user-data-dir.
+const DEFAULT_PROFILE_SUBDIR: &str = "Default";
+
+/// The profile's settings file, read once at startup and rewritten by Chromium.
+const PREFERENCES_FILE: &str = "Preferences";
+
+/// Settings a new pane profile starts with. Chromium merges anything absent from
+/// its own defaults, so this stays to what an embedded pane actually needs:
+///
+/// * no default-browser prompt — this browser lives in a terminal group and is
+///   nobody's system default;
+/// * the welcome page already seen, so a restored group opens on its own page;
+/// * notification permission prompts denied by default — a pane cannot usefully
+///   grant them, so they are pure interruption.
+const DEFAULT_PREFERENCES: &str = r#"{
+  "browser": {
+    "check_default_browser": false,
+    "has_seen_welcome_page": true
+  },
+  "profile": {
+    "default_content_setting_values": {
+      "notifications": 2
+    }
+  }
+}
+"#;
+
 /// How long Chromium gets to exit after `SIGTERM` before it is `SIGKILL`ed.
 ///
 /// This is spent blocking on the GTK main thread, so it is deliberately short:
@@ -141,12 +172,29 @@ impl Browser {
             pane.close();
             return Err(BrowserError::Profile(err));
         }
+        // Only a profile this call created: seeding an existing one would throw
+        // away settings the user made inside the pane.
+        if !profile_existed && let Err(err) = seed_profile(&profile) {
+            pane.close();
+            let _ = remove_profile(&profile);
+            return Err(BrowserError::Profile(err));
+        }
 
         let mut command = Command::new(&binary);
         command
             .arg("--ozone-platform=wayland")
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg("--restore-last-session")
+            // The first-run wizard is for someone setting up a browser, not for a
+            // pane in a terminal: the group's browser should come up on the page
+            // the user wanted, not on a welcome flow.
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            // Teardown gives Chromium `TERM_GRACE` and then kills it, so it usually
+            // records an unclean exit and offers to restore pages on the next start.
+            // That prompt is an artefact of how this app stops it, not something the
+            // user did — and `--restore-last-session` already brings the tabs back.
+            .arg("--hide-crash-restore-bubble")
             .env("WAYLAND_DISPLAY", &socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -570,6 +618,24 @@ pub fn profile_dir(state_dir: &Path, group_uuid: &str) -> PathBuf {
 /// `<state_dir>/browsers` — pure path derivation.
 pub fn profiles_root(state_dir: &Path) -> PathBuf {
     state_dir.join(PROFILES_SUBDIR)
+}
+
+/// Give a freshly created profile the state Chromium would otherwise ask the user
+/// for on its first run.
+///
+/// `--no-first-run` suppresses the welcome flow for the run it is passed to, but
+/// Chromium still treats a user-data-dir without the `First Run` sentinel as new and
+/// keeps offering the setup prompts. Writing the sentinel plus a small `Preferences`
+/// file settles it once, at the only moment it is safe to: a directory this process
+/// just created, before Chromium has ever opened it.
+///
+/// The seeded values are deliberately few — the defaults a browser embedded in a
+/// terminal wants, not a general opinion about how the user should browse.
+fn seed_profile(profile: &Path) -> std::io::Result<()> {
+    std::fs::write(profile.join(FIRST_RUN_SENTINEL), b"")?;
+    let default = profile.join(DEFAULT_PROFILE_SUBDIR);
+    std::fs::create_dir_all(&default)?;
+    std::fs::write(default.join(PREFERENCES_FILE), DEFAULT_PREFERENCES)
 }
 
 /// Resolve the Chromium binary from [`BROWSER_CANDIDATES`] against `PATH`.
