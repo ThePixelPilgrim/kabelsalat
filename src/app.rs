@@ -1126,6 +1126,26 @@ impl App {
         }
     }
 
+    /// Hand the keyboard to whichever half the user just asked for.
+    ///
+    /// The pane mirrors its GTK focus onto the nested compositor's seat: losing
+    /// GTK focus clears the seat's keyboard focus, and a pane without it
+    /// receives no keys at all — the hosted browser goes deaf. Showing the
+    /// browser is an explicit request to work in it, so it gets the keyboard;
+    /// hiding it gives the keyboard back to the terminal.
+    fn focus_browser_or_terminal(&self) {
+        let browser = self
+            .active_group()
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .filter(|g| g.browser_visible)
+            .and_then(|g| g.browser.as_ref());
+        if let Some(browser) = browser {
+            browser.widget().grab_focus();
+        } else if let Some(tab) = self.active.and_then(|id| self.tabs.iter().find(|t| t.id == id)) {
+            tab.terminal.grab_focus();
+        }
+    }
+
     /// Alt-2: no browser → spawn and show; hidden → show; shown → hide.
     /// Never panics: a failure to spawn leaves the group without a browser and
     /// reports the reason, mirroring how the app degrades without tmux.
@@ -1160,6 +1180,7 @@ impl App {
             }
         }
         self.sync_browser_pane();
+        self.focus_browser_or_terminal();
     }
 
     /// Tear a group's browser down: terminate and reap Chromium, close the
