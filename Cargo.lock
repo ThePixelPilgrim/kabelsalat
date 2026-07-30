@@ -862,6 +862,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "klamottenkiste"
 version = "0.1.0"
+source = "git+https://github.com/ThePixelPilgrim/klamottenkiste?tag=v0.1.0#d0b239ab6489e1c8ad1030b49044378c3ed7880d"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1001,6 +1002,7 @@ dependencies = [
 [[package]]
 name = "monochromatic-nested-wayland-session"
 version = "0.1.1"
+source = "git+https://github.com/ThePixelPilgrim/klamottenkiste?tag=v0.1.0#d0b239ab6489e1c8ad1030b49044378c3ed7880d"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
