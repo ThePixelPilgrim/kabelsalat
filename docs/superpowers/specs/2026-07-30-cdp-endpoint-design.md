@@ -127,14 +127,22 @@ any restart; `browser_open: true` already drives re-launch, which rediscovers it
 
 ## Behaviour
 
-Two variables are published per session, with identical values:
+Three variables are published per session. Two carry the endpoint, with
+identical values:
 
 - `PLAYWRIGHT_MCP_CDP_ENDPOINT` — read directly by `@playwright/mcp`, giving
   zero-configuration attachment.
 - `KABELSALAT_CDP` — a neutral name for other tooling and user scripts, so the
   feature is not tied to one client.
 
-Both are `http://127.0.0.1:<port>`.
+Both are `http://127.0.0.1:<port>`. The third names the tab's home:
+
+- `KABELSALAT_GROUP` — the uuid of the group the tab currently belongs to.
+
+Its lifecycle differs from the endpoint pair on purpose: it describes the tab,
+not the browser. It is set when the session is created, rewritten when the tab
+moves, and never unset — a tab always belongs to some group. The endpoint pair
+tracks the browser: set on discovery, unset on close.
 
 ### Browser start
 
@@ -145,9 +153,21 @@ their uuids — the filter already used throughout `src/app.rs`.
 
 ### Tab added to a group
 
-A tab created in a group that already has a live endpoint gets both variables set
-on its session immediately after `spawn_backing` (`src/app.rs:2628-2656`).
-Injecting only at browser start would silently miss every tab created later.
+A tab created in a group gets `KABELSALAT_GROUP` set on its session immediately
+after `spawn_backing` (`src/app.rs:2628-2656`), and — when the group already has
+a live endpoint — the endpoint pair as well. Injecting only at browser start
+would silently miss every tab created later.
+
+### Tab moved between groups
+
+Moving a tab is a sanctioned feature, and it is the one event that can leave a
+session's variables *valid but wrong*: the old group's endpoint may still point
+at a live browser — just not one visible from the tab's new home. The move
+handler therefore rewrites the session: `KABELSALAT_GROUP` is set to the target
+group's uuid, and the endpoint pair is set to the target group's live endpoint
+or unset if it has none. From the moment of the move, `show-environment`
+answers truthfully; agents notice through the precondition described under
+"Consumption model".
 
 ### Browser closed
 
@@ -156,10 +176,15 @@ inherit a stale endpoint.
 
 ### Startup
 
-Before any injection, both variables are unset on every session kabelsalat
+Before any injection, the endpoint pair is unset on every session kabelsalat
 reattaches to. A session's environment can carry values written by a previous run
 — or by a previous *version* — and this is the only point at which they can be
 cleared. See "Compatibility".
+
+`KABELSALAT_GROUP` is written (not unset) on every reattached session at the
+same point, from the tab-to-group mapping in `state.json`. Reattached sessions
+may predate the variable entirely — created by an older version — and this
+refresh is what brings them under the invariant.
 
 ### Shells that are already running
 
@@ -205,12 +230,16 @@ The agent skill documents this as authored scripts against stock Playwright
 
 - Scripts compose. Many CDP actions run in one shell invocation with data
   flowing between steps, instead of one agent round-trip per action.
-- The endpoint is fetched once per task via `show-environment` and pasted
-  literally into the scripts; the port is stable for the lifetime of the
-  browser process. A browser restart makes the next `connect_over_cdp` fail
-  instantly, which is the signal to re-fetch and retry — staleness is loud and
-  self-healing here, unlike in a long-lived server that froze the value at
-  startup.
+- Every script opens with the same preamble, given by the skill: query
+  `show-environment`, assert that `KABELSALAT_GROUP` still equals the uuid the
+  agent pinned on first fetch, then use the endpoint the query returned. The
+  group uuid works as a fencing token: a browser restart in the same group
+  passes the assertion and picks up the fresh port transparently, while a tab
+  moved to another group — the one case where a cached endpoint stays *valid
+  but wrong* — fails the assertion loudly, forcing the agent to re-orient
+  before acting. A move into a browserless group fails just as loudly on the
+  missing endpoint variable. Nothing silently succeeds against a browser the
+  user cannot see; the query itself costs milliseconds against a ~1 s script.
 - Stock Playwright is an API agents already know deeply; a kabelsalat-specific
   wrapper would trade that familiarity away. The skill's only bespoke content
   is the two things stock Playwright cannot know: fetch the endpoint from
@@ -332,9 +361,6 @@ No GTK-level tests, consistent with the rest of the repository.
   is closed, so sessions started in that window get a dead endpoint. Clearing it
   from the existing `PollBrowsers` timer (`src/app.rs:1290`) would close this, at
   the cost of scope; it is deliberately left out of phase A.
-- **Environment drift.** A tab moved between groups, if that is possible, would
-  keep the old group's endpoint. Verify against the group-reassignment paths
-  during implementation.
 - **Silent Playwright attachment.** An agent picks the variable up automatically,
   which is the point, but it also means an agent may drive the user's visible
   browser without being asked to. Documented in the skill.
