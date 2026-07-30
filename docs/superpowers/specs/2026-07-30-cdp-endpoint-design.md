@@ -152,6 +152,13 @@ Injecting only at browser start would silently miss every tab created later.
 Both variables are unset on the group's sessions, so a later shell does not
 inherit a stale endpoint.
 
+### Startup
+
+Before any injection, both variables are unset on every session kabelsalat
+reattaches to. A session's environment can carry values written by a previous run
+— or by a previous *version* — and this is the only point at which they can be
+cleared. See "Compatibility".
+
 ### Shells that are already running
 
 `tmux set-environment` populates the environment given to *newly created*
@@ -174,6 +181,58 @@ becomes a vertical `gtk::Box` containing:
 
 Before discovery finishes, or after it fails, the first row reads `CDP:
 unavailable` and is dimmed. Closing the browser continues to work in every state.
+
+## Compatibility
+
+Two stores outlive a single run, and they need different treatment.
+
+### `state.json`
+
+Unchanged by this phase. No field is added, so no schema change happens and
+nothing here needs new handling.
+
+The existing posture, for reference: every field added over time carries a
+default — `uuid` (`src/state.rs:29`), `browser_open` (`:38`), `browser_split`
+(`:42`, via `default_browser_split`), `linger_warning_dismissed` (`:123`) — each
+covered by a test. `active: Option<String>` deserializes to `None` when the key is
+absent. No struct declares `deny_unknown_fields`, so an older binary silently
+ignores keys it does not recognise. There is no schema version marker. A corrupt
+file is renamed to `state.json.corrupt` and the app starts from defaults
+(`src/state.rs:227-236`), so a bad parse never orphans running shells.
+
+One property constrains later phases: `save()` (`src/state.rs:184-193`) serializes
+the in-memory struct wholesale, with no read-merge of the file on disk. An older
+binary that loads a newer file and then saves drops every field it does not know
+about. Reading forward-compatibly is not the same as round-tripping
+forward-compatibly. Nothing in this phase writes such a field; anything that does
+later must accept that a downgrade erases it, or introduce a version marker.
+
+### The tmux server
+
+This is the store this phase actually writes to, and it outlives not just the app
+but the app's *version*: sessions survive restart, and with `loginctl
+enable-linger`, logout. Kabelsalat does not currently read or clear a tmux
+session's environment anywhere — there is no `set-environment`,
+`show-environment`, or `update-environment` call in `src/` today.
+
+A published variable can therefore outlive the browser that justified it:
+
+- **Downgrade.** A version without this feature reattaches to sessions that
+  already have the variables set, and never clears them. Shells started there
+  inherit an endpoint whose port died with the previous browser, or that the
+  kernel has since reassigned to an unrelated process.
+- **Crash.** The unset on browser close does not run if the app dies with the
+  browser still open.
+
+The remedy belongs on the read side, the half a new version controls: **at
+startup, unset both variables on every session kabelsalat reattaches to, before
+any injection.** That makes one invariant true regardless of which version wrote
+the session earlier — a variable present in a session always describes a live
+browser.
+
+Measured tmux semantics this relies on: `set-environment` is inherited by panes
+created afterwards; `set-environment -u` removes the entry, and panes created
+after it see nothing. Neither affects a process that is already running.
 
 ## Error handling
 
@@ -212,10 +271,13 @@ No GTK-level tests, consistent with the rest of the repository.
 
 ## Known risks
 
-- **Port reuse across a crash.** Deleting `DevToolsActivePort` before spawn
-  removes the stale-read hazard, but if Chromium dies without the poll noticing,
-  the stored endpoint stays in the group's environment until the browser is
-  closed. Sessions started in that window get a dead endpoint.
+- **Port reuse within a run.** Deleting `DevToolsActivePort` before spawn removes
+  the stale-read hazard, and the startup unset covers stale variables inherited
+  across restarts and downgrades. Neither covers Chromium dying *while the app
+  keeps running*: the endpoint stays in the group's environment until the browser
+  is closed, so sessions started in that window get a dead endpoint. Clearing it
+  from the existing `PollBrowsers` timer (`src/app.rs:1290`) would close this, at
+  the cost of scope; it is deliberately left out of phase A.
 - **Environment drift.** A tab moved between groups, if that is possible, would
   keep the old group's endpoint. Verify against the group-reassignment paths
   during implementation.
