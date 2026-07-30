@@ -711,12 +711,12 @@ impl SimpleComponent for App {
                     // The child VTE saw is the tmux *client*, not the shell. If
                     // the session still lives (external detach), reattach;
                     // otherwise the session is gone (clean exit) → close.
-                    let uuid = self
+                    let uuid_group = self
                         .tabs
                         .iter()
                         .find(|t| t.id == id)
-                        .map(|t| t.uuid.clone());
-                    if let Some(uuid) = uuid {
+                        .map(|t| (t.uuid.clone(), t.group));
+                    if let Some((uuid, group)) = uuid_group {
                         // Only a *definitive* empty result proves the session
                         // is gone. A query error (transient fork failure,
                         // busy server, novel stderr) means liveness is unknown
@@ -726,12 +726,26 @@ impl SimpleComponent for App {
                         let gone = session_definitively_gone(&tmux.list_sessions(), &uuid);
                         if gone {
                             self.close_tab(id);
-                        } else if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
-                            // Reattach: -A ignores -c, and we want the existing
-                            // session's directory anyway, so no cwd. -e is
-                            // ignored too; that session's environment is
-                            // already correct.
-                            spawn_backing(&tab.terminal, &uuid, Some(tmux), None, None, &[]);
+                        } else {
+                            // Reattach: -A ignores -c, and we want the
+                            // existing session's directory anyway, so no cwd.
+                            // -e is ignored on a genuine reattach too — but if
+                            // list_sessions errored while the session was
+                            // actually dead, -A creates a session here, and
+                            // these pairs are what it needs.
+                            let group_info = self.group_env_pairs(group);
+                            let mut env: Vec<(&str, &str)> = Vec::new();
+                            if let Some((group_uuid, cdp_url)) = &group_info {
+                                env.push((ENV_GROUP, group_uuid.as_str()));
+                                if let Some(url) = cdp_url {
+                                    for key in CDP_ENV_KEYS {
+                                        env.push((key, url.as_str()));
+                                    }
+                                }
+                            }
+                            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                                spawn_backing(&tab.terminal, &uuid, Some(tmux), None, None, &env);
+                            }
                         }
                     }
                 } else if gtk::glib::spawn_check_wait_status(status).is_ok() {
@@ -928,6 +942,19 @@ impl SimpleComponent for App {
         self.on_browser_split_changed();
         self.attached_browser = None;
         self.browser_paned.set_end_child(gtk::Widget::NONE);
+        // Sessions outlive the app; this is the one moment the app knows the
+        // endpoints are dying, so unset them before the browsers are killed
+        // rather than leaving the pair to rot in surviving sessions until the
+        // next startup's refresh.
+        let browser_group_ids: Vec<usize> = self
+            .groups
+            .iter()
+            .filter(|g| g.browser.is_some())
+            .map(|g| g.id)
+            .collect();
+        for id in browser_group_ids {
+            self.cdp_env_unset(id);
+        }
         // One shared SIGTERM deadline for all of them: serial teardown cost
         // `n * TERM_GRACE` of frozen UI, this costs at most TERM_GRACE however
         // many browsers there are. `Keep` preserves every profile for restore.
@@ -1093,7 +1120,10 @@ impl App {
         // or none of the variables at all, if written by an older version.
         // This refresh is the only point where they can be brought under the
         // invariant: variables present in a session always describe a live
-        // browser, and every session names its group.
+        // browser, and every session names its group. This must run before
+        // start_browser_maintenance() below queues any browser restore, so
+        // it always unsets stale endpoints rather than racing a fresh
+        // discovery.
         let reattached: Vec<(String, usize)> = self
             .tabs
             .iter()
@@ -1514,6 +1544,16 @@ impl App {
         }
     }
 
+    /// The env pairs a session of this group is created with: the group
+    /// identity always, the endpoint pair when the browser already has one.
+    /// Returns None only for a group id that no longer exists.
+    fn group_env_pairs(&self, group_id: usize) -> Option<(String, Option<String>)> {
+        self.groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .map(|g| (g.uuid.clone(), g.browser.as_ref().and_then(|b| b.cdp_url())))
+    }
+
     /// Watch for `DevToolsActivePort` in the group's profile. The file shows
     /// up roughly half a second after spawn, so this cannot block the main
     /// thread; stat-ing a file is cheap enough for a 100 ms local timeout
@@ -1924,11 +1964,7 @@ impl App {
         // always, the endpoint pair when the group's browser already has one.
         // A -A reattach ignores -e; reattached sessions are refreshed
         // explicitly in restore_or_fresh instead.
-        let group_info = self
-            .groups
-            .iter()
-            .find(|g| g.id == group)
-            .map(|g| (g.uuid.clone(), g.browser.as_ref().and_then(|b| b.cdp_url())));
+        let group_info = self.group_env_pairs(group);
         let mut env: Vec<(&str, &str)> = Vec::new();
         if let Some((group_uuid, cdp_url)) = &group_info {
             env.push((ENV_GROUP, group_uuid.as_str()));

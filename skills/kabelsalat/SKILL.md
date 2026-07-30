@@ -75,6 +75,10 @@ act only when asked. An attached client has full power over the profile
 (cookies, logins, script execution) — treat it as the user's browser, because
 it is.
 
+The endpoint is **unauthenticated**: any process running as any user on
+this machine can connect to the same browser. Do not treat it as a private
+channel.
+
 Fetch the endpoint and group identity once per task (a running shell's
 inherited environment may be stale; the tmux table is live):
 
@@ -82,6 +86,9 @@ inherited environment may be stale; the tmux table is live):
     tmux show-environment KABELSALAT_GROUP   # KABELSALAT_GROUP=<group-uuid>
 
 A leading `-` in the output means the variable is unset (no browser running).
+If `show-environment` reports no `KABELSALAT_GROUP` at all, the tab predates
+the feature or lost its stamp — say so to the user instead of guessing a
+group.
 
 Author scripts against stock Playwright, and start every script with the same
 preamble — re-resolve the environment and assert the group you pinned on

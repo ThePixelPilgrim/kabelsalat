@@ -755,6 +755,32 @@ mod tests {
     }
 
     #[test]
+    fn spawn_argv_env_precedes_cwd() {
+        let dir = temp_dir("argv-env-cwd");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_argv(
+            "1234-abcd",
+            Some(Path::new("/home/user/proj")),
+            None,
+            &[("KABELSALAT_GROUP", "uuid-a")],
+        );
+        assert_eq!(
+            &argv[5..13],
+            [
+                "new-session",
+                "-A",
+                "-e",
+                "KABELSALAT_GROUP=uuid-a",
+                "-c",
+                "/home/user/proj",
+                "-s",
+                "ks-1234-abcd"
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn set_environment_argv_shape() {
         let args =
             TmuxCtl::set_environment_args("1234-abcd", "KABELSALAT_CDP", "http://127.0.0.1:4567");
