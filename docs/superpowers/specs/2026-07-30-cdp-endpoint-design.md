@@ -350,3 +350,6 @@ No GTK-level tests, consistent with the rest of the repository.
 - Restricting what an attached client may do. The broker in phase C is the first
   point at which policy can be applied.
 - Driving embedded Wayland apps other than the browser.
+- Skill distribution. The agent skill this spec references ships as a Claude Code
+  plugin from a tagged release (the repo symlink is dev mode only); packaging is
+  its own work item.
