@@ -230,6 +230,9 @@ pub struct Browser {
     pane: WaylandPane,
     child: Child,
     profile: PathBuf,
+    /// CDP endpoint, once discovery has read `DevToolsActivePort`. Runtime
+    /// state only; `None` until discovery completes, and forever if it fails.
+    cdp: Option<CdpEndpoint>,
     /// Set once the child has been killed and reaped, so `Drop` does not retry.
     torn_down: bool,
     /// Decided by the first [`Browser::teardown`] call; `Drop` obeys it.
@@ -310,6 +313,9 @@ impl Browser {
             // That prompt is an artefact of how this app stops it, not something the
             // user did — and `--restore-last-session` already brings the tabs back.
             .arg("--hide-crash-restore-bubble")
+            // Port 0: Chromium binds a free port and writes it (plus the
+            // browser websocket path) to <profile>/DevToolsActivePort.
+            .arg("--remote-debugging-port=0")
             .env("WAYLAND_DISPLAY", &socket)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -330,6 +336,12 @@ impl Browser {
         // `killpg` at teardown.
         isolate_process_group(&mut command);
 
+        // The file outlives the process that wrote it, so a stale copy cannot
+        // be told apart from a fresh one by inspection. Deleting it here means
+        // only the process spawned below can recreate it, which turns "is this
+        // file current?" into a structural guarantee.
+        let _ = std::fs::remove_file(devtools_port_path(&profile));
+
         let child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
@@ -349,6 +361,7 @@ impl Browser {
             pane,
             child,
             profile,
+            cdp: None,
             torn_down: false,
             disposition: ProfileDisposition::Remove,
             profile_handled: false,
@@ -380,6 +393,16 @@ impl Browser {
     /// The profile directory backing this browser.
     pub fn profile(&self) -> &Path {
         &self.profile
+    }
+
+    /// Record the discovered CDP endpoint.
+    pub fn set_cdp(&mut self, endpoint: CdpEndpoint) {
+        self.cdp = Some(endpoint);
+    }
+
+    /// The endpoint's HTTP URL, if discovery has completed.
+    pub fn cdp_url(&self) -> Option<String> {
+        self.cdp.as_ref().map(CdpEndpoint::url)
     }
 
     /// Terminate Chromium, close the pane, and dispose of the profile as asked.
