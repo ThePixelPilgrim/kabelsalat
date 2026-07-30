@@ -128,6 +128,21 @@ of stacking another copy of the default tab on top of it. So a group that
 already has a browser picks up a new default only after **Close browser** —
 which deletes that pane's profile — and a fresh `Alt+2`.
 
+### Browser automation (CDP)
+
+Each group's browser exposes an **unauthenticated** Chrome DevTools Protocol
+endpoint on loopback. CDP grants full control of that browser profile —
+cookies, sessions, arbitrary navigation and script execution — and any process
+running as any user on this machine can connect to it. This is a deliberate,
+documented interim state; a token-authenticated broker is planned.
+
+Terminals in the group receive the endpoint as `KABELSALAT_CDP` and
+`PLAYWRIGHT_MCP_CDP_ENDPOINT` (both `http://127.0.0.1:<port>`), plus
+`KABELSALAT_GROUP` (the group's uuid). Because a running shell's environment
+is frozen at spawn, the live values are always available from tmux:
+
+    tmux show-environment KABELSALAT_CDP
+
 The tmux server keeps running after the last tab closes (this is what makes
 the crash and logout guarantees work). To stop it entirely:
 `tmux -S "$XDG_RUNTIME_DIR/kabelsalat/tmux.sock" kill-server`.

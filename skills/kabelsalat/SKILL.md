@@ -66,3 +66,52 @@ You cannot read the tab's output, send input to it, or close it. If the
 command fails (non-zero exit), the tab stays visible showing its exit status
 and can be restarted. If it exits successfully (status 0), its tab closes on
 its own — do not tell the user to go look for it.
+
+## Driving the group's browser (CDP)
+
+Each group's embedded browser exposes a CDP endpoint. The workflow is
+co-browsing: the user steers the visible browser; you attach to inspect, and
+act only when asked. An attached client has full power over the profile
+(cookies, logins, script execution) — treat it as the user's browser, because
+it is.
+
+Fetch the endpoint and group identity once per task (a running shell's
+inherited environment may be stale; the tmux table is live):
+
+    tmux show-environment KABELSALAT_CDP     # KABELSALAT_CDP=http://127.0.0.1:<port>
+    tmux show-environment KABELSALAT_GROUP   # KABELSALAT_GROUP=<group-uuid>
+
+A leading `-` in the output means the variable is unset (no browser running).
+
+Author scripts against stock Playwright, and start every script with the same
+preamble — re-resolve the environment and assert the group you pinned on
+first fetch. Tabs can be moved between groups; the assert is what turns a
+silently-wrong browser into a loud, recoverable failure:
+
+    import subprocess
+    from playwright.sync_api import sync_playwright
+
+    PINNED_GROUP = "<uuid from your first fetch>"
+
+    def tmux_env():
+        out = subprocess.run(["tmux", "show-environment"],
+                             capture_output=True, text=True).stdout
+        return dict(line.split("=", 1) for line in out.splitlines()
+                    if "=" in line and not line.startswith("-"))
+
+    env = tmux_env()
+    assert env.get("KABELSALAT_GROUP") == PINNED_GROUP, \
+        f"tab moved (now in {env.get('KABELSALAT_GROUP', 'nowhere')}) — re-orient"
+    endpoint = env["KABELSALAT_CDP"]      # KeyError = no browser: also loud
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(endpoint)
+        pages = [pg for ctx in browser.contexts for pg in ctx.pages]
+        page = next((pg for pg in pages
+                     if pg.evaluate("document.visibilityState") == "visible"),
+                    pages[0] if pages else None)
+        # page is the tab the user is looking at: read, evaluate, screenshot.
+
+A failed `connect_over_cdp` (connection refused) means the browser restarted:
+re-run the fetch and retry. Prefer one script that does many steps over many
+single-step invocations.
