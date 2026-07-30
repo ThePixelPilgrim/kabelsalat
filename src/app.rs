@@ -1310,6 +1310,7 @@ impl App {
     /// Idempotent: a second call for a group whose browser is already gone —
     /// e.g. a duplicate `BrowserDied` from the exit poll — is a no-op.
     fn close_browser(&mut self, id: usize, disposition: ProfileDisposition) {
+        self.cdp_env_unset(id);
         let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
             return;
         };
@@ -1383,6 +1384,33 @@ impl App {
                 if let Err(err) = tmux.unset_environment(&tab.uuid, key) {
                     eprintln!("kabelsalat: unset {key} on {}: {err}", tab.uuid);
                 }
+            }
+        }
+    }
+
+    /// Make one session's environment describe its group: `KABELSALAT_GROUP`
+    /// always (a tab always belongs to some group — never unset), the
+    /// endpoint pair set or unset by whether the group's browser has a live
+    /// endpoint. Used when a session is (re)created and when a tab moves.
+    fn session_env_refresh(&self, tab_uuid: &str, group_id: usize) {
+        let Some(tmux) = &self.tmux else { return };
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+            return;
+        };
+        if let Err(err) = tmux.set_environment(tab_uuid, ENV_GROUP, &group.uuid) {
+            eprintln!("kabelsalat: set {ENV_GROUP} on {tab_uuid}: {err}");
+        }
+        let url = group.browser.as_ref().and_then(|b| b.cdp_url());
+        for key in CDP_ENV_KEYS {
+            let result = match &url {
+                Some(url) => tmux.set_environment(tab_uuid, key, url),
+                // Also the startup path: a reattached session may carry a
+                // stale endpoint written by a previous run (or version), and
+                // this unset is the only point where it can be cleared.
+                None => tmux.unset_environment(tab_uuid, key),
+            };
+            if let Err(err) = result {
+                eprintln!("kabelsalat: refresh {key} on {tab_uuid}: {err}");
             }
         }
     }
@@ -1638,9 +1666,14 @@ impl App {
             return;
         }
         tab.group = target;
+        let moved_uuid = tab.uuid.clone();
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == target) {
             group.last_active = active;
         }
+        // A moved tab's session must describe its new home; the old group's
+        // endpoint may still point at a live browser — just not one visible
+        // from here (see the spec's "Tab moved between groups").
+        self.session_env_refresh(&moved_uuid, target);
         self.prune_empty_groups();
         self.rebuild_list();
     }
@@ -1789,6 +1822,11 @@ impl App {
             .build();
         apply_scheme(&terminal, self.style.is_dark());
         spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd, command);
+        // Every path that creates or reattaches a session funnels through
+        // here: fresh tabs, restored tabs, adopted orphans, CLI tabs. The
+        // refresh both stamps the group identity and clears any stale
+        // endpoint a reattached session inherited from a previous run.
+        self.session_env_refresh(&uuid, group);
 
         attach_drag_hint(&terminal, sender);
 
@@ -1975,13 +2013,18 @@ impl App {
             self.tabs.insert(si, tab);
             return;
         };
+        let old_group = tab.group;
         tab.group = self.tabs[di].group;
         let moved_group = tab.group;
+        let moved_uuid = tab.uuid.clone();
         self.tabs.insert(di, tab);
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == moved_group)
             && self.active == Some(src)
         {
             group.last_active = src;
+        }
+        if moved_group != old_group {
+            self.session_env_refresh(&moved_uuid, moved_group);
         }
         self.prune_empty_groups();
         self.rebuild_list();
@@ -2009,7 +2052,9 @@ impl App {
             return;
         }
         let mut tab = self.tabs.remove(si);
+        let old_group = tab.group;
         tab.group = group;
+        let moved_uuid = tab.uuid.clone();
         let insert_at = self
             .tabs
             .iter()
@@ -2020,6 +2065,9 @@ impl App {
             && let Some(group) = self.groups.iter_mut().find(|g| g.id == group)
         {
             group.last_active = src;
+        }
+        if group != old_group {
+            self.session_env_refresh(&moved_uuid, group);
         }
         self.prune_empty_groups();
         self.rebuild_list();
