@@ -745,6 +745,48 @@ pub fn profiles_root(state_dir: &Path) -> PathBuf {
     state_dir.join(PROFILES_SUBDIR)
 }
 
+/// The browser's CDP endpoint, read from `DevToolsActivePort` in its profile.
+///
+/// Runtime state only — a port is meaningless across a browser restart, so
+/// this is never persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdpEndpoint {
+    pub port: u16,
+    pub browser_ws_path: String,
+}
+
+impl CdpEndpoint {
+    /// The HTTP form consumers need: Playwright resolves the websocket URL by
+    /// fetching `/json/version` from here.
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+/// Parse the two-line `DevToolsActivePort` file Chromium writes with
+/// `--remote-debugging-port=0`: the chosen port, then the browser websocket
+/// path. The second line carries no trailing newline.
+pub fn parse_devtools_active_port(contents: &str) -> Option<CdpEndpoint> {
+    let mut lines = contents.lines();
+    let port: u16 = lines.next()?.trim().parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    let browser_ws_path = lines.next()?.trim();
+    if browser_ws_path.is_empty() {
+        return None;
+    }
+    Some(CdpEndpoint {
+        port,
+        browser_ws_path: browser_ws_path.to_string(),
+    })
+}
+
+/// `<profile>/DevToolsActivePort` — pure path derivation.
+pub fn devtools_port_path(profile: &Path) -> PathBuf {
+    profile.join("DevToolsActivePort")
+}
+
 /// Give a freshly created profile the state Chromium would otherwise ask the user
 /// for on its first run.
 ///
@@ -904,6 +946,41 @@ mod tests {
         let base = Path::new("/s");
         assert_ne!(profile_dir(base, UUID_A), profile_dir(base, UUID_B));
         assert!(!profile_dir(base, UUID_A).ends_with("3"));
+    }
+
+    #[test]
+    fn devtools_port_file_parses_without_trailing_newline() {
+        // Chromium writes no trailing newline after the second line.
+        let parsed = parse_devtools_active_port("40455\n/devtools/browser/66dad126-b59e").unwrap();
+        assert_eq!(parsed.port, 40455);
+        assert_eq!(parsed.browser_ws_path, "/devtools/browser/66dad126-b59e");
+        assert_eq!(parsed.url(), "http://127.0.0.1:40455");
+    }
+
+    #[test]
+    fn devtools_port_file_parses_with_trailing_newline() {
+        let parsed = parse_devtools_active_port("40455\n/devtools/browser/abc\n").unwrap();
+        assert_eq!(parsed.port, 40455);
+        assert_eq!(parsed.browser_ws_path, "/devtools/browser/abc");
+    }
+
+    #[test]
+    fn devtools_port_file_rejects_bad_input() {
+        // Empty, port-only, non-numeric, port 0, above u16, leading blank line:
+        // all mean "no endpoint", never a panic or a garbage endpoint.
+        assert!(parse_devtools_active_port("").is_none());
+        assert!(parse_devtools_active_port("40455").is_none());
+        assert!(parse_devtools_active_port("40455\n").is_none());
+        assert!(parse_devtools_active_port("no-port\n/devtools/browser/abc").is_none());
+        assert!(parse_devtools_active_port("0\n/devtools/browser/abc").is_none());
+        assert!(parse_devtools_active_port("70000\n/devtools/browser/abc").is_none());
+        assert!(parse_devtools_active_port("\n40455\n/devtools/browser/abc").is_none());
+    }
+
+    #[test]
+    fn devtools_port_path_is_inside_the_profile() {
+        let path = devtools_port_path(Path::new("/s/browsers/uuid-a"));
+        assert_eq!(path, PathBuf::from("/s/browsers/uuid-a/DevToolsActivePort"));
     }
 
     #[test]
