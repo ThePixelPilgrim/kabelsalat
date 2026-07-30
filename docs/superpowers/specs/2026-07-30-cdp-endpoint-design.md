@@ -14,8 +14,10 @@ broker; see "Out of scope".
 - A group's browser exposes a CDP endpoint on loopback.
 - Every terminal in that group gets the endpoint in its environment, so an agent
   started there attaches without being configured.
-- The endpoint is visible and copyable from the browser overflow menu, for shells
-  that are already running.
+- A shell that is already running can fetch the live endpoint from tmux without
+  restarting anything.
+- The endpoint is visible and copyable from the browser overflow menu, as the
+  human-facing fallback.
 - The app keeps working unchanged when the endpoint never materialises.
 
 ## Background
@@ -164,10 +166,58 @@ cleared. See "Compatibility".
 `tmux set-environment` populates the environment given to *newly created*
 processes in a session. A process already running cannot have its environment
 changed — Linux offers no such mechanism. An agent already running in a tab
-therefore will not see the variable; a newly started one will.
+therefore will not see the variable in its inherited environment; a newly
+started one will.
 
-This is the reason the overflow menu shows the endpoint. It is the supported path
-for an already-running shell, not a convenience.
+The inherited copy is not the only way to read it. The variables live in the
+tmux server's per-session environment table, which `show-environment` queries
+live — and every process in a pane inherits `$TMUX`, which points at
+kabelsalat's private socket and names the pane's session. The supported path for
+a running shell is therefore to ask tmux:
+
+```
+tmux show-environment KABELSALAT_CDP                 # KABELSALAT_CDP=http://127.0.0.1:<port>
+eval "$(tmux show-environment -s KABELSALAT_CDP)"    # same, as a real env var
+```
+
+When the variable has been unset, `show-environment` prints `-KABELSALAT_CDP`,
+so "browser closed" is distinguishable from "never set". Because the table is
+read at query time, a value fetched this way is current even when an inherited
+copy is stale — which makes per-use fetching the right default for agents (see
+"Consumption model").
+
+The overflow menu shows the endpoint for the same reason, as the human-facing
+fallback: visible and copyable with no shell involved.
+
+## Consumption model
+
+The primary consumer is an agent in one of the group's terminals driving the
+browser the user is looking at — co-browsing: the user steers, the agent
+attaches to inspect, and acts only when asked. Measured against Chromium 150
+with Playwright: `connect_over_cdp` on the HTTP endpoint attaches in ~60 ms,
+the user-visible tab is discoverable from inside the pages themselves
+(`document.visibilityState === "visible"`) with no window-system integration,
+and attaching, evaluating, and screenshotting leave scroll position and focus
+untouched.
+
+The agent skill documents this as authored scripts against stock Playwright
+(Python sync API or Node), not a wrapper library and not an MCP server:
+
+- Scripts compose. Many CDP actions run in one shell invocation with data
+  flowing between steps, instead of one agent round-trip per action.
+- Each script run resolves the endpoint fresh via `show-environment`, so a
+  browser restart between invocations is harmless.
+- Stock Playwright is an API agents already know deeply; a kabelsalat-specific
+  wrapper would trade that familiarity away. The skill's only bespoke content
+  is the two things stock Playwright cannot know: fetch the endpoint from
+  tmux, and pick the visible page.
+
+`PLAYWRIGHT_MCP_CDP_ENDPOINT` still gives `@playwright/mcp` zero-configuration
+attachment in shells started after the browser. That path is published but
+secondary: the MCP server freezes the endpoint string at process start, and
+Claude Code respawns a stdio server only on a manual `/mcp` reconnect, so every
+browser restart costs a manual step that the script path does not have. Nothing
+here blocks MCP use; the skill simply does not lead with it.
 
 ## Menu
 
