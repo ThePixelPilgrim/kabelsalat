@@ -47,10 +47,11 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
 | `Ctrl+Shift+W` | Close the active tab |
 | `Ctrl+Shift+M` | Move the tab to another group |
 | `Ctrl+Shift+G` | Jump to a group |
-| `Ctrl+Shift+R` | Name the active group |
+| `Ctrl+Shift+R` | Group settings (name, browser default URL) |
 | `Ctrl+Page Down` / `Ctrl+Page Up` | Next / previous tab |
 | `Alt+Page Down` / `Alt+Page Up` | Next / previous group |
 | `Alt+1` | Toggle the tab pane |
+| `Alt+2` | Toggle the browser pane |
 | `F1` | Show the shortcut list |
 
 ## Command line
@@ -112,6 +113,20 @@ Each tab runs the shell from `$SHELL`, falling back to `/bin/bash`. When a
 shell exits with a non-zero status the tab is marked with the exit code
 instead of closed, so the output stays readable; a restart button reruns the
 shell in place.
+
+`Ctrl+Shift+R` opens the active group's settings: its name, and the URL a
+freshly launched browser pane in that group starts on. Leave the URL empty for
+whatever Chromium opens by itself. A bare host gets `http://` filled in, so
+`localhost:3000` is enough; `https://…` and `file:///…` are taken as typed, and
+anything else — another scheme, or something that would reach the browser as a
+command-line flag — is refused with the reason under the entry, with Apply
+disabled until it is fixed.
+
+Editing that URL never touches a browser that is already running: it is a launch
+argument, not navigation, and a relaunched pane restores its own session instead
+of stacking another copy of the default tab on top of it. So a group that
+already has a browser picks up a new default only after **Close browser** —
+which deletes that pane's profile — and a fresh `Alt+2`.
 
 The tmux server keeps running after the last tab closes (this is what makes
 the crash and logout guarantees work). To stop it entirely:

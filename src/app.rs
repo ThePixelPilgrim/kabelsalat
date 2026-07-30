@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use relm4::adw;
-use relm4::adw::prelude::{AdwDialogExt, AlertDialogExt};
+use relm4::adw::prelude::{AdwDialogExt, AlertDialogExt, PreferencesGroupExt};
 use relm4::gtk;
 use relm4::gtk::gdk::RGBA;
 use relm4::gtk::gio;
@@ -32,8 +32,8 @@ const SHORTCUTS: &[(&str, &str, Msg)] = &[
     ("<Control><Shift>g", "Jump to a group", Msg::JumpPicker),
     (
         "<Control><Shift>r",
-        "Name the active group",
-        Msg::RenameDialog,
+        "Group settings",
+        Msg::GroupSettingsDialog,
     ),
     ("<Control>Page_Down", "Next tab", Msg::NavNext),
     ("<Control>Page_Up", "Previous tab", Msg::NavPrev),
@@ -122,6 +122,11 @@ pub struct Group {
     browser_visible: bool,
     /// Divider position of the terminal/browser split, in pixels.
     browser_split: f64,
+    /// Where a freshly launched browser for this group starts, already
+    /// normalized. `None` = whatever Chromium opens on its own. Editing it never
+    /// touches a running browser: it is a launch argument, and only a launch
+    /// into a *fresh* profile uses it.
+    default_url: Option<String>,
 }
 
 pub struct App {
@@ -216,8 +221,15 @@ pub enum Msg {
         src: usize,
         group: usize,
     },
-    RenameDialog,
-    RenameGroup(usize, String),
+    /// Open the group settings dialog for the active group.
+    GroupSettingsDialog,
+    /// Apply the group settings dialog: name and default URL land together, in
+    /// one save. `default_url` is already normalized by the dialog.
+    ApplyGroupSettings {
+        id: usize,
+        name: String,
+        default_url: Option<String>,
+    },
     NavNext,
     NavPrev,
     GroupNext,
@@ -744,10 +756,16 @@ impl SimpleComponent for App {
             Msg::DropTab { src, dest } => self.drop_tab(src, dest),
             Msg::DropGroup { src, dest } => self.drop_group(src, dest),
             Msg::DropTabOnGroup { src, group } => self.drop_tab_on_group(src, group),
-            Msg::RenameDialog => self.show_rename_dialog(),
-            Msg::RenameGroup(id, name) => {
+            Msg::GroupSettingsDialog => self.show_group_settings_dialog(),
+            Msg::ApplyGroupSettings {
+                id,
+                name,
+                default_url,
+            } => {
                 if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    // An empty name still means an unnamed group with no header.
                     group.name = name.trim().to_string();
+                    group.default_url = default_url;
                     self.rebuild_list();
                 }
             }
@@ -862,6 +880,7 @@ impl App {
             browser: None,
             browser_visible: false,
             browser_split: state::DEFAULT_BROWSER_SPLIT,
+            default_url: None,
         });
         id
     }
@@ -936,6 +955,7 @@ impl App {
                 // group at a time, in start_browser_maintenance().
                 browser_visible: group.browser_open,
                 browser_split: group.browser_split,
+                default_url: group.default_url.clone(),
             });
         }
         self.next_group_id = saved.groups.iter().map(|g| g.id).max().map_or(1, |m| m + 1);
@@ -1023,6 +1043,7 @@ impl App {
                 } else {
                     g.browser_split
                 },
+                default_url: g.default_url.clone(),
             })
             .collect();
         let tabs = self
@@ -1221,7 +1242,10 @@ impl App {
             // Keyed by the group's uuid: ids are reused, so an id-keyed
             // profile could be one the startup sweep is still deleting.
             let uuid = group.uuid.clone();
-            match Browser::spawn(&uuid, &self.state_dir) {
+            // Cloned like the uuid, so no borrow of `self.groups` is alive
+            // across the spawn.
+            let default_url = group.default_url.clone();
+            match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
                 Ok(browser) => {
                     if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
                         group.browser = Some(browser);
@@ -1377,9 +1401,9 @@ impl App {
             .groups
             .iter()
             .find(|g| g.id == id && g.browser.is_none())
-            .map(|g| g.uuid.clone());
-        if let Some(uuid) = wanted {
-            match Browser::spawn(&uuid, &self.state_dir) {
+            .map(|g| (g.uuid.clone(), g.default_url.clone()));
+        if let Some((uuid, default_url)) = wanted {
+            match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
                 Ok(browser) => {
                     if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
                         group.browser = Some(browser);
@@ -2290,9 +2314,14 @@ impl App {
         row
     }
 
-    /// Name (or un-name) the active group via a small entry dialog.
-    /// Enter applies, Esc cancels, an empty name removes the header.
-    fn show_rename_dialog(&self) {
+    /// Per-group settings: its name, and the URL a freshly launched browser in
+    /// it opens on. Enter applies, Esc cancels, an empty name removes the
+    /// header and an empty URL clears the default.
+    ///
+    /// The URL is validated as it is typed and Apply is disabled while it is
+    /// unusable: `adw::AlertDialog` closes on any response, so an error raised
+    /// at submit time would have nowhere left to live.
+    fn show_group_settings_dialog(&self) {
         let Some(group) = self
             .active_group()
             .and_then(|id| self.groups.iter().find(|g| g.id == id))
@@ -2300,23 +2329,82 @@ impl App {
             return;
         };
 
-        let entry = gtk::Entry::builder()
-            .text(&group.name)
-            .placeholder_text("Group name (empty to clear)")
+        let name_row = adw::EntryRow::builder()
+            .title("Name")
             .activates_default(true)
             .build();
-        let dialog = adw::AlertDialog::new(Some("Name Group"), None);
-        dialog.set_extra_child(Some(&entry));
+        name_row.set_text(&group.name);
+        let url_row = adw::EntryRow::builder()
+            .title("Browser default URL")
+            .activates_default(true)
+            .build();
+        url_row.set_text(group.default_url.as_deref().unwrap_or_default());
+
+        // Stock Adwaita style class, so the CSS provider needs nothing added.
+        let error = gtk::Label::builder()
+            .xalign(0.0)
+            .wrap(true)
+            .visible(false)
+            .build();
+        error.add_css_class("error");
+
+        let rows = adw::PreferencesGroup::new();
+        rows.add(&name_row);
+        rows.add(&url_row);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        content.append(&rows);
+        content.append(&error);
+
+        let dialog = adw::AlertDialog::new(Some("Group Settings"), None);
+        dialog.set_extra_child(Some(&content));
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("apply", "Apply");
         dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("apply"));
         dialog.set_close_response("cancel");
 
+        // Live validation: the only gate on Apply. Also runs once up front, so a
+        // hand-edited `state.json` opens the dialog already showing why.
+        // The dialog is held weakly: this closure lives on a widget *inside* it,
+        // so a strong reference would be a cycle the dialog never escapes.
+        let validate = {
+            let dialog = dialog.downgrade();
+            let error = error.clone();
+            move |text: &str| {
+                let Some(dialog) = dialog.upgrade() else {
+                    return;
+                };
+                match browser::normalize_default_url(text) {
+                    Ok(_) => {
+                        error.set_visible(false);
+                        dialog.set_response_enabled("apply", true);
+                    }
+                    Err(err) => {
+                        error.set_text(&err.to_string());
+                        error.set_visible(true);
+                        dialog.set_response_enabled("apply", false);
+                    }
+                }
+            }
+        };
+        validate(&url_row.text());
+        url_row.connect_changed(move |row| validate(&row.text()));
+
         let id = group.id;
         let input = self.input.clone();
         dialog.connect_response(Some("apply"), move |_, _| {
-            let _ = input.send(Msg::RenameGroup(id, entry.text().to_string()));
+            // Apply is only pressable while this parses, and what it produces —
+            // scheme lowercased, implied `http://` filled in — is what gets
+            // stored. `None` covers both "cleared" and the unreachable error.
+            let default_url = browser::normalize_default_url(&url_row.text())
+                .ok()
+                .flatten();
+            let _ = input.send(Msg::ApplyGroupSettings {
+                id,
+                name: name_row.text().to_string(),
+                default_url,
+            });
         });
         dialog.present(Some(&self.window));
     }

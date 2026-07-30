@@ -41,6 +41,12 @@ pub struct SavedGroup {
     /// `serde(default)` so older state files load with the default split.
     #[serde(default = "default_browser_split")]
     pub browser_split: f64,
+    /// Where a freshly launched browser for this group starts. `None` = whatever
+    /// Chromium opens on its own. Only consulted for a launch into a *fresh*
+    /// profile; a launch that resumes an existing profile restores that session
+    /// instead, so a crash or a restart never stacks another copy of this tab.
+    #[serde(default)]
+    pub default_url: Option<String>,
 }
 
 fn default_browser_split() -> f64 {
@@ -57,6 +63,7 @@ impl SavedGroup {
             palette,
             browser_open: false,
             browser_split: DEFAULT_BROWSER_SPLIT,
+            default_url: None,
         }
     }
 }
@@ -312,6 +319,7 @@ mod tests {
                     palette: 0,
                     browser_open: false,
                     browser_split: DEFAULT_BROWSER_SPLIT,
+                    default_url: None,
                 },
                 SavedGroup {
                     uuid: "g-bbb".into(),
@@ -320,6 +328,7 @@ mod tests {
                     palette: 2,
                     browser_open: true,
                     browser_split: 640.0,
+                    default_url: Some("http://localhost:3000".into()),
                 },
             ],
             tabs: vec![
@@ -500,6 +509,7 @@ mod tests {
         assert_eq!(g.palette, 3);
         assert!(!g.browser_open);
         assert_eq!(g.browser_split, DEFAULT_BROWSER_SPLIT);
+        assert_eq!(g.default_url, None);
     }
 
     #[test]
@@ -543,6 +553,39 @@ mod tests {
         assert_eq!(state.groups[0].palette, 1);
         assert!(!state.groups[0].browser_open);
         assert_eq!(state.groups[0].browser_split, DEFAULT_BROWSER_SPLIT);
+    }
+
+    #[test]
+    fn old_group_without_default_url_loads() {
+        // A state.json written before the per-group default URL existed. The
+        // absent field is the whole migration: it loads as "no default URL".
+        let json = r#"{
+            "groups": [{
+                "id": 3,
+                "name": "work",
+                "palette": 1,
+                "browser_open": true,
+                "browser_split": 640.0
+            }],
+            "tabs": [],
+            "active": null,
+            "sidebar_visible": true
+        }"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].default_url, None);
+        assert!(state.groups[0].browser_open);
+        assert_eq!(state.groups[0].browser_split, 640.0);
+    }
+
+    #[test]
+    fn default_url_round_trips() {
+        let mut group = SavedGroup::new(4, "dev".into(), 0);
+        group.default_url = Some("http://localhost:3000".into());
+        let json = serde_json::to_string(&group).unwrap();
+        let back: SavedGroup = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.default_url.as_deref(), Some("http://localhost:3000"));
+        assert_eq!(back, group);
     }
 
     #[test]

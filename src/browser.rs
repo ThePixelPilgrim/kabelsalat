@@ -119,6 +119,112 @@ impl fmt::Display for BrowserError {
 
 impl std::error::Error for BrowserError {}
 
+/// Schemes a group's default URL may use, lowercase. Anything else is refused:
+/// a browser pane opens pages, and these are the only forms Chromium is asked
+/// to treat as one here.
+pub const DEFAULT_URL_SCHEMES: &[&str] = &["http", "https", "file"];
+
+/// Scheme kabelsalat assumes when the user types a bare host, so
+/// `localhost:3000` works the way it does in an address bar.
+const IMPLIED_SCHEME: &str = "http";
+
+/// Why a group's default URL was refused. Its [`Display`](fmt::Display) text is
+/// what the group settings dialog shows under the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultUrlError {
+    /// Starts with `-`, so Chromium would read it as a command-line flag.
+    LooksLikeFlag,
+    /// A `scheme://` that is not one of [`DEFAULT_URL_SCHEMES`].
+    UnsupportedScheme(String),
+    /// Structurally not a URL: interior whitespace, or nothing where the host
+    /// (`http`/`https`) or the path (`file`) has to be.
+    NotAUrl,
+}
+
+impl fmt::Display for DefaultUrlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LooksLikeFlag => write!(
+                f,
+                "A URL cannot start with “-”: the browser would read it as a command-line flag."
+            ),
+            Self::UnsupportedScheme(scheme) => write!(
+                f,
+                "“{scheme}://” is not supported. Use {}.",
+                DEFAULT_URL_SCHEMES
+                    .iter()
+                    .map(|s| format!("{s}://"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::NotAUrl => write!(
+                f,
+                "That is not a URL. Try something like localhost:3000, \
+                 https://example.org or file:///home/you/notes.html."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DefaultUrlError {}
+
+/// Validate and canonicalize a group's default URL.
+///
+/// `Ok(None)` means "no default URL" — the empty input is how the setting is
+/// cleared, so an empty string is a valid answer rather than an error. The
+/// returned string has its scheme lowercased and the rest kept exactly as
+/// typed; a bare host gains an implied `http://`, the way an address bar does
+/// it.
+///
+/// Pure: no filesystem, no network, no reachability check. Anything a browser
+/// cannot load is Chromium's error page, not this function's business. The one
+/// thing it exists to make impossible is a value that reaches Chromium as a
+/// *flag* instead of a URL — which is why it also runs again at spawn time,
+/// against whatever `state.json` happens to contain.
+///
+/// Deliberate limits of a hand-rolled parser: IPv6 literals and userinfo pass
+/// through untouched, and no percent-encoding, punycode or path normalization
+/// happens.
+pub fn normalize_default_url(input: &str) -> Result<Option<String>, DefaultUrlError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // Before anything else: this is the case the whole helper exists for.
+    if trimmed.starts_with('-') {
+        return Err(DefaultUrlError::LooksLikeFlag);
+    }
+    // Whitespace inside would split into more than one Chromium argument.
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(DefaultUrlError::NotAUrl);
+    }
+
+    // No `scheme://` at all: assume one, then apply the same rules.
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return normalize_default_url(&format!("{IMPLIED_SCHEME}://{trimmed}"));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if !DEFAULT_URL_SCHEMES.contains(&scheme.as_str()) {
+        return Err(DefaultUrlError::UnsupportedScheme(scheme));
+    }
+
+    // The requirement is per scheme: `file:///home/c/notes.html` has no host by
+    // construction — everything after `://` is its path, and that is what has
+    // to be there. For http/https it is the host that must not be empty.
+    if scheme == "file" {
+        if rest.is_empty() {
+            return Err(DefaultUrlError::NotAUrl);
+        }
+    } else {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if host.is_empty() {
+            return Err(DefaultUrlError::NotAUrl);
+        }
+    }
+
+    Ok(Some(format!("{scheme}://{rest}")))
+}
+
 /// A live browser: the pane widget, the Chromium process, and its profile dir.
 pub struct Browser {
     pane: WaylandPane,
@@ -141,7 +247,16 @@ impl Browser {
     /// `<state_dir>/browsers/<group_uuid>`. On any failure the pane is torn
     /// down before returning, so no blank pane is ever left behind, and a
     /// profile directory this call created is rolled back.
-    pub fn spawn(group_uuid: &str, state_dir: &Path) -> Result<Self, BrowserError> {
+    ///
+    /// `default_url` is the group's configured start page. It is used only for a
+    /// launch into a profile this call creates, and an unusable value is dropped
+    /// rather than turned into an error: a bad default URL costs a start page,
+    /// never a browser.
+    pub fn spawn(
+        group_uuid: &str,
+        state_dir: &Path,
+        default_url: Option<&str>,
+    ) -> Result<Self, BrowserError> {
         let pane = WaylandPane::new();
         // `wayland_socket() == None` is the startup-failure signal; the message
         // (if any) lives in `startup_error()`.
@@ -199,6 +314,16 @@ impl Browser {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Only a profile this call created: an existing one has a session that
+        // `--restore-last-session` brings back, and the group's default URL would
+        // pile a duplicate tab on top of it every crash and every restart.
+        // Re-validated here rather than trusted: `state.json` is user-editable, and
+        // a value beginning with `-` would reach Chromium as a *flag*, not a URL.
+        if !profile_existed
+            && let Ok(Some(url)) = normalize_default_url(default_url.unwrap_or_default())
+        {
+            command.arg(url);
+        }
         // Chromium is a process *tree* (zygote, GPU process, one renderer per
         // tab). Signalling the direct pid alone leaves those behind, so the
         // whole tree gets its own process group and is signalled with
@@ -829,6 +954,75 @@ mod tests {
             Some(dir.join("google-chrome"))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_url_accepts_only_browsable_urls() {
+        use DefaultUrlError::*;
+        let cases: &[(&str, Result<Option<String>, DefaultUrlError>)] = &[
+            // Cleared: an empty (or blank) setting is a valid "no default URL".
+            ("", Ok(None)),
+            ("   ", Ok(None)),
+            ("\t\n ", Ok(None)),
+            // The case this whole helper exists for: a flag, not a URL.
+            ("--disable-web-security", Err(LooksLikeFlag)),
+            ("-", Err(LooksLikeFlag)),
+            ("  --headless", Err(LooksLikeFlag)),
+            // Whitespace inside would become a second Chromium argument.
+            ("hello world", Err(NotAUrl)),
+            ("http://example.org /etc/passwd", Err(NotAUrl)),
+            // Supported schemes, scheme lowercased, the rest kept as typed.
+            (
+                "http://example.org/a?b=1#c",
+                Ok(Some("http://example.org/a?b=1#c".into())),
+            ),
+            (
+                "HTTPS://Example.ORG/Path",
+                Ok(Some("https://Example.ORG/Path".into())),
+            ),
+            ("FiLe:///tmp/x.html", Ok(Some("file:///tmp/x.html".into()))),
+            // A bare host gains the implied scheme, address-bar style.
+            ("localhost:3000", Ok(Some("http://localhost:3000".into()))),
+            (
+                "example.org/path",
+                Ok(Some("http://example.org/path".into())),
+            ),
+            // Anything else is not a page this pane opens.
+            ("ftp://host/file", Err(UnsupportedScheme("ftp".into()))),
+            (
+                "JavaScript://alert(1)",
+                Err(UnsupportedScheme("javascript".into())),
+            ),
+            // Both sides of the per-scheme rule: http needs a host, file needs
+            // a path (and has no host at all, by construction).
+            ("http://", Err(NotAUrl)),
+            ("https:///just/a/path", Err(NotAUrl)),
+            ("file://", Err(NotAUrl)),
+            ("file:///", Ok(Some("file:///".into()))),
+            (
+                "file:///home/c/notes.html",
+                Ok(Some("file:///home/c/notes.html".into())),
+            ),
+            // Surrounding whitespace is trimmed, not rejected.
+            (
+                "  https://example.org  ",
+                Ok(Some("https://example.org".into())),
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&normalize_default_url(input), expected, "input: {input:?}");
+        }
+    }
+
+    #[test]
+    fn default_url_errors_all_say_something() {
+        for err in [
+            DefaultUrlError::LooksLikeFlag,
+            DefaultUrlError::UnsupportedScheme("ftp".into()),
+            DefaultUrlError::NotAUrl,
+        ] {
+            assert!(!err.to_string().is_empty(), "{err:?}");
+        }
     }
 
     #[test]
