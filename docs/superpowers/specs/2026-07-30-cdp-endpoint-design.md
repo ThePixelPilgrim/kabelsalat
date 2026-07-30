@@ -205,8 +205,12 @@ The agent skill documents this as authored scripts against stock Playwright
 
 - Scripts compose. Many CDP actions run in one shell invocation with data
   flowing between steps, instead of one agent round-trip per action.
-- Each script run resolves the endpoint fresh via `show-environment`, so a
-  browser restart between invocations is harmless.
+- The endpoint is fetched once per task via `show-environment` and pasted
+  literally into the scripts; the port is stable for the lifetime of the
+  browser process. A browser restart makes the next `connect_over_cdp` fail
+  instantly, which is the signal to re-fetch and retry — staleness is loud and
+  self-healing here, unlike in a long-lived server that froze the value at
+  startup.
 - Stock Playwright is an API agents already know deeply; a kabelsalat-specific
   wrapper would trade that familiarity away. The skill's only bespoke content
   is the two things stock Playwright cannot know: fetch the endpoint from
