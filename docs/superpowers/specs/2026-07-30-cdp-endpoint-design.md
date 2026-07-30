@@ -119,6 +119,11 @@ They invoke `set-environment -t ks-<uuid> KEY VALUE` and `set-environment -u -t
 ks-<uuid> KEY`. Like every other path in this file, they return `Result` and never
 panic.
 
+`spawn_argv` additionally gains an `env: &[(&str, &str)]` parameter, emitted as
+`-e KEY=VALUE` pairs in the `new-session` portion of the argv — the
+creation-time stamp described under "Tab added to a group". Each pair is a
+single argv element crossing an exec boundary, so no shell quoting applies.
+
 ### `src/state.rs`
 
 Unchanged. `SavedGroup` persists `browser_open` and `browser_split`
@@ -153,10 +158,17 @@ their uuids — the filter already used throughout `src/app.rs`.
 
 ### Tab added to a group
 
-A tab created in a group gets `KABELSALAT_GROUP` set on its session immediately
-after `spawn_backing` (`src/app.rs:2628-2656`), and — when the group already has
-a live endpoint — the endpoint pair as well. Injecting only at browser start
-would silently miss every tab created later.
+A tab's variables are stamped *at session creation*, atomically, via
+`new-session -e KEY=VALUE` flags on the spawn argv: `KABELSALAT_GROUP` always,
+and — when the group already has a live endpoint — the endpoint pair as well.
+Injecting only at browser start would silently miss every tab created later.
+
+Post-spawn `set-environment` cannot do this job: the tmux session is created
+by an *asynchronous* VTE spawn, so a synchronous call right after
+`spawn_backing` races a session that usually does not exist yet — and the
+creation-time flag is also the only mechanism whose values reach the tab's
+very first shell. `-e` is ignored by a `-A` reattach, which is exactly right:
+pre-existing sessions are handled by the startup refresh instead.
 
 ### Tab moved between groups
 
@@ -172,7 +184,10 @@ answers truthfully; agents notice through the precondition described under
 ### Browser closed
 
 Both variables are unset on the group's sessions, so a later shell does not
-inherit a stale endpoint.
+inherit a stale endpoint. This runs for a deliberate close and for a browser
+that died on its own, and again for every group at app shutdown — sessions
+outlive the app, and shutdown is the one moment the app knows the endpoints
+are dying with it.
 
 ### Startup
 
@@ -316,6 +331,9 @@ browser.
 Measured tmux semantics this relies on: `set-environment` is inherited by panes
 created afterwards; `set-environment -u` removes the entry, and panes created
 after it see nothing. Neither affects a process that is already running.
+`new-session -e KEY=VALUE` (added in tmux 3.2, exactly this app's version
+floor) stamps the variable atomically with session creation — the first shell
+already inherits it — and is ignored by a `-A` reattach.
 
 ## Error handling
 
@@ -354,13 +372,20 @@ No GTK-level tests, consistent with the rest of the repository.
 
 ## Known risks
 
-- **Port reuse within a run.** Deleting `DevToolsActivePort` before spawn removes
-  the stale-read hazard, and the startup unset covers stale variables inherited
-  across restarts and downgrades. Neither covers Chromium dying *while the app
-  keeps running*: the endpoint stays in the group's environment until the browser
-  is closed, so sessions started in that window get a dead endpoint. Clearing it
-  from the existing `PollBrowsers` timer (`src/app.rs:1290`) would close this, at
-  the cost of scope; it is deliberately left out of phase A.
+- **Port reuse within a run: closed.** Deleting `DevToolsActivePort` before
+  spawn removes the stale-read hazard, and the startup refresh covers stale
+  variables inherited across restarts and downgrades. Chromium dying *while
+  the app keeps running* is covered too: the `PollBrowsers` timer reaps the
+  process within `BROWSER_POLL_SECS`, and the resulting `BrowserDied` funnels
+  through the same close path that unsets the pair — a dead endpoint survives
+  in the environment for at most one poll tick.
+- **A tab created in the discovery window.** Between browser spawn and
+  `CdpReady` (~half a second), a new tab's session is created while
+  `cdp_url` is still `None`, and the `CdpReady` injection may reach tmux
+  before that session exists — such a tab misses the endpoint pair until the
+  next move, close, or restart. The failure is loud on the consumer side
+  (the skill's preamble raises on the missing variable) rather than silently
+  wrong; accepted for phase A.
 - **Silent Playwright attachment.** An agent picks the variable up automatically,
   which is the point, but it also means an agent may drive the user's visible
   browser without being asked to. Documented in the skill.
