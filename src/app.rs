@@ -689,8 +689,10 @@ impl SimpleComponent for App {
                             self.close_tab(id);
                         } else if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
                             // Reattach: -A ignores -c, and we want the existing
-                            // session's directory anyway, so no cwd.
-                            spawn_backing(&tab.terminal, &uuid, Some(tmux), None, None);
+                            // session's directory anyway, so no cwd. -e is
+                            // ignored too; that session's environment is
+                            // already correct.
+                            spawn_backing(&tab.terminal, &uuid, Some(tmux), None, None, &[]);
                         }
                     }
                 } else if gtk::glib::spawn_check_wait_status(status).is_ok() {
@@ -1035,6 +1037,22 @@ impl App {
             }
         }
 
+        // Reattached sessions were not touched by -e (a -A attach ignores
+        // it) and may carry stale endpoint variables from a previous run —
+        // or none of the variables at all, if written by an older version.
+        // This refresh is the only point where they can be brought under the
+        // invariant: variables present in a session always describe a live
+        // browser, and every session names its group.
+        let reattached: Vec<(String, usize)> = self
+            .tabs
+            .iter()
+            .filter(|t| live.contains(&t.uuid))
+            .map(|t| (t.uuid.clone(), t.group))
+            .collect();
+        for (uuid, group) in &reattached {
+            self.session_env_refresh(uuid, *group);
+        }
+
         // Drop any group that ended up empty, then restore the active tab.
         self.prune_empty_groups();
         let active_id = saved
@@ -1310,7 +1328,6 @@ impl App {
     /// Idempotent: a second call for a group whose browser is already gone —
     /// e.g. a duplicate `BrowserDied` from the exit poll — is a no-op.
     fn close_browser(&mut self, id: usize, disposition: ProfileDisposition) {
-        self.cdp_env_unset(id);
         let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
             return;
         };
@@ -1318,6 +1335,10 @@ impl App {
             return;
         };
         group.browser_visible = false;
+        // NLL: `group` is done; &self calls are fine from here. Runs only
+        // when a browser was actually present, so a duplicate BrowserDied
+        // (see the doc comment above) stays a true no-op.
+        self.cdp_env_unset(id);
         if self.attached_browser == Some(id) {
             self.browser_paned.set_end_child(gtk::Widget::NONE);
             self.attached_browser = None;
@@ -1821,12 +1842,25 @@ impl App {
             .enable_fallback_scrolling(false)
             .build();
         apply_scheme(&terminal, self.style.is_dark());
-        spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd, command);
-        // Every path that creates or reattaches a session funnels through
-        // here: fresh tabs, restored tabs, adopted orphans, CLI tabs. The
-        // refresh both stamps the group identity and clears any stale
-        // endpoint a reattached session inherited from a previous run.
-        self.session_env_refresh(&uuid, group);
+        // Stamped at session creation via new-session -e: the group identity
+        // always, the endpoint pair when the group's browser already has one.
+        // A -A reattach ignores -e; reattached sessions are refreshed
+        // explicitly in restore_or_fresh instead.
+        let group_info = self
+            .groups
+            .iter()
+            .find(|g| g.id == group)
+            .map(|g| (g.uuid.clone(), g.browser.as_ref().and_then(|b| b.cdp_url())));
+        let mut env: Vec<(&str, &str)> = Vec::new();
+        if let Some((group_uuid, cdp_url)) = &group_info {
+            env.push((ENV_GROUP, group_uuid.as_str()));
+            if let Some(url) = cdp_url {
+                for key in CDP_ENV_KEYS {
+                    env.push((key, url.as_str()));
+                }
+            }
+        }
+        spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd, command, &env);
 
         attach_drag_hint(&terminal, sender);
 
@@ -2872,12 +2906,13 @@ fn spawn_backing(
     tmux: Option<&TmuxCtl>,
     cwd: Option<&Path>,
     command: Option<&[String]>,
+    env: &[(&str, &str)],
 ) {
     let Some(ctl) = tmux else {
         spawn_shell(terminal, cwd, command);
         return;
     };
-    let argv = ctl.spawn_argv(uuid, cwd, command);
+    let argv = ctl.spawn_argv(uuid, cwd, command, env);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     terminal.spawn_async(
         PtyFlags::DEFAULT,

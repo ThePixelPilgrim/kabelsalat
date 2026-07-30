@@ -286,12 +286,19 @@ impl TmuxCtl {
     }
 
     /// Argv for spawning (or reattaching) the backing session of a tab:
-    /// `tmux -S <sock> -f <conf> new-session -A [-c <cwd>] -s ks-<uuid> <cmd>`,
-    /// where `<cmd>` is `$SHELL` unless `command` overrides it.
+    /// `tmux -S <sock> -f <conf> new-session -A [-e KEY=VALUE]... [-c <cwd>]
+    /// -s ks-<uuid> <cmd>`, where `<cmd>` is `$SHELL` unless `command`
+    /// overrides it.
     ///
     /// When `cwd` is set, `-c <dir>` sets the new session's working directory so
     /// a fresh shell starts there. `new-session -A` ignores `-c` when the
     /// session already exists, so reattach/restore paths pass `None`.
+    ///
+    /// `env` stamps `KEY=VALUE` pairs into the new session's environment table
+    /// atomically with its creation via one `-e` per pair. Like `-c`, `-e` only
+    /// takes effect when the session is actually created; a `-A` reattach
+    /// ignores it, so reattach/restore paths pass `&[]` and refresh the
+    /// session's environment explicitly instead.
     ///
     /// `command` is what `kabelsalat run` passes. It arrives as argv but tmux
     /// wants a single shell-command string, so it is quoted and joined here
@@ -302,6 +309,7 @@ impl TmuxCtl {
         uuid: &str,
         cwd: Option<&Path>,
         command: Option<&[String]>,
+        env: &[(&str, &str)],
     ) -> Vec<String> {
         let mut argv = vec![
             "tmux".into(),
@@ -312,6 +320,15 @@ impl TmuxCtl {
             "new-session".into(),
             "-A".into(),
         ];
+        // -e stamps the variable into the new session's environment table
+        // atomically with its creation, so the very first shell already
+        // inherits it. Like -c, it takes effect only when the session is
+        // created; a -A reattach ignores it (reattached sessions get an
+        // explicit refresh instead).
+        for (key, value) in env {
+            argv.push("-e".into());
+            argv.push(format!("{key}={value}"));
+        }
         if let Some(dir) = cwd {
             argv.push("-c".into());
             argv.push(escape_tmux_format(&dir.to_string_lossy()));
@@ -675,7 +692,7 @@ mod tests {
     fn spawn_argv_shape() {
         let dir = temp_dir("argv");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("1234-abcd", None, None);
+        let argv = ctl.spawn_argv("1234-abcd", None, None, &[]);
         assert_eq!(argv[0], "tmux");
         assert_eq!(argv[1], "-S");
         assert!(argv[2].ends_with("run/tmux.sock"));
@@ -690,7 +707,7 @@ mod tests {
     fn spawn_argv_with_cwd_inserts_c_flag() {
         let dir = temp_dir("argv-cwd");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")), None);
+        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")), None, &[]);
         // -c <dir> sits in the new-session portion, before -s, so it only
         // affects a freshly created session (ignored on reattach).
         assert_eq!(
@@ -705,6 +722,35 @@ mod tests {
             ]
         );
         assert!(!argv[11].is_empty()); // $SHELL or /bin/bash
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_argv_with_env_inserts_e_flags() {
+        let dir = temp_dir("argv-env");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_argv(
+            "1234-abcd",
+            None,
+            None,
+            &[
+                ("KABELSALAT_GROUP", "uuid-a"),
+                ("KABELSALAT_CDP", "http://127.0.0.1:4567"),
+            ],
+        );
+        assert_eq!(
+            &argv[5..13],
+            [
+                "new-session",
+                "-A",
+                "-e",
+                "KABELSALAT_GROUP=uuid-a",
+                "-e",
+                "KABELSALAT_CDP=http://127.0.0.1:4567",
+                "-s",
+                "ks-1234-abcd"
+            ]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -750,6 +796,7 @@ mod tests {
             "1234-abcd",
             Some(Path::new("/tmp/#(touch /tmp/PWNED)")),
             None,
+            &[],
         );
         assert_eq!(argv[8], "/tmp/##(touch /tmp/PWNED)");
         // No unescaped '#' survives: stripping every doubled "##" (tmux's
@@ -762,7 +809,7 @@ mod tests {
     fn spawn_argv_escapes_bare_hash_in_cwd() {
         let dir = temp_dir("argv-cwd-hash");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/tmp/#weird")), None);
+        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/tmp/#weird")), None, &[]);
         assert_eq!(argv[8], "/tmp/##weird");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -772,7 +819,7 @@ mod tests {
         // Regression guard: the escaping must not alter paths without '#'.
         let dir = temp_dir("argv-cwd-plain");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")), None);
+        let argv = ctl.spawn_argv("1234-abcd", Some(Path::new("/home/user/proj")), None, &[]);
         assert_eq!(argv[8], "/home/user/proj");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -786,7 +833,7 @@ mod tests {
             "--model".to_string(),
             "opus".to_string(),
         ];
-        let argv = ctl.spawn_argv("1234-abcd", None, Some(&command));
+        let argv = ctl.spawn_argv("1234-abcd", None, Some(&command), &[]);
         assert_eq!(&argv[5..9], ["new-session", "-A", "-s", "ks-1234-abcd"]);
         assert_eq!(argv[9], "claude --model opus");
         assert_eq!(argv.len(), 10);
@@ -827,9 +874,9 @@ mod tests {
         let dir = temp_dir("argv-nocmd");
         let ctl = test_ctl(&dir);
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let argv = ctl.spawn_argv("1234-abcd", None, None);
+        let argv = ctl.spawn_argv("1234-abcd", None, None, &[]);
         assert_eq!(argv[9], shell);
-        assert_eq!(ctl.spawn_argv("1234-abcd", None, Some(&[])), argv);
+        assert_eq!(ctl.spawn_argv("1234-abcd", None, Some(&[]), &[]), argv);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1094,7 +1141,7 @@ mod tests {
         }
         let dir = temp_dir("live");
         let ctl = test_ctl(&dir);
-        let argv = ctl.spawn_argv("itest", None, None);
+        let argv = ctl.spawn_argv("itest", None, None, &[]);
         // Run detached (-d) instead of attaching a client.
         let status = Command::new(&argv[0])
             .args(&argv[1..6])
