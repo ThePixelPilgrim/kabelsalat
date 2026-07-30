@@ -164,6 +164,11 @@ pub struct App {
     browser_paned: gtk::Paned,
     /// Popover behind the header bar's browser overflow button.
     browser_menu: gtk::Popover,
+    /// Endpoint row in the browser overflow menu: dimmed "CDP: unavailable"
+    /// until discovery succeeds, then `127.0.0.1:<port>` plus a live copy
+    /// button.
+    cdp_label: gtk::Label,
+    cdp_copy: gtk::Button,
     /// Which group's pane is currently the paned's end child, if any. Tracked
     /// explicitly so detaching works even after the group was pruned.
     attached_browser: Option<usize>,
@@ -295,6 +300,8 @@ pub enum Msg {
     /// CDP discovery finished for this group's browser: the endpoint, or
     /// `None` when `DevToolsActivePort` never appeared or never parsed.
     CdpReady(usize, Option<browser::CdpEndpoint>),
+    /// Copy the active group's CDP endpoint URL to the clipboard.
+    CopyCdpEndpoint,
     /// A `kabelsalat run` invocation: create a tab in the group with this
     /// uuid, running `argv` in `cwd`. Deliberately inert otherwise — it does
     /// not activate the tab, raise the window, change the active group, or
@@ -384,12 +391,24 @@ impl SimpleComponent for App {
                     #[wrap(Some)]
                     set_popover = &browser_menu.clone() {
                         #[wrap(Some)]
-                        set_child = &gtk::Button {
-                            set_label: "Close browser",
-                            add_css_class: "flat",
-                            connect_clicked[sender, browser_menu] => move |_| {
-                                browser_menu.popdown();
-                                sender.input(Msg::CloseBrowser);
+                        set_child = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_spacing: 6,
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 6,
+                                append: &cdp_label.clone(),
+                                append: &cdp_copy.clone(),
+                            },
+
+                            gtk::Button {
+                                set_label: "Close browser",
+                                add_css_class: "flat",
+                                connect_clicked[sender, browser_menu] => move |_| {
+                                    browser_menu.popdown();
+                                    sender.input(Msg::CloseBrowser);
+                                },
                             },
                         },
                     },
@@ -566,6 +585,16 @@ impl SimpleComponent for App {
             stack: gtk::Stack::new(),
             browser_paned: gtk::Paned::new(gtk::Orientation::Horizontal),
             browser_menu: gtk::Popover::new(),
+            cdp_label: gtk::Label::builder()
+                .label("CDP: unavailable")
+                .css_classes(["monospace", "dim-label"])
+                .build(),
+            cdp_copy: gtk::Button::builder()
+                .icon_name("edit-copy-symbolic")
+                .tooltip_text("Copy CDP endpoint URL")
+                .css_classes(["flat"])
+                .sensitive(false)
+                .build(),
             attached_browser: None,
             pending_browser_restore: Vec::new(),
             browser_poll_running: false,
@@ -593,6 +622,16 @@ impl SimpleComponent for App {
         let stack = model.stack.clone();
         let browser_paned = model.browser_paned.clone();
         let browser_menu = model.browser_menu.clone();
+        let cdp_label = model.cdp_label.clone();
+        let cdp_copy = model.cdp_copy.clone();
+        cdp_copy.connect_clicked({
+            let sender = sender.clone();
+            let browser_menu = browser_menu.clone();
+            move |_| {
+                browser_menu.popdown();
+                sender.input(Msg::CopyCdpEndpoint);
+            }
+        });
         let widgets = view_output!();
 
         // The divider lives in the widget; mirror it into the active group as
@@ -773,6 +812,18 @@ impl SimpleComponent for App {
                     None => {
                         eprintln!("kabelsalat: no CDP endpoint for group {group_id} within 10 s");
                     }
+                }
+                self.refresh_cdp_menu();
+                return;
+            }
+            Msg::CopyCdpEndpoint => {
+                let url = self
+                    .active_group()
+                    .and_then(|id| self.groups.iter().find(|g| g.id == id))
+                    .and_then(|g| g.browser.as_ref())
+                    .and_then(|b| b.cdp_url());
+                if let (Some(url), Some(display)) = (url, gtk::gdk::Display::default()) {
+                    display.clipboard().set_text(&url);
                 }
                 return;
             }
@@ -1177,11 +1228,38 @@ impl App {
             .is_some_and(|g| g.browser.is_some() && !g.browser_visible)
     }
 
+    /// Reflect the active group's CDP state in the overflow menu. The label
+    /// shows host:port; the copy button carries the full http:// URL.
+    fn refresh_cdp_menu(&self) {
+        let url = self
+            .active_group()
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .and_then(|g| g.browser.as_ref())
+            .and_then(|b| b.cdp_url());
+        match url {
+            Some(url) => {
+                self.cdp_label.set_label(url.trim_start_matches("http://"));
+                self.cdp_label.remove_css_class("dim-label");
+                self.cdp_copy.set_sensitive(true);
+            }
+            None => {
+                self.cdp_label.set_label("CDP: unavailable");
+                self.cdp_label.add_css_class("dim-label");
+                self.cdp_copy.set_sensitive(false);
+            }
+        }
+    }
+
     /// Make the split show exactly the active group's browser, if it has a
     /// visible one. The outgoing pane's divider position is saved and the pane
     /// is hidden and unparented — the compositor and Chromium keep running, so
     /// coming back to the group is instant with page state intact.
     fn sync_browser_pane(&mut self) {
+        // Refresh before the early return below: that return fires whenever
+        // the *visible* pane isn't changing, but the active group itself may
+        // still have changed (e.g. switching to a tab whose group's browser
+        // is hidden), which the CDP menu must reflect regardless.
+        self.refresh_cdp_menu();
         let want = self.active_group().filter(|id| {
             self.groups
                 .iter()
