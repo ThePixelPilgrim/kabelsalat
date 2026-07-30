@@ -452,6 +452,45 @@ impl TmuxCtl {
         self.run(&["respawn-pane", "-t", &format!("{SESSION_PREFIX}{uuid}")])
     }
 
+    /// Argv tail for publishing one variable into a tab's session environment.
+    /// Pure, so the shape is testable like `spawn_argv`.
+    fn set_environment_args(uuid: &str, key: &str, value: &str) -> [String; 5] {
+        [
+            "set-environment".into(),
+            "-t".into(),
+            format!("{SESSION_PREFIX}{uuid}"),
+            key.into(),
+            value.into(),
+        ]
+    }
+
+    /// Argv tail for removing one variable from a tab's session environment.
+    fn unset_environment_args(uuid: &str, key: &str) -> [String; 5] {
+        [
+            "set-environment".into(),
+            "-u".into(),
+            "-t".into(),
+            format!("{SESSION_PREFIX}{uuid}"),
+            key.into(),
+        ]
+    }
+
+    /// Publish `key=value` into a tab session's environment table. Inherited
+    /// by processes created in the session afterwards; a process already
+    /// running sees it only by querying `show-environment`.
+    pub fn set_environment(&self, uuid: &str, key: &str, value: &str) -> Result<(), TmuxError> {
+        let args = Self::set_environment_args(uuid, key, value);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(&refs)
+    }
+
+    /// Remove `key` from a tab session's environment table.
+    pub fn unset_environment(&self, uuid: &str, key: &str) -> Result<(), TmuxError> {
+        let args = Self::unset_environment_args(uuid, key);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(&refs)
+    }
+
     fn run(&self, args: &[&str]) -> Result<(), TmuxError> {
         let output = Command::new("tmux")
             .args(["-S", &self.socket.to_string_lossy()])
@@ -667,6 +706,37 @@ mod tests {
         );
         assert!(!argv[11].is_empty()); // $SHELL or /bin/bash
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn set_environment_argv_shape() {
+        let args =
+            TmuxCtl::set_environment_args("1234-abcd", "KABELSALAT_CDP", "http://127.0.0.1:4567");
+        assert_eq!(
+            args,
+            [
+                "set-environment",
+                "-t",
+                "ks-1234-abcd",
+                "KABELSALAT_CDP",
+                "http://127.0.0.1:4567"
+            ]
+        );
+    }
+
+    #[test]
+    fn unset_environment_argv_shape() {
+        let args = TmuxCtl::unset_environment_args("1234-abcd", "KABELSALAT_CDP");
+        assert_eq!(
+            args,
+            [
+                "set-environment",
+                "-u",
+                "-t",
+                "ks-1234-abcd",
+                "KABELSALAT_CDP"
+            ]
+        );
     }
 
     #[test]
