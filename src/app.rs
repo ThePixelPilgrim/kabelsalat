@@ -62,6 +62,21 @@ const SHORTCUT_ALIASES: &[&str] = &[
 /// How often the hosted Chromium processes are reaped for exit.
 const BROWSER_POLL_SECS: u32 = 2;
 
+/// CDP discovery: poll the profile's DevToolsActivePort file this often…
+const CDP_POLL_MS: u64 = 100;
+/// …and give up after this many attempts (10 s total).
+const CDP_POLL_TRIES: u32 = 100;
+
+/// Environment keys published into each tab's tmux session (see
+/// docs/superpowers/specs/2026-07-30-cdp-endpoint-design.md).
+const ENV_CDP: &str = "KABELSALAT_CDP";
+const ENV_CDP_PLAYWRIGHT: &str = "PLAYWRIGHT_MCP_CDP_ENDPOINT";
+const ENV_GROUP: &str = "KABELSALAT_GROUP";
+/// The endpoint pair: set on discovery, unset on browser close. `ENV_GROUP`
+/// is deliberately not in here — it describes the tab, not the browser, and
+/// is never unset.
+const CDP_ENV_KEYS: [&str; 2] = [ENV_CDP, ENV_CDP_PLAYWRIGHT];
+
 /// How long the "hold Shift to select" icon stays up after a bare drag.
 const SELECT_HINT_SECS: u32 = 7;
 
@@ -277,6 +292,9 @@ pub enum Msg {
     PollBrowsers,
     /// Restart restore: bring up this group's browser, then queue the next.
     RestoreBrowser(usize),
+    /// CDP discovery finished for this group's browser: the endpoint, or
+    /// `None` when `DevToolsActivePort` never appeared or never parsed.
+    CdpReady(usize, Option<browser::CdpEndpoint>),
     /// A `kabelsalat run` invocation: create a tab in the group with this
     /// uuid, running `argv` in `cwd`. Deliberately inert otherwise — it does
     /// not activate the tab, raise the window, change the active group, or
@@ -735,6 +753,27 @@ impl SimpleComponent for App {
                 return;
             }
             Msg::RestoreBrowser(group) => self.restore_browser(group),
+            // Runtime state only: nothing here is persisted, so return early
+            // to skip the save_state() at the bottom (like PollBrowsers).
+            Msg::CdpReady(group_id, endpoint) => {
+                let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) else {
+                    return;
+                };
+                let Some(browser) = group.browser.as_mut() else {
+                    return;
+                };
+                match endpoint {
+                    Some(endpoint) => {
+                        let url = endpoint.url();
+                        browser.set_cdp(endpoint);
+                        self.cdp_env_set(group_id, &url);
+                    }
+                    None => {
+                        eprintln!("kabelsalat: no CDP endpoint for group {group_id} within 10 s");
+                    }
+                }
+                return;
+            }
             // Title changes arrive at animation rate from some programs
             // (spinners/progress in the title). Rebuilding the sidebar and
             // tab bar per change kept the main thread busy and replaced the
@@ -1252,6 +1291,7 @@ impl App {
                         group.browser_visible = true;
                     }
                     self.start_browser_poll();
+                    self.start_cdp_poll(id);
                 }
                 Err(err) => {
                     self.show_notice(&err.to_string());
@@ -1317,6 +1357,70 @@ impl App {
                 // The component is gone; stop ticking.
                 Err(_) => gtk::glib::ControlFlow::Break,
             }
+        });
+    }
+
+    /// Publish the endpoint pair to every session in the group. One session
+    /// failing must not stop the others, and a tmux failure must never keep
+    /// the browser from working: log and continue.
+    fn cdp_env_set(&self, group_id: usize, url: &str) {
+        let Some(tmux) = &self.tmux else { return };
+        for tab in self.tabs.iter().filter(|t| t.group == group_id) {
+            for key in CDP_ENV_KEYS {
+                if let Err(err) = tmux.set_environment(&tab.uuid, key, url) {
+                    eprintln!("kabelsalat: set {key} on {}: {err}", tab.uuid);
+                }
+            }
+        }
+    }
+
+    /// Remove the endpoint pair from every session in the group, so a shell
+    /// started later does not inherit a dead endpoint.
+    fn cdp_env_unset(&self, group_id: usize) {
+        let Some(tmux) = &self.tmux else { return };
+        for tab in self.tabs.iter().filter(|t| t.group == group_id) {
+            for key in CDP_ENV_KEYS {
+                if let Err(err) = tmux.unset_environment(&tab.uuid, key) {
+                    eprintln!("kabelsalat: unset {key} on {}: {err}", tab.uuid);
+                }
+            }
+        }
+    }
+
+    /// Watch for `DevToolsActivePort` in the group's profile. The file shows
+    /// up roughly half a second after spawn, so this cannot block the main
+    /// thread; stat-ing a file is cheap enough for a 100 ms local timeout
+    /// (same reasoning as the BROWSER_POLL_SECS timer, not the linger thread).
+    fn start_cdp_poll(&self, group_id: usize) {
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+            return;
+        };
+        if group.browser.is_none() {
+            return;
+        }
+        let profile = browser::profile_dir(&self.state_dir, &group.uuid);
+        let port_file = browser::devtools_port_path(&profile);
+        let input = self.input.clone();
+        let mut tries = 0u32;
+        gtk::glib::timeout_add_local(std::time::Duration::from_millis(CDP_POLL_MS), move || {
+            tries += 1;
+            if let Ok(contents) = std::fs::read_to_string(&port_file)
+                && let Some(endpoint) = browser::parse_devtools_active_port(&contents)
+            {
+                let _ = input.send(Msg::CdpReady(group_id, Some(endpoint)));
+                return gtk::glib::ControlFlow::Break;
+            }
+            // Profile gone = browser closed mid-poll; stop quietly. The
+            // CdpReady(None) on timeout is still delivered so the failure is
+            // logged in exactly one place, the handler.
+            if !profile.is_dir() {
+                return gtk::glib::ControlFlow::Break;
+            }
+            if tries >= CDP_POLL_TRIES {
+                let _ = input.send(Msg::CdpReady(group_id, None));
+                return gtk::glib::ControlFlow::Break;
+            }
+            gtk::glib::ControlFlow::Continue
         });
     }
 
@@ -1409,6 +1513,7 @@ impl App {
                         group.browser = Some(browser);
                     }
                     self.start_browser_poll();
+                    self.start_cdp_poll(id);
                 }
                 Err(err) => {
                     eprintln!("kabelsalat: restoring browser for group {id}: {err}");
