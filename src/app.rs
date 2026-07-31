@@ -1815,6 +1815,9 @@ impl App {
         self.session_env_refresh(&moved_uuid, target);
         self.prune_empty_groups();
         self.rebuild_list();
+        // The active tab changed groups without an activate(), so the pane
+        // and CDP menu must reconcile here too.
+        self.sync_browser_pane();
     }
 
     /// Modal group picker: arrow keys + Enter, or a single click. Esc closes
@@ -2095,8 +2098,9 @@ impl App {
         self.stack.set_visible_child(&tab.terminal);
         tab.terminal.grab_focus();
         self.rebuild_list();
-        // A group change always implies a tab change, so this is the single
-        // funnel for swapping the parented browser pane.
+        // The main funnel for swapping the parented browser pane. Not the
+        // only one: a tab *move* changes the active group with no tab
+        // change, so the move handlers re-sync themselves.
         self.sync_browser_pane();
     }
 
@@ -2176,6 +2180,8 @@ impl App {
         }
         self.prune_empty_groups();
         self.rebuild_list();
+        // No-op unless the dragged tab was the active one changing groups.
+        self.sync_browser_pane();
     }
 
     /// Reorder groups by drag-and-drop: move `src` before `dest`. The render
@@ -2219,6 +2225,8 @@ impl App {
         }
         self.prune_empty_groups();
         self.rebuild_list();
+        // No-op unless the dragged tab was the active one changing groups.
+        self.sync_browser_pane();
     }
 
     /// Jump to the first tab of the next/previous group, wrapping around.
