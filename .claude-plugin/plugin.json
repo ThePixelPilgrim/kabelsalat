@@ -1,0 +1,10 @@
+{
+  "name": "kabelsalat",
+  "displayName": "Kabelsalat",
+  "version": "0.4.0",
+  "description": "Drive a running kabelsalat terminal: launch commands into visible, persistent group panes and co-browse the group's embedded browser over CDP.",
+  "author": { "name": "Christoph Rauch", "url": "https://github.com/ThePixelPilgrim" },
+  "repository": "https://github.com/ThePixelPilgrim/kabelsalat",
+  "license": "MIT",
+  "keywords": ["terminal", "tmux", "browser", "cdp", "playwright"]
+}

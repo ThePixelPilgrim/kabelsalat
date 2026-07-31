@@ -67,8 +67,24 @@ which defaults to the caller's. Everything after `--` is the command. The new
 tab does not steal focus. Exit codes: 0 success, 1 not running, 2 usage,
 3 no such group.
 
-`scripts/install-skill.sh` links `skills/kabelsalat` into `~/.claude/skills/`
-so Claude Code knows how to use this.
+Claude Code learns this interface through the plugin below.
+
+## Claude Code plugin
+
+The agent skill ships as a Claude Code plugin, and this repository is its own
+plugin marketplace. Inside Claude Code:
+
+    /plugin marketplace add ThePixelPilgrim/kabelsalat
+    /plugin install kabelsalat@kabelsalat
+
+The skill teaches an agent to launch commands into groups via `kabelsalat run`
+and to drive the group's embedded browser over CDP (see "Browser automation"
+below, including its security note). Plugin versions follow tagged releases —
+`/plugin update` picks up a release, not every commit.
+
+For hacking on the skill itself, `scripts/install-skill.sh` symlinks
+`skills/kabelsalat` into `~/.claude/skills/` — a dev-mode shortcut, not the
+supported install path.
 
 ## Requirements
 

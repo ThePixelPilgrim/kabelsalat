@@ -1,0 +1,12 @@
+{
+  "name": "kabelsalat",
+  "description": "The kabelsalat terminal's own plugin: launch commands into its groups and co-browse the embedded browser.",
+  "owner": { "name": "ThePixelPilgrim", "url": "https://github.com/ThePixelPilgrim" },
+  "plugins": [
+    {
+      "name": "kabelsalat",
+      "source": "./",
+      "description": "Agent skill for driving a running kabelsalat terminal and its per-group embedded browser."
+    }
+  ]
+}
