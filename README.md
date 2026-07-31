@@ -6,9 +6,9 @@ colour-coded groups.
 - **Shells survive everything.** Tabs are backed by an invisible tmux
   server; crash, quit or upgrade the GUI and every shell reattaches, layout
   intact. With systemd lingering they survive logout too.
-- **Agents co-browse with you.** Each group's embedded browser hands its CDP
-  endpoint to the group's terminals automatically — an agent running there
-  sees and drives the page you're looking at, zero configuration.
+- **Your AI agent sees what you see.** Each group's embedded browser hands
+  its CDP endpoint to the group's terminals automatically — an agent running
+  there inspects and drives the page in front of you, zero configuration.
 - **One browser per project.** `Alt+2` opens a per-group Chromium pane with
   its own profile and start page.
 - **Tabs live in groups.** Colour-coded, nameable, drag-and-drop; the
