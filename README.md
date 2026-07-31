@@ -3,15 +3,22 @@
 A crash-safe GTK4/libadwaita terminal emulator with tabs organised into
 colour-coded groups.
 
-Tabs belong to a group; groups are colour-coded and can be named. Navigation
-happens per tab or per group, and tabs can be moved between groups. The tab
-pane on the left can be hidden, leaving a compact tab bar.
-
-Shells are backed by tmux sessions on a private, invisible tmux server, so
-they survive the GUI crashing, quitting, or being upgraded — relaunch and
-every tab reattaches to its still-running shell, with grouping, colours,
-order, and titles restored. With systemd lingering enabled they even survive
-logging out and back in.
+- **Shells survive everything.** Tabs are backed by an invisible tmux
+  server; crash, quit or upgrade the GUI and every shell reattaches, layout
+  intact. With systemd lingering they survive logout too.
+- **Agents co-browse with you.** Each group's embedded browser hands its CDP
+  endpoint to the group's terminals automatically — an agent running there
+  sees and drives the page you're looking at, zero configuration.
+- **One browser per project.** `Alt+2` opens a per-group Chromium pane with
+  its own profile and start page.
+- **Tabs live in groups.** Colour-coded, nameable, drag-and-drop; the
+  sidebar collapses to a compact tab bar.
+- **Agent-friendly CLI.** `kabelsalat run -g web -- npm run dev` opens a
+  command in a visible tab without stealing focus; a Claude Code plugin
+  teaches agents the whole interface.
+- **Failure is survivable.** Crashed shells keep their output and restart in
+  one click; orphaned sessions land in a "Recovered" group. Works without
+  tmux, minus the survival guarantees.
 
 Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
 [VTE](https://gitlab.gnome.org/GNOME/vte).
