@@ -9,7 +9,8 @@ colour-coded groups.
 - **Your AI agent sees the web page you see.** Each group's embedded browser
   hands its CDP endpoint to the group's terminals automatically — an agent
   running there inspects and drives the page in front of you, zero
-  configuration.
+  configuration. One camera-button click hands it a screenshot of the pane
+  instead, pasted straight into the tab you took it from.
 - **One browser per project.** `Alt+2` opens a per-group Chromium pane with
   its own profile and start page.
 - **Tabs live in groups.** Colour-coded, nameable, drag-and-drop; the
@@ -151,6 +152,20 @@ argument, not navigation, and a relaunched pane restores its own session instead
 of stacking another copy of the default tab on top of it. So a group that
 already has a browser picks up a new default only after **Close browser** —
 which deletes that pane's profile — and a fresh `Alt+2`.
+
+### Screenshot into the terminal
+
+The camera button in the header bar captures the active group's browser pane
+and puts the image on the clipboard, then presses `Ctrl+V` in the tab it was
+started from — so a `claude` running there stages the screenshot and you type
+your question next to it. It works while the pane is hidden, and is greyed out
+when the group has no running browser.
+
+Two consequences worth knowing: it **replaces the clipboard contents**, like
+any other copy action, and the keystroke goes to whatever is running in that
+tab — a shell rather than an agent sees a plain `Ctrl+V`, exactly as if you had
+pressed it yourself. If you switch tabs while the capture is still in flight,
+the paste is skipped and the screenshot only lands on the clipboard.
 
 ### Browser automation (CDP)
 
