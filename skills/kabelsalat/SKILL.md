@@ -1,6 +1,6 @@
 ---
 name: kabelsalat
-description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess; not for commands whose output you need to capture or read back. Also use when reading, inspecting, screenshotting or automating the web page in the user's embedded browser pane, which is attachable over CDP with Playwright. Covers the named groups of the user's running kabelsalat terminal and the browser each one can show.
+description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess; not for commands whose output you need to capture or read back. Also use to read, screenshot or drive the page in the user's embedded browser pane (CDP/Playwright). Both live in the named groups of the user's running kabelsalat terminal.
 ---
 
 # Launching terminals in kabelsalat
@@ -90,18 +90,16 @@ If `show-environment` reports no `KABELSALAT_GROUP` at all, the tab predates
 the feature or lost its stamp — say so to the user instead of guessing a
 group.
 
-Write a program and run it: a Python or JavaScript script against stock
-Playwright. **Do not drive the browser through a Playwright MCP server**, even
-if one is wired into your session and already pointed at this endpoint. A
-script does many steps in one process and works the same whatever tools happen
-to be configured; MCP turns one task into a long chain of single-step round
-trips. The script is your working tool, not a deliverable — re-read it when
-iterating, and do not hand it to the user for review.
+Drive the browser from a script — Python or JavaScript against stock
+Playwright, connecting to `KABELSALAT_CDP`. **Do not use a Playwright MCP
+server**, even if one is configured and already pointed at this endpoint: a
+script runs many steps in one process, where MCP makes each step a separate
+round trip. The script is scratch tooling for you, not something to present
+to the user.
 
-`KABELSALAT_CDP` is the endpoint to use. `PLAYWRIGHT_MCP_CDP_ENDPOINT` carries
-the identical value and exists only so that a session already configured that
-way does not point at the wrong browser — its presence is not a reason to use
-MCP.
+(`PLAYWRIGHT_MCP_CDP_ENDPOINT` holds the same value. It exists so that a
+session which does use an MCP server at least points at the right browser —
+not as a recommendation.)
 
 Start every script with the same preamble — re-resolve the environment and
 assert the group you pinned on first fetch. Tabs can be moved between groups;
@@ -133,5 +131,4 @@ failure:
         # page is the tab the user is looking at: read, evaluate, screenshot.
 
 A failed `connect_over_cdp` (connection refused) means the browser restarted:
-re-run the fetch and retry. Prefer one script that does many steps over many
-single-step invocations.
+re-run the fetch and retry.
