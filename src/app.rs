@@ -11,7 +11,7 @@ use relm4::gtk::prelude::*;
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
-use crate::browser::{self, Browser, ProfileDisposition};
+use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::control;
 use crate::state::{self, SavedGroup, SavedState, SavedTab};
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
@@ -93,6 +93,14 @@ const MIN_BROWSER_PX: i32 = 200;
 /// rather than an attempted selection.
 const DRAG_THRESHOLD_PX: f64 = 8.0;
 
+/// The Ctrl-V byte, written straight into the active tab's pty after a
+/// screenshot lands on the clipboard.
+///
+/// Writing to the pty is what keeps tmux out of this feature entirely: the
+/// byte behaves the same whether the pty runs a tmux client or a plain shell,
+/// exactly as if the user had pressed the keys.
+const CTRL_V: u8 = 0x16;
+
 /// Floor for the *active* tab. It is deliberately a floor and not a pin: every
 /// tab asks for its full title as natural width, so it renders unabbreviated
 /// whenever the bar has the room, and only gives ground when the window is
@@ -162,6 +170,9 @@ pub struct App {
     /// pane (end). The end child is attached and detached imperatively — only
     /// the active group's pane is ever parented.
     browser_paned: gtk::Paned,
+    /// Wraps the window content; carries the transient failure notices that do
+    /// not deserve a dialog.
+    toast_overlay: adw::ToastOverlay,
     /// Popover behind the header bar's browser overflow button.
     browser_menu: gtk::Popover,
     /// Endpoint row in the browser overflow menu: dimmed "CDP: unavailable"
@@ -302,6 +313,14 @@ pub enum Msg {
     CdpReady(usize, Option<browser::CdpEndpoint>),
     /// Copy the active group's CDP endpoint URL to the clipboard.
     CopyCdpEndpoint,
+    /// Capture what the active group's browser shows.
+    Screenshot,
+    /// The capture finished: the frame, or why there is none.
+    ///
+    /// The error is already rendered to text, like [`Msg::LingerEnabled`]'s:
+    /// klamottenkiste's `CaptureError` is not `Clone`, and both failure kinds
+    /// mean the same thing here — a toast and a line on stderr.
+    ScreenshotCaptured(Result<CapturedFrame, String>),
     /// A `kabelsalat run` invocation: create a tab in the group with this
     /// uuid, running `argv` in `cwd`. Deliberately inert otherwise — it does
     /// not activate the tab, raise the window, change the active group, or
@@ -382,6 +401,14 @@ impl SimpleComponent for App {
                     connect_clicked => Msg::ToggleBrowser,
                 },
 
+                pack_end = &gtk::Button {
+                    set_icon_name: "camera-photo-symbolic",
+                    set_tooltip_text: Some("Screenshot browser → paste into terminal"),
+                    #[watch]
+                    set_sensitive: model.active_browser_running(),
+                    connect_clicked => Msg::Screenshot,
+                },
+
                 pack_end = &gtk::MenuButton {
                     set_icon_name: "view-more-symbolic",
                     set_tooltip_text: Some("Browser options"),
@@ -415,92 +442,99 @@ impl SimpleComponent for App {
                 },
             },
 
-            gtk::Paned {
-                set_orientation: gtk::Orientation::Horizontal,
-                set_position: 220,
-                set_resize_start_child: false,
-                set_shrink_start_child: false,
-
+            // The toast overlay wraps the whole content: a screenshot that
+            // could not be taken is worth a line the user notices, but not a
+            // dialog they have to dismiss.
+            #[local_ref]
+            toast_overlay -> adw::ToastOverlay {
                 #[wrap(Some)]
-                set_start_child = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_width_request: 120,
-                    #[watch]
-                    set_visible: model.sidebar_visible,
-
-                        gtk::Box {
-                            set_orientation: gtk::Orientation::Horizontal,
-                            set_margin_all: 6,
-                            set_spacing: 6,
-
-                            gtk::Label {
-                                set_label: "tabs",
-                                set_hexpand: true,
-                                set_halign: gtk::Align::Start,
-                            },
-
-                            gtk::Button {
-                                set_icon_name: "folder-new-symbolic",
-                                set_tooltip_text: Some("New group (Ctrl+Shift+N)"),
-                                connect_clicked => Msg::NewGroup,
-                            },
-
-                            gtk::Button {
-                                set_icon_name: "tab-new-symbolic",
-                                set_tooltip_text: Some("New tab (Ctrl+Shift+T)"),
-                                connect_clicked => Msg::NewTab,
-                            },
-                        },
-
-                        #[local_ref]
-                        tab_list -> gtk::ListBox {
-                            set_vexpand: true,
-                            add_css_class: "navigation-sidebar",
-                            connect_row_selected[sender] => move |_, row| {
-                                if let Some(id) = row.and_then(|r| r.widget_name().parse().ok()) {
-                                    sender.input(Msg::Select(id));
-                                }
-                            },
-                        },
-                },
-
-                // The browser split. Its end child is the active group's
-                // WaylandPane, attached and detached imperatively; with no
-                // browser showing, the terminal box takes the full width.
-                #[wrap(Some)]
-                set_end_child = &browser_paned.clone() {
+                set_child = &gtk::Paned {
                     set_orientation: gtk::Orientation::Horizontal,
-                    set_resize_end_child: false,
-                    set_shrink_end_child: false,
+                    set_position: 220,
+                    set_resize_start_child: false,
+                    set_shrink_start_child: false,
 
-                #[wrap(Some)]
-                set_start_child = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_hexpand: true,
+                    #[wrap(Some)]
+                    set_start_child = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_width_request: 120,
+                        #[watch]
+                        set_visible: model.sidebar_visible,
 
-                    // The scroller is what lets the bar have a small minimum
-                    // width: past the point where inactive tabs hit their
-                    // character floor, the overflow scrolls instead of forcing
-                    // the window wider.
-                    append = &tab_scroller.clone() {
-                        set_hscrollbar_policy: gtk::PolicyType::External,
-                        set_vscrollbar_policy: gtk::PolicyType::Never,
-                        set_propagate_natural_height: true,
-                        set_visible: false,
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_margin_all: 6,
+                                set_spacing: 6,
 
-                        #[wrap(Some)]
-                        set_child = &tab_bar.clone() {
-                            set_orientation: gtk::Orientation::Horizontal,
-                            set_spacing: 2,
-                            set_margin_all: 4,
+                                gtk::Label {
+                                    set_label: "tabs",
+                                    set_hexpand: true,
+                                    set_halign: gtk::Align::Start,
+                                },
+
+                                gtk::Button {
+                                    set_icon_name: "folder-new-symbolic",
+                                    set_tooltip_text: Some("New group (Ctrl+Shift+N)"),
+                                    connect_clicked => Msg::NewGroup,
+                                },
+
+                                gtk::Button {
+                                    set_icon_name: "tab-new-symbolic",
+                                    set_tooltip_text: Some("New tab (Ctrl+Shift+T)"),
+                                    connect_clicked => Msg::NewTab,
+                                },
+                            },
+
+                            #[local_ref]
+                            tab_list -> gtk::ListBox {
+                                set_vexpand: true,
+                                add_css_class: "navigation-sidebar",
+                                connect_row_selected[sender] => move |_, row| {
+                                    if let Some(id) = row.and_then(|r| r.widget_name().parse().ok()) {
+                                        sender.input(Msg::Select(id));
+                                    }
+                                },
+                            },
+                    },
+
+                    // The browser split. Its end child is the active group's
+                    // WaylandPane, attached and detached imperatively; with no
+                    // browser showing, the terminal box takes the full width.
+                    #[wrap(Some)]
+                    set_end_child = &browser_paned.clone() {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_resize_end_child: false,
+                        set_shrink_end_child: false,
+
+                    #[wrap(Some)]
+                    set_start_child = &gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_hexpand: true,
+
+                        // The scroller is what lets the bar have a small minimum
+                        // width: past the point where inactive tabs hit their
+                        // character floor, the overflow scrolls instead of forcing
+                        // the window wider.
+                        append = &tab_scroller.clone() {
+                            set_hscrollbar_policy: gtk::PolicyType::External,
+                            set_vscrollbar_policy: gtk::PolicyType::Never,
+                            set_propagate_natural_height: true,
+                            set_visible: false,
+
+                            #[wrap(Some)]
+                            set_child = &tab_bar.clone() {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 2,
+                                set_margin_all: 4,
+                            },
+                        },
+
+                        append = &stack.clone() {
+                            set_hexpand: true,
+                            set_vexpand: true,
                         },
                     },
-
-                    append = &stack.clone() {
-                        set_hexpand: true,
-                        set_vexpand: true,
                     },
-                },
                 },
             },
         }
@@ -584,6 +618,7 @@ impl SimpleComponent for App {
             tab_scroller: gtk::ScrolledWindow::new(),
             stack: gtk::Stack::new(),
             browser_paned: gtk::Paned::new(gtk::Orientation::Horizontal),
+            toast_overlay: adw::ToastOverlay::new(),
             browser_menu: gtk::Popover::new(),
             cdp_label: gtk::Label::builder()
                 .label("CDP: unavailable")
@@ -621,6 +656,7 @@ impl SimpleComponent for App {
         let tab_scroller = model.tab_scroller.clone();
         let stack = model.stack.clone();
         let browser_paned = model.browser_paned.clone();
+        let toast_overlay = model.toast_overlay.clone();
         let browser_menu = model.browser_menu.clone();
         let cdp_label = model.cdp_label.clone();
         let cdp_copy = model.cdp_copy.clone();
@@ -838,6 +874,23 @@ impl SimpleComponent for App {
                     .and_then(|b| b.cdp_url());
                 if let (Some(url), Some(display)) = (url, gtk::gdk::Display::default()) {
                     display.clipboard().set_text(&url);
+                }
+                return;
+            }
+            // The clipboard and the pty are the only things this touches, and
+            // neither is persisted — so both arms return early like the other
+            // runtime-only messages.
+            Msg::Screenshot => {
+                self.capture_browser(&sender);
+                return;
+            }
+            Msg::ScreenshotCaptured(result) => {
+                match result {
+                    Ok(frame) => self.paste_screenshot(frame),
+                    Err(detail) => {
+                        eprintln!("kabelsalat: browser screenshot failed: {detail}");
+                        self.show_toast("The browser screenshot failed.");
+                    }
                 }
                 return;
             }
@@ -1256,6 +1309,78 @@ impl App {
         self.active_group()
             .and_then(|id| self.groups.iter().find(|g| g.id == id))
             .is_some_and(|g| g.browser.is_some() && !g.browser_visible)
+    }
+
+    /// Can the active group's browser be captured right now? Drives the
+    /// screenshot button. The pane's compositor is what renders the frame, so
+    /// a browser whose pane has died has nothing left to show — and a hidden
+    /// browser has, which is why this asks "running", not "visible".
+    fn active_browser_running(&self) -> bool {
+        self.active_group()
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .and_then(|g| g.browser.as_ref())
+            .is_some_and(Browser::is_running)
+    }
+
+    /// Ask the active group's browser for a fresh frame. The pane answers on
+    /// the GTK main context, so the reply comes back as an ordinary message.
+    fn capture_browser(&self, sender: &ComponentSender<Self>) {
+        let Some(browser) = self
+            .active_group()
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .and_then(|g| g.browser.as_ref())
+        else {
+            return;
+        };
+        let sender = sender.clone();
+        browser.capture_frame(move |result| {
+            sender.input(Msg::ScreenshotCaptured(
+                result.map_err(|err| err.to_string()),
+            ));
+        });
+    }
+
+    /// Put a captured frame on the clipboard, then press Ctrl-V in the active
+    /// tab so a `claude` running there stages it as an image.
+    ///
+    /// The claim outlives the paste — GDK serializes the texture per requester
+    /// — so the screenshot stays available for the user to paste anywhere else.
+    /// The keystroke is deferred by one main-loop iteration because the claim
+    /// only reaches the compositor when the loop next runs, and the reader in
+    /// the tab must not beat it there.
+    fn paste_screenshot(&self, frame: CapturedFrame) {
+        if !frame_backs_texture(frame.width, frame.height, frame.stride, frame.rgba.len()) {
+            eprintln!("kabelsalat: unusable screenshot frame: {frame:?}");
+            self.show_toast("The browser screenshot failed.");
+            return;
+        }
+        let Some(display) = gtk::gdk::Display::default() else {
+            return;
+        };
+        let (width, height, stride) = (frame.width as i32, frame.height as i32, frame.stride);
+        let texture = gtk::gdk::MemoryTexture::new(
+            width,
+            height,
+            gtk::gdk::MemoryFormat::R8g8b8a8,
+            &gtk::glib::Bytes::from_owned(frame.rgba),
+            stride,
+        );
+        display.clipboard().set_texture(&texture);
+
+        // No active tab: nothing to type into, but the clipboard is set, so the
+        // screenshot is still there to be pasted by hand.
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let terminal = tab.terminal.clone();
+        gtk::glib::idle_add_local_once(move || {
+            terminal.feed_child(&[CTRL_V]);
+        });
+    }
+
+    /// Say something transient in the toast overlay.
+    fn show_toast(&self, message: &str) {
+        self.toast_overlay.add_toast(adw::Toast::new(message));
     }
 
     /// Reflect the active group's CDP state in the overflow menu. The label
@@ -2814,6 +2939,16 @@ fn browser_open_desired(has_browser: bool, pending_restore: &[usize], id: usize)
     has_browser || pending_restore.contains(&id)
 }
 
+/// Can a captured frame back a `gdk::MemoryTexture`? Pure.
+///
+/// GDK reads `stride * height` bytes out of the buffer it is handed and trusts
+/// the geometry, so a degenerate or short frame is a failure to report rather
+/// than something to pass on to it.
+fn frame_backs_texture(width: u32, height: u32, stride: usize, len: usize) -> bool {
+    let needed = stride.saturating_mul(height as usize);
+    width > 0 && height > 0 && stride > 0 && needed > 0 && len >= needed
+}
+
 /// Uuids whose profile directory nobody will dispose of when the groups not in
 /// `live` are dropped. Pure.
 ///
@@ -3100,6 +3235,28 @@ mod tests {
     fn group_without_browser_and_not_queued_is_persisted_as_closed() {
         assert!(!browser_open_desired(false, &[2, 3], 4));
         assert!(!browser_open_desired(false, &[], 1));
+    }
+
+    // --- captured frames -------------------------------------------------
+
+    #[test]
+    fn a_full_frame_backs_a_texture() {
+        assert!(frame_backs_texture(800, 600, 3200, 3200 * 600));
+        // Padded rows and an over-long buffer are both fine.
+        assert!(frame_backs_texture(800, 600, 4096, 4096 * 600 + 17));
+    }
+
+    #[test]
+    fn a_degenerate_or_short_frame_backs_nothing() {
+        // Nothing to show…
+        assert!(!frame_backs_texture(0, 600, 3200, 3200 * 600));
+        assert!(!frame_backs_texture(800, 0, 3200, 0));
+        assert!(!frame_backs_texture(800, 600, 0, 3200 * 600));
+        // …and a buffer GDK would read past the end of.
+        assert!(!frame_backs_texture(800, 600, 3200, 3200 * 600 - 1));
+        assert!(!frame_backs_texture(800, 600, 3200, 0));
+        // No overflow panic on absurd geometry, just a refusal.
+        assert!(!frame_backs_texture(u32::MAX, u32::MAX, usize::MAX, 4));
     }
 
     // --- profile reclamation on group deletion ---------------------------

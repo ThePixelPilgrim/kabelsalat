@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 use klamottenkiste::WaylandPane;
 use relm4::gtk::prelude::WidgetExt;
 
+/// A captured pane frame and why a capture failed. Re-exported so the rest of
+/// the app can name them without reaching into klamottenkiste itself.
+pub use klamottenkiste::{CaptureError, CapturedFrame};
+
 /// Chromium binaries tried at spawn time, in order.
 pub const BROWSER_CANDIDATES: &[&str] = &["chromium", "chromium-browser", "google-chrome"];
 
@@ -377,6 +381,26 @@ impl Browser {
     /// compositor and Chromium keep running, so page state survives.
     pub fn set_visible(&self, visible: bool) {
         self.pane.set_visible(visible);
+    }
+
+    /// Is the pane's compositor still running, i.e. is there anything left to
+    /// render a frame? Says nothing about the hosted Chromium, which has its
+    /// own answer in [`Browser::has_exited`].
+    pub fn is_running(&self) -> bool {
+        self.pane.is_running()
+    }
+
+    /// Ask the pane for a freshly rendered frame of what it shows.
+    ///
+    /// `callback` runs on the GTK main context, exactly once, failures
+    /// included; the GTK thread never blocks on the readback. Works while the
+    /// pane is hidden — the offscreen framebuffer does not care about widget
+    /// visibility.
+    pub fn capture_frame<F>(&self, callback: F)
+    where
+        F: FnOnce(Result<CapturedFrame, CaptureError>) + 'static,
+    {
+        self.pane.capture_frame(callback);
     }
 
     /// Has the hosted Chromium exited? `Ok(true)` means it is gone.
