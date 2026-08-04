@@ -315,12 +315,14 @@ pub enum Msg {
     CopyCdpEndpoint,
     /// Capture what the active group's browser shows.
     Screenshot,
-    /// The capture finished: the frame, or why there is none.
+    /// The capture finished: the frame, or why there is none. The id is the
+    /// tab that was active when the capture was asked for — the readback can
+    /// take seconds, and the paste belongs to that tab or to none.
     ///
     /// The error is already rendered to text, like [`Msg::LingerEnabled`]'s:
     /// klamottenkiste's `CaptureError` is not `Clone`, and both failure kinds
     /// mean the same thing here — a toast and a line on stderr.
-    ScreenshotCaptured(Result<CapturedFrame, String>),
+    ScreenshotCaptured(usize, Result<CapturedFrame, String>),
     /// A `kabelsalat run` invocation: create a tab in the group with this
     /// uuid, running `argv` in `cwd`. Deliberately inert otherwise — it does
     /// not activate the tab, raise the window, change the active group, or
@@ -404,6 +406,12 @@ impl SimpleComponent for App {
                 pack_end = &gtk::Button {
                     set_icon_name: "camera-photo-symbolic",
                     set_tooltip_text: Some("Screenshot browser → paste into terminal"),
+                    // The point of the button is to leave the user typing a
+                    // description next to the pasted image, so it must not
+                    // keep the keyboard: with focus on the button, the next
+                    // Space or Enter would fire a second capture and a second
+                    // Ctrl-V instead of reaching the terminal.
+                    set_focus_on_click: false,
                     #[watch]
                     set_sensitive: model.active_browser_running(),
                     connect_clicked => Msg::Screenshot,
@@ -884,9 +892,9 @@ impl SimpleComponent for App {
                 self.capture_browser(&sender);
                 return;
             }
-            Msg::ScreenshotCaptured(result) => {
+            Msg::ScreenshotCaptured(tab, result) => {
                 match result {
-                    Ok(frame) => self.paste_screenshot(frame),
+                    Ok(frame) => self.paste_screenshot(tab, frame),
                     Err(detail) => {
                         eprintln!("kabelsalat: browser screenshot failed: {detail}");
                         self.show_toast("The browser screenshot failed.");
@@ -1323,11 +1331,18 @@ impl App {
     }
 
     /// Ask the active group's browser for a fresh frame. The pane answers on
-    /// the GTK main context, so the reply comes back as an ordinary message.
+    /// the GTK main context, so the reply comes back as an ordinary message —
+    /// carrying the tab the user asked from, because the answer may take
+    /// seconds and the user is free to switch tabs meanwhile.
     fn capture_browser(&self, sender: &ComponentSender<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let tab_id = tab.id;
         let Some(browser) = self
-            .active_group()
-            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .groups
+            .iter()
+            .find(|g| g.id == tab.group)
             .and_then(|g| g.browser.as_ref())
         else {
             return;
@@ -1335,20 +1350,27 @@ impl App {
         let sender = sender.clone();
         browser.capture_frame(move |result| {
             sender.input(Msg::ScreenshotCaptured(
+                tab_id,
                 result.map_err(|err| err.to_string()),
             ));
         });
     }
 
-    /// Put a captured frame on the clipboard, then press Ctrl-V in the active
-    /// tab so a `claude` running there stages it as an image.
+    /// Put a captured frame on the clipboard, then press Ctrl-V in the tab the
+    /// capture was started from so a `claude` running there stages it as an
+    /// image.
     ///
     /// The claim outlives the paste — GDK serializes the texture per requester
     /// — so the screenshot stays available for the user to paste anywhere else.
     /// The keystroke is deferred by one main-loop iteration because the claim
     /// only reaches the compositor when the loop next runs, and the reader in
     /// the tab must not beat it there.
-    fn paste_screenshot(&self, frame: CapturedFrame) {
+    ///
+    /// The keystroke only goes to `tab`, and only while it is still the active
+    /// one: a frame that arrives after the user moved on would otherwise be
+    /// typed into an unrelated agent's session. The clipboard is set either
+    /// way, so a skipped paste still leaves the screenshot in hand.
+    fn paste_screenshot(&self, tab: usize, frame: CapturedFrame) {
         if !frame_backs_texture(frame.width, frame.height, frame.stride, frame.rgba.len()) {
             eprintln!("kabelsalat: unusable screenshot frame: {frame:?}");
             self.show_toast("The browser screenshot failed.");
@@ -1367,14 +1389,17 @@ impl App {
         );
         display.clipboard().set_texture(&texture);
 
-        // No active tab: nothing to type into, but the clipboard is set, so the
-        // screenshot is still there to be pasted by hand.
-        let Some(tab) = self.active_tab() else {
+        let Some(tab) = self.active_tab().filter(|t| t.id == tab) else {
+            self.show_toast("Screenshot copied to the clipboard.");
             return;
         };
         let terminal = tab.terminal.clone();
         gtk::glib::idle_add_local_once(move || {
             terminal.feed_child(&[CTRL_V]);
+            // The click left the keyboard where it was; the paste is an
+            // invitation to type next to the image, so hand it to the
+            // terminal that just received it.
+            terminal.grab_focus();
         });
     }
 
@@ -2941,12 +2966,24 @@ fn browser_open_desired(has_browser: bool, pending_restore: &[usize], id: usize)
 
 /// Can a captured frame back a `gdk::MemoryTexture`? Pure.
 ///
-/// GDK reads `stride * height` bytes out of the buffer it is handed and trusts
-/// the geometry, so a degenerate or short frame is a failure to report rather
-/// than something to pass on to it.
+/// GDK reads `stride * height` bytes out of the buffer it is handed, so a
+/// degenerate or short frame is a failure to report rather than something to
+/// pass on to it. The other constraints are the ones
+/// `gdk_memory_texture_new()` checks itself and answers with NULL — which the
+/// binding's non-nullable return turns into a panic, so they have to be caught
+/// here: a row must hold its pixels (4 bytes each in `R8g8b8a8`), and the
+/// dimensions must survive the cast to the `i32` the call takes.
 fn frame_backs_texture(width: u32, height: u32, stride: usize, len: usize) -> bool {
+    const BYTES_PER_PIXEL: usize = 4;
+    let row = (width as usize).saturating_mul(BYTES_PER_PIXEL);
     let needed = stride.saturating_mul(height as usize);
-    width > 0 && height > 0 && stride > 0 && needed > 0 && len >= needed
+    width > 0
+        && height > 0
+        && width <= i32::MAX as u32
+        && height <= i32::MAX as u32
+        && stride >= row
+        && needed > 0
+        && len >= needed
 }
 
 /// Uuids whose profile directory nobody will dispose of when the groups not in
@@ -3257,6 +3294,29 @@ mod tests {
         assert!(!frame_backs_texture(800, 600, 3200, 0));
         // No overflow panic on absurd geometry, just a refusal.
         assert!(!frame_backs_texture(u32::MAX, u32::MAX, usize::MAX, 4));
+    }
+
+    #[test]
+    fn a_row_too_short_for_its_pixels_backs_nothing() {
+        // Long enough overall, but GDK refuses a stride below width * 4 —
+        // and answers a refusal with NULL, which would panic on the way back.
+        assert!(!frame_backs_texture(800, 600, 1600, 1600 * 600));
+        assert!(!frame_backs_texture(800, 600, 3199, 3199 * 600));
+        // Exactly the pixels, no padding, is the normal case.
+        assert!(frame_backs_texture(800, 600, 3200, 3200 * 600));
+    }
+
+    #[test]
+    fn dimensions_beyond_i32_back_nothing() {
+        // They would reach gdk_memory_texture_new() as negative numbers.
+        let huge = i32::MAX as u32 + 1;
+        assert!(!frame_backs_texture(
+            huge,
+            1,
+            huge as usize * 4,
+            huge as usize * 4
+        ));
+        assert!(!frame_backs_texture(1, huge, 4, huge as usize * 4));
     }
 
     // --- profile reclamation on group deletion ---------------------------
