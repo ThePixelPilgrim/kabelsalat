@@ -90,10 +90,23 @@ If `show-environment` reports no `KABELSALAT_GROUP` at all, the tab predates
 the feature or lost its stamp — say so to the user instead of guessing a
 group.
 
-Author scripts against stock Playwright, and start every script with the same
-preamble — re-resolve the environment and assert the group you pinned on
-first fetch. Tabs can be moved between groups; the assert is what turns a
-silently-wrong browser into a loud, recoverable failure:
+Write a program and run it: a Python or JavaScript script against stock
+Playwright. **Do not drive the browser through a Playwright MCP server**, even
+if one is wired into your session and already pointed at this endpoint. A
+script does many steps in one process and works the same whatever tools happen
+to be configured; MCP turns one task into a long chain of single-step round
+trips. The script is your working tool, not a deliverable — re-read it when
+iterating, and do not hand it to the user for review.
+
+`KABELSALAT_CDP` is the endpoint to use. `PLAYWRIGHT_MCP_CDP_ENDPOINT` carries
+the identical value and exists only so that a session already configured that
+way does not point at the wrong browser — its presence is not a reason to use
+MCP.
+
+Start every script with the same preamble — re-resolve the environment and
+assert the group you pinned on first fetch. Tabs can be moved between groups;
+the assert is what turns a silently-wrong browser into a loud, recoverable
+failure:
 
     import subprocess
     from playwright.sync_api import sync_playwright
