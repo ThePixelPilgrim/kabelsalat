@@ -173,3 +173,94 @@ Pure functions only, in the existing style (banner comment, direct
 - Group-level age aggregation beyond the collapsed row's representative.
 - Tracking activity types separately (keystroke vs output); one timestamp
   serves all.
+
+---
+
+# Revision v2 — meaningful activity only (2026-08-13)
+
+Dogfooding falsified the v1 source model. Field observations (sidebar full of
+agent tabs): most tabs pinned to `now` and never aging, two-bucket age
+distributions after reattach, tabs idle for days showing minutes. Trace
+results:
+
+- `contents-changed` fires on any *visible appearance* change, not on
+  meaningful output. An idle Claude TUI repaints continuously (spinner,
+  status line, caret), so an agent tab can never age. The 750 ms
+  post-attach settle window guards only the attach repaint, not this.
+- The v1 title hook stamps on every OSC title *event*, including events
+  that carry an unchanged title.
+- The tmux seed (`#{window_activity}`, and `#{session_activity}` before
+  it) is itself output-based: an idle-but-running agent keeps it
+  perpetually fresh inside tmux. No kabelsalat-side filtering can fix the
+  seed; "4 days ago" is unreachable from any output-derived source.
+
+## v2 activity definition
+
+A tab's age is the time since the last **meaningful** event, which is
+exactly one of:
+
+1. **User input, strict (global default):** a press of `Esc` or `Enter`
+   (`GDK_KEY_Escape`, `GDK_KEY_Return`, `GDK_KEY_KP_Enter`,
+   `GDK_KEY_ISO_Enter`) on the tab's key controller. In an agent tab these
+   are the moments of intent — submitting work, interrupting — while
+   composing and scrolling stay silent. The controller sees GTK keyvals,
+   so `Esc` is cleanly distinguishable from ESC-prefixed escape sequences;
+   a pty-byte tap could not make this distinction.
+2. **Agent activity: a title *change*.** Stamp only when the new title
+   string differs from the tab's previous one. Agents update the terminal
+   title while they work; when the title stops changing, the tab ages.
+   The comparison also absorbs the attach-time title re-emission for free.
+
+Dropped from v1: `contents-changed` as a source (entirely), the
+unchanged-title stamps, the `#{window_activity}`/`#{session_activity}`
+seed, and with them the `activity_armed` / `ACTIVITY_SETTLE_MS` machinery —
+neither remaining source needs an attach-settle window.
+
+Deferred (explicitly wanted later, not now): per-tab/per-group activity
+modes — e.g. a lenient mode counting any keystroke — and assignment
+policies (by command, by group). v2 ships one global behavior: strict
+input + title changes.
+
+## Persistence (reverses v1's "state.rs untouched")
+
+v1 avoided `state.json` because tmux was assumed authoritative. With
+output-derived sources rejected, tmux has nothing per-tab to offer: there
+is no per-pane "last input" or "last title change" in tmux. The persisted
+state is now the only truthful seed, so `SavedTab` gains:
+
+```rust
+last_activity: Option<SystemTime>,  // serde-friendly encoding at impl time
+last_title: Option<String>,         // dedupe anchor across restarts
+```
+
+- Written only on the existing save events (tab create/close/move, title
+  change already triggers `save_state` today — verify at impl time;
+  otherwise piggyback on the events that do). The 30 s `AgeTick` still
+  never writes — v1's no-disk-churn guarantee stands.
+- `Esc`/`Enter` stamps mark state dirty but must not fsync per keystroke;
+  they ride the next regular save. A stamp lost to a crash costs at most
+  the age looking slightly older — the honest direction to err.
+- Reattach seeds `last_activity` from the persisted value; missing field
+  (older state files) seeds with now, once. `last_title` prevents the
+  attach-time title re-emission from stamping.
+- No-tmux mode is unchanged: tabs are fresh shells, seeded now — still
+  the truth.
+
+## v2 behaviour deltas
+
+- An idle agent tab ages honestly: its TUI may repaint forever, but with
+  no title change and no Esc/Enter, `4d` is reachable and correct.
+- A *working* agent tab shows `now` while the agent is actually doing
+  things (title churn), which is the desired signal.
+- Plain shells under the strict default only stamp on Enter — which in a
+  shell is precisely "a command was run". Acceptable; lenient mode is the
+  deferred refinement.
+
+## v2 testing additions
+
+- Title dedupe: same title twice → one stamp; A→B→B→A → three stamps.
+- Strict filter: Esc/Enter keyvals stamp; printable keys, arrows (ESC-
+  prefixed on the wire, distinct keyvals in GTK) do not.
+- `SavedTab` round-trip with and without the new fields (old state files
+  must load; `state.rs` reconciliation carries the values through).
+- Age seeding: persisted value wins; absent → now.
