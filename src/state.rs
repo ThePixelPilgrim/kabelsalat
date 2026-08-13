@@ -113,6 +113,23 @@ pub struct SavedTab {
     pub uuid: String, // stable UUID assigned at tab creation, names the tmux session
     pub group: usize,
     pub title: String,
+    /// When this tab last saw *meaningful* activity (strict `Esc`/`Enter` input
+    /// or an actual title change), as unix seconds. Stored as `u64` rather than
+    /// `SystemTime` because serde encodes the latter as a nested struct, and
+    /// this file's on-disk format is meant to stay hand-readable.
+    /// `serde(default)` so state files predating the field load as `None`; the
+    /// app seeds those with "now", once — tmux has no per-pane last-input or
+    /// last-title-change to recover the real value from, so the persisted
+    /// timestamp is the only truthful seed there is.
+    #[serde(default)]
+    pub last_activity: Option<u64>,
+    /// The tab's title as of the last stamp, kept as the dedupe anchor across
+    /// restarts. VTE's title signal fires on every title *write*, including
+    /// writes of an unchanged string, so "did anything change?" is always an
+    /// app-side comparison against this value. Persisting it stops the
+    /// attach-time title re-emission from stamping every tab fresh on startup.
+    #[serde(default)]
+    pub last_title: Option<String>,
 }
 
 /// The whole persisted presentation model.
@@ -336,16 +353,22 @@ mod tests {
                     uuid: "aaa".into(),
                     group: 0,
                     title: "bash".into(),
+                    last_activity: Some(1_700_000_000),
+                    last_title: Some("bash".into()),
                 },
                 SavedTab {
                     uuid: "bbb".into(),
                     group: 1,
                     title: "vim".into(),
+                    last_activity: Some(1_700_000_500),
+                    last_title: Some("vim".into()),
                 },
                 SavedTab {
                     uuid: "ccc".into(),
                     group: 1,
                     title: "logs".into(),
+                    last_activity: None,
+                    last_title: None,
                 },
             ],
             active: Some("bbb".into()),
@@ -722,5 +745,56 @@ mod tests {
         assert_eq!(plan.attach[0].dead_exit, None); // aaa alive
         assert_eq!(plan.attach[1].dead_exit, Some(3)); // bbb crashed
         assert_eq!(plan.adopt[0].dead_exit, Some(127)); // orphan crashed
+    }
+
+    // --- tab age fields ---
+
+    #[test]
+    fn tab_age_fields_round_trip() {
+        let tab = SavedTab {
+            uuid: "aaa".into(),
+            group: 0,
+            title: "claude".into(),
+            last_activity: Some(1_755_000_000),
+            last_title: Some("claude — writing tests".into()),
+        };
+        let json = serde_json::to_string(&tab).unwrap();
+        let back: SavedTab = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_activity, Some(1_755_000_000));
+        assert_eq!(back.last_title.as_deref(), Some("claude — writing tests"));
+        assert_eq!(back, tab);
+    }
+
+    #[test]
+    fn old_tab_without_age_fields_loads_as_none() {
+        // A state.json written before tab ages existed. Absent fields are the
+        // whole migration: the app seeds such tabs with "now", once.
+        let json = r#"{
+            "groups": [],
+            "tabs": [{ "uuid": "aaa", "group": 0, "title": "bash" }],
+            "active": null,
+            "sidebar_visible": true
+        }"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].title, "bash");
+        assert_eq!(state.tabs[0].last_activity, None);
+        assert_eq!(state.tabs[0].last_title, None);
+    }
+
+    #[test]
+    fn reconcile_carries_age_fields_through_attach_and_respawn() {
+        // Neither path may silently reset a tab's age: an attached tab keeps the
+        // persisted stamp, and a respawned one keeps it too — the shell is new,
+        // but "when did the user last do something here" is unchanged by the
+        // fact that we had to recreate the session.
+        let state = sample_state();
+        let plan = reconcile(&state, &["aaa".to_string()], &[]);
+        assert_eq!(plan.attach[0].tab.last_activity, Some(1_700_000_000));
+        assert_eq!(plan.attach[0].tab.last_title.as_deref(), Some("bash"));
+        assert_eq!(plan.respawn[0].last_activity, Some(1_700_000_500));
+        assert_eq!(plan.respawn[0].last_title.as_deref(), Some("vim"));
+        assert_eq!(plan.respawn[1].last_activity, None);
+        assert_eq!(plan.respawn[1].last_title, None);
     }
 }

@@ -1,6 +1,8 @@
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use relm4::adw;
 use relm4::adw::prelude::{AdwDialogExt, AlertDialogExt, PreferencesGroupExt};
@@ -46,6 +48,14 @@ const SHORTCUTS: &[(&str, &str, Msg)] = &[
     ("<Alt><Shift>2", "Toggle browser pane", Msg::ToggleBrowser),
     ("<Alt>at", "Toggle browser pane", Msg::ToggleBrowser),
     ("<Alt>quotedbl", "Toggle browser pane", Msg::ToggleBrowser),
+    // Shift is what keeps these off the pty: plain Ctrl-V still reaches the
+    // child as 0x16, so `claude`, vim and readline keep their own handling.
+    ("<Control><Shift>v", "Paste into the terminal", Msg::Paste),
+    (
+        "<Control><Shift>c",
+        "Copy the terminal selection",
+        Msg::Copy,
+    ),
     ("F1", "Show this help", Msg::ShowHelp),
 ];
 
@@ -61,6 +71,10 @@ const SHORTCUT_ALIASES: &[&str] = &[
 
 /// How often the hosted Chromium processes are reaped for exit.
 const BROWSER_POLL_SECS: u32 = 2;
+
+/// How often the tab age prefixes are recomputed. The display has minute
+/// granularity, so a 30 s tick shows a stale "now" for at most 89 s.
+const AGE_TICK_SECS: u32 = 30;
 
 /// CDP discovery: poll the profile's DevToolsActivePort file this often…
 const CDP_POLL_MS: u64 = 100;
@@ -126,6 +140,18 @@ pub struct Tab {
     title: String,
     crashed: Option<i32>, // shell exit code when the tab crashed
     terminal: Terminal,
+    /// Wall-clock stamp of the last *meaningful* activity on this tab: an
+    /// Esc/Enter press, or a title that actually changed. Persisted in
+    /// `SavedTab::last_activity` — tmux has nothing per-pane to offer here
+    /// (every tmux timestamp is output-derived, so an idle-but-repainting
+    /// agent would stay perpetually fresh), which makes the state file the
+    /// only truthful seed across restarts. Shared with the key controller,
+    /// which fires per keystroke and so must not go through the relm4
+    /// message loop.
+    last_activity: Rc<Cell<SystemTime>>,
+    /// Age prefix currently rendered in the labels; the tick only touches a
+    /// label when this changes.
+    age_shown: String,
 }
 
 pub struct Group {
@@ -234,6 +260,8 @@ pub enum Msg {
     CloseActive,
     ChildExited(usize, i32),
     TitleChanged(usize, String),
+    /// Periodic recomputation of the tab age prefixes.
+    AgeTick,
     MoveTabPicker,
     MoveTabTo(Option<usize>), // None = new group
     JumpPicker,
@@ -313,6 +341,10 @@ pub enum Msg {
     CdpReady(usize, Option<browser::CdpEndpoint>),
     /// Copy the active group's CDP endpoint URL to the clipboard.
     CopyCdpEndpoint,
+    /// Paste the clipboard into the focused terminal.
+    Paste,
+    /// Copy the focused terminal's selection to the clipboard.
+    Copy,
     /// Capture what the active group's browser shows.
     Screenshot,
     /// The capture finished: the frame, or why there is none. The id is the
@@ -493,14 +525,19 @@ impl SimpleComponent for App {
                                 },
                             },
 
-                            #[local_ref]
-                            tab_list -> gtk::ListBox {
+                            gtk::ScrolledWindow {
                                 set_vexpand: true,
-                                add_css_class: "navigation-sidebar",
-                                connect_row_selected[sender] => move |_, row| {
-                                    if let Some(id) = row.and_then(|r| r.widget_name().parse().ok()) {
-                                        sender.input(Msg::Select(id));
-                                    }
+                                set_hscrollbar_policy: gtk::PolicyType::Never,
+
+                                #[local_ref]
+                                #[wrap(Some)]
+                                set_child = &tab_list -> gtk::ListBox {
+                                    add_css_class: "navigation-sidebar",
+                                    connect_row_selected[sender] => move |_, row| {
+                                        if let Some(id) = row.and_then(|r| r.widget_name().parse().ok()) {
+                                            sender.input(Msg::Select(id));
+                                        }
+                                    },
                                 },
                             },
                     },
@@ -730,6 +767,15 @@ impl SimpleComponent for App {
         // `pending_browser_restore` not yet filled), and a crash inside that
         // window would lose every browser flag.
         model.restore_or_fresh(&sender);
+        // Always on, unlike the browser poll: every tab has an age.
+        let input = sender.input_sender().clone();
+        gtk::glib::timeout_add_seconds_local(AGE_TICK_SECS, move || {
+            match input.send(Msg::AgeTick) {
+                Ok(()) => gtk::glib::ControlFlow::Continue,
+                // The component is gone; stop ticking.
+                Err(_) => gtk::glib::ControlFlow::Break,
+            }
+        });
         ComponentParts { model, widgets }
     }
 
@@ -885,6 +931,22 @@ impl SimpleComponent for App {
                 }
                 return;
             }
+            // The shortcut controller is global-scope, so it fires wherever
+            // focus sits. Only the terminal that actually has the keyboard may
+            // act on it — otherwise a Ctrl-Shift-V aimed at the browser pane
+            // would type into whichever tab happens to be active.
+            Msg::Paste => {
+                if let Some(tab) = self.active_tab().filter(|t| t.terminal.has_focus()) {
+                    tab.terminal.paste_clipboard();
+                }
+                return;
+            }
+            Msg::Copy => {
+                if let Some(tab) = self.active_tab().filter(|t| t.terminal.has_focus()) {
+                    tab.terminal.copy_clipboard_format(vte4::Format::Text);
+                }
+                return;
+            }
             // The clipboard and the pty are the only things this touches, and
             // neither is persisted — so both arms return early like the other
             // runtime-only messages.
@@ -910,6 +972,19 @@ impl SimpleComponent for App {
             // state-file write — the next layout mutation persists the title.
             Msg::TitleChanged(id, title) => {
                 self.update_title(id, title);
+                return;
+            }
+            // The age stamps ride along with whatever writes next — a tab
+            // create/close/move, or shutdown. (The v2 spec guessed that a
+            // title change already saves; it does not, see the arm above.
+            // Piggybacking on the layout mutations is the deliberate
+            // alternative: an unclean exit then loses the stamps since the
+            // last structural change, and the tabs seed slightly young — the
+            // direction the spec sanctions erring in.) The tick itself must
+            // never reach the save at the bottom of `update`: a disk write
+            // every 30 s would be a regression.
+            Msg::AgeTick => {
+                self.refresh_ages();
                 return;
             }
             Msg::MoveTabPicker => self.show_group_picker(PickerMode::Move),
@@ -1147,7 +1222,12 @@ impl App {
             self.add_tab(
                 tab.uuid.clone(),
                 tab.group,
-                Some(tab.title.clone()),
+                // `last_title` is the dedupe anchor, and `Tab::title` is what
+                // `update_title` compares against — so restoring the anchor is
+                // exactly restoring the title. Both were written from the same
+                // `tab.title`, so they only differ for state files predating
+                // the field, where `title` is the honest fallback.
+                Some(tab.last_title.clone().unwrap_or_else(|| tab.title.clone())),
                 dead_exit(&tab.uuid),
                 None,
                 None,
@@ -1194,6 +1274,24 @@ impl App {
         for (uuid, group) in &reattached {
             self.session_env_refresh(uuid, *group);
         }
+
+        // Seed the ages from the state file — the only source that survives a
+        // restart. A tab whose entry predates the field (or an adopted orphan,
+        // which has no `SavedTab` at all) keeps the `now` set at construction:
+        // erring young once is better than inventing a past.
+        let seeds: HashMap<&str, u64> = saved
+            .tabs
+            .iter()
+            .filter_map(|t| t.last_activity.map(|at| (t.uuid.as_str(), at)))
+            .collect();
+        let now = SystemTime::now();
+        for tab in &mut self.tabs {
+            tab.last_activity
+                .set(seed_activity(seeds.get(tab.uuid.as_str()).copied(), now));
+        }
+        // The seeded ages must be on the labels from the first paint, not 30 s
+        // later.
+        self.refresh_ages();
 
         // Drop any group that ended up empty, then restore the active tab.
         self.prune_empty_groups();
@@ -1252,6 +1350,19 @@ impl App {
                 uuid: t.uuid.clone(),
                 group: t.group,
                 title: t.title.clone(),
+                // Unix seconds, and never a panic on a clock: a pre-epoch
+                // stamp (only reachable via a wild clock jump) is dropped
+                // rather than unwrapped, which reseeds the tab to `now` on
+                // the next start.
+                last_activity: t
+                    .last_activity
+                    .get()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs()),
+                // The dedupe anchor: what `update_title` will compare the
+                // first post-restart title against.
+                last_title: Some(t.title.clone()),
             })
             .collect();
         let active = self
@@ -2135,6 +2246,26 @@ impl App {
         self.next_tab_id += 1;
         let title = title.unwrap_or_else(|| format!("Terminal {id}"));
 
+        // Activity tracking. The key handler fires per keystroke, far too
+        // often for relm4 messages, so it does exactly one `Cell::set` and
+        // rides the next regular save rather than triggering one.
+        let last_activity = Rc::new(Cell::new(SystemTime::now()));
+        // Capture phase and non-consuming: VTE still sees every key exactly
+        // as before, byte-identical. Only Esc and Enter stamp — see
+        // `is_activity_key`.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        keys.connect_key_pressed({
+            let last = last_activity.clone();
+            move |_, key, _, _| {
+                if is_activity_key(key) {
+                    last.set(SystemTime::now());
+                }
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        terminal.add_controller(keys);
+
         #[allow(deprecated)] // successor termprop API needs VTE >= 0.78 feature gates
         terminal.connect_window_title_notify({
             let sender = sender.clone();
@@ -2163,6 +2294,8 @@ impl App {
             title,
             crashed,
             terminal,
+            last_activity,
+            age_shown: age_prefix(Duration::ZERO),
         });
         id
     }
@@ -2468,11 +2601,12 @@ impl App {
             // No max_width_chars: the natural width stays the exact pixel
             // width of the title, so a tab is only ellipsized once the bar
             // actually runs out of room and squeezes it toward its floor.
+            let text = display_title(&tab.age_shown, &tab.title, tab.crashed, None);
             let label = gtk::Label::builder()
-                .label(&tab.title)
+                .label(&text)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .single_line_mode(true)
-                .width_chars(tab_label_min_chars(tab.title.chars().count(), active))
+                .width_chars(tab_label_min_chars(text.chars().count(), active))
                 .build();
 
             let button = gtk::Button::builder().child(&label).build();
@@ -2538,6 +2672,35 @@ impl App {
         });
     }
 
+    /// Recompute every tab's age prefix and repaint only the labels whose
+    /// prefix actually changed. Two-phase for the borrow checker: the
+    /// refreshers take `&self`.
+    fn refresh_ages(&mut self) {
+        let now = SystemTime::now();
+        let changed: Vec<(usize, String)> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                // Saturating: a backward clock jump shows "now" until real
+                // time catches up.
+                let elapsed = now
+                    .duration_since(tab.last_activity.get())
+                    .unwrap_or(Duration::ZERO);
+                let prefix = age_prefix(elapsed);
+                (prefix != tab.age_shown).then_some((tab.id, prefix))
+            })
+            .collect();
+        for (id, prefix) in changed {
+            let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+                continue;
+            };
+            self.tabs[index].age_shown = prefix;
+            let tab = &self.tabs[index];
+            self.refresh_sidebar_label(tab);
+            self.refresh_tab_bar_label(tab);
+        }
+    }
+
     /// Apply a title change by mutating the existing labels instead of
     /// rebuilding the sidebar and tab bar. Rebuilding tears down every row,
     /// button, and drag controller — per title change, at whatever rate the
@@ -2549,9 +2712,21 @@ impl App {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
             return;
         };
-        if tab.title == title {
+        if !title_changed(&tab.title, &title) {
             return;
         }
+        // After the guard, never before it: VTE's `window-title-notify` fires
+        // on every title *write*, including writes of an unchanged string, so
+        // the signal is only a prompt to compare and never itself evidence of
+        // change. The comparison also absorbs the attach-time title
+        // re-emission for free, which is why v2 needs no settle window.
+        tab.last_activity.set(SystemTime::now());
+        // `age_shown` caches what the labels render; the stamp above just
+        // invalidated it, and the two refreshes below read it. Without this
+        // the relabelled tab keeps showing its pre-stamp age ("3d · <new
+        // title>") until the next tick — a value the code knows is wrong at
+        // the moment it paints it. No disk write is involved.
+        tab.age_shown = age_prefix(Duration::ZERO);
         tab.title = title;
         let tab = self.tabs.iter().find(|t| t.id == id).unwrap();
         self.refresh_sidebar_label(tab);
@@ -2565,7 +2740,7 @@ impl App {
         let (row_name, text) = if Some(tab.group) == self.active_group() {
             (
                 tab.id.to_string(),
-                row_label_text(&tab.title, tab.crashed, None),
+                display_title(&tab.age_shown, &tab.title, tab.crashed, None),
             )
         } else {
             let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == tab.group).collect();
@@ -2583,7 +2758,7 @@ impl App {
             }
             (
                 tab.id.to_string(),
-                row_label_text(&tab.title, tab.crashed, Some(members.len())),
+                display_title(&tab.age_shown, &tab.title, tab.crashed, Some(members.len())),
             )
         };
         let mut i = 0;
@@ -2625,11 +2800,14 @@ impl App {
         let Some(button) = child.and_then(|c| c.downcast::<gtk::Button>().ok()) else {
             return;
         };
+        // Tooltip stays the raw title: it exists to show what the ellipsized
+        // label cannot, and the prefix is already on the label.
         button.set_tooltip_text(Some(&tab.title));
         if let Some(label) = button.child().and_then(|w| w.downcast::<gtk::Label>().ok()) {
             let active = self.active == Some(tab.id);
-            label.set_width_chars(tab_label_min_chars(tab.title.chars().count(), active));
-            label.set_label(&tab.title);
+            let text = display_title(&tab.age_shown, &tab.title, tab.crashed, None);
+            label.set_width_chars(tab_label_min_chars(text.chars().count(), active));
+            label.set_label(&text);
         }
     }
 
@@ -2701,7 +2879,7 @@ impl App {
         group: &Group,
         collapsed_count: Option<usize>,
     ) -> gtk::ListBoxRow {
-        let label = row_label_text(&tab.title, tab.crashed, collapsed_count);
+        let label = display_title(&tab.age_shown, &tab.title, tab.crashed, collapsed_count);
         let row_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
@@ -3038,14 +3216,73 @@ fn crashed_tab_label(title: &str, crashed: Option<i32>) -> String {
     }
 }
 
-/// Text of a sidebar row for a tab: the crash-marked title when the row is
-/// one tab of the expanded group, or "title (n)" when the row stands in for
-/// a collapsed group of n tabs. Shared by row construction and the in-place
-/// title update so the two can never drift apart.
-fn row_label_text(title: &str, crashed: Option<i32>, collapsed_count: Option<usize>) -> String {
+/// Whether a key press counts as tab activity. Strict by design: in an agent
+/// tab Esc and Enter are the moments of intent (interrupt / submit), while
+/// composing and scrolling are not — counting every keystroke would pin a tab
+/// being read or edited in at "now". The controller sees GTK keyvals, so Esc
+/// is cleanly distinguishable here from the ESC-prefixed escape sequences that
+/// arrow keys put on the wire; a pty-byte tap could not make that distinction.
+fn is_activity_key(key: gtk::gdk::Key) -> bool {
+    matches!(
+        key,
+        gtk::gdk::Key::Escape
+            | gtk::gdk::Key::Return
+            | gtk::gdk::Key::KP_Enter
+            | gtk::gdk::Key::ISO_Enter
+    )
+}
+
+/// Whether an incoming terminal title is a real change against the one the tab
+/// already shows. The dedupe anchor for the title activity source: agents churn
+/// the title while they work, but a title rewritten to the same string says
+/// nothing happened.
+fn title_changed(current: &str, incoming: &str) -> bool {
+    current != incoming
+}
+
+/// Decide a restored tab's `last_activity` from what the state file held.
+/// `state.json` is meant to stay hand-readable, so the persisted seconds are
+/// untrusted input: a value past what `SystemTime` can represent must fall
+/// back to `now` rather than panic, since `UNIX_EPOCH + Duration` panics on
+/// overflow and this would abort during restore, before any window is up.
+/// Absent (an entry predating the field, or an adopted orphan with no
+/// `SavedTab` at all) also seeds `now` — erring young once is better than
+/// inventing a past.
+fn seed_activity(persisted: Option<u64>, now: SystemTime) -> SystemTime {
+    persisted
+        .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+        .unwrap_or(now)
+}
+
+/// Age prefix for a tab: minute granularity, never seconds, uncapped at the
+/// day end ("45d" is honest and needs no fourth unit).
+fn age_prefix(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// Text of the label shown for a tab, in the sidebar and in the tab bar: the
+/// age prefix, then the crash-marked title when the label stands for one tab
+/// of the expanded group, or "title (n)" when it stands in for a collapsed
+/// group of n tabs. Shared by row construction, tab-bar construction and the
+/// in-place refreshes so they can never drift apart.
+fn display_title(
+    age: &str,
+    title: &str,
+    crashed: Option<i32>,
+    collapsed_count: Option<usize>,
+) -> String {
     match collapsed_count {
-        Some(n) => format!("{title} ({n})"),
-        None => crashed_tab_label(title, crashed),
+        Some(n) => format!("{age} · {title} ({n})"),
+        None => format!("{age} · {}", crashed_tab_label(title, crashed)),
     }
 }
 
@@ -3534,19 +3771,125 @@ mod tests {
         assert_eq!(crashed_tab_label("bash", None), "bash");
     }
 
-    // --- sidebar row label text ------------------------------------------
+    // --- tab age prefix ---------------------------------------------------
 
     #[test]
-    fn expanded_row_shows_title_with_crash_marker() {
-        assert_eq!(row_label_text("bash", Some(3), None), "bash [exit 3]");
-        assert_eq!(row_label_text("bash", None, None), "bash");
+    fn age_under_a_minute_is_now() {
+        assert_eq!(age_prefix(Duration::from_secs(0)), "now");
+        assert_eq!(age_prefix(Duration::from_secs(59)), "now");
     }
 
     #[test]
-    fn collapsed_row_shows_title_with_count() {
+    fn age_minutes() {
+        assert_eq!(age_prefix(Duration::from_secs(60)), "1m");
+        assert_eq!(age_prefix(Duration::from_secs(3_599)), "59m");
+    }
+
+    #[test]
+    fn age_hours() {
+        assert_eq!(age_prefix(Duration::from_secs(3_600)), "1h");
+        assert_eq!(age_prefix(Duration::from_secs(86_399)), "23h");
+    }
+
+    #[test]
+    fn age_days_are_uncapped() {
+        assert_eq!(age_prefix(Duration::from_secs(86_400)), "1d");
+        assert_eq!(age_prefix(Duration::from_secs(40 * 86_400)), "40d");
+    }
+
+    // --- sidebar/tab-bar label text ---------------------------------------
+
+    #[test]
+    fn expanded_row_shows_age_and_title_with_crash_marker() {
+        assert_eq!(
+            display_title("3d", "build", Some(1), None),
+            "3d \u{b7} build [exit 1]"
+        );
+        assert_eq!(display_title("now", "bash", None, None), "now \u{b7} bash");
+    }
+
+    #[test]
+    fn collapsed_row_shows_age_title_and_count() {
         // A collapsed group's row shows its member count, never the crash
-        // marker (the representative stands in for the whole group).
-        assert_eq!(row_label_text("bash", Some(3), Some(4)), "bash (4)");
+        // marker (the representative stands in for the whole group) - but the
+        // age prefix is always there.
+        assert_eq!(
+            display_title("2h", "web", None, Some(3)),
+            "2h \u{b7} web (3)"
+        );
+        assert_eq!(
+            display_title("5m", "bash", Some(3), Some(4)),
+            "5m \u{b7} bash (4)"
+        );
+    }
+
+    // --- tab activity sources (v2) ----------------------------------------
+
+    #[test]
+    fn only_esc_and_enter_count_as_input_activity() {
+        use gtk::gdk::Key;
+        assert!(is_activity_key(Key::Escape));
+        assert!(is_activity_key(Key::Return));
+        assert!(is_activity_key(Key::KP_Enter));
+        assert!(is_activity_key(Key::ISO_Enter));
+    }
+
+    #[test]
+    fn composing_and_navigating_keys_stay_silent() {
+        use gtk::gdk::Key;
+        // Printable keys: typing into a prompt is not "the user did a thing".
+        assert!(!is_activity_key(Key::a));
+        assert!(!is_activity_key(Key::space));
+        // Arrows send ESC-prefixed sequences on the wire but arrive here as
+        // their own keyvals - which is the whole reason the filter sits on
+        // keyvals and not on pty bytes.
+        assert!(!is_activity_key(Key::Up));
+        assert!(!is_activity_key(Key::Left));
+        assert!(!is_activity_key(Key::Control_L));
+        assert!(!is_activity_key(Key::Tab));
+    }
+
+    #[test]
+    fn a_title_rewritten_to_the_same_string_is_not_activity() {
+        // The case the whole dedupe exists for: VTE re-emits the title on
+        // attach and on plain rewrites, so a write is not a change.
+        assert!(!title_changed("claude", "claude"));
+        assert!(title_changed("claude", "claude: building"));
+        // The anchor is the *previous* title, not the set of titles ever
+        // seen: A -> B -> A is two changes, not one.
+        assert!(title_changed("B", "A"));
+        // A restored tab anchors on the persisted `last_title`, so the
+        // attach-time re-emission of that same title is silent.
+        assert!(!title_changed("vim", "vim"));
+    }
+
+    // --- tab age seeding on restore ---------------------------------------
+
+    #[test]
+    fn persisted_activity_wins_over_now() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(
+            seed_activity(Some(1_700_000_000), now),
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn absent_activity_seeds_now() {
+        // An entry predating the field, or an adopted orphan with no
+        // `SavedTab` at all: the tab reads "now", never an invented past.
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(seed_activity(None, now), now);
+    }
+
+    #[test]
+    fn unrepresentable_activity_seeds_now_instead_of_panicking() {
+        // `state.json` is hand-readable and therefore hand-editable, so the
+        // persisted seconds are untrusted: `UNIX_EPOCH + Duration` would
+        // panic on overflow and abort the app during restore, before any
+        // window is up.
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(seed_activity(Some(u64::MAX), now), now);
     }
 
     // --- finding 5: pane-died event-file parsing ------------------------
