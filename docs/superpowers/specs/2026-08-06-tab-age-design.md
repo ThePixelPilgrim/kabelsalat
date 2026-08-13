@@ -210,6 +210,12 @@ exactly one of:
    string differs from the tab's previous one. Agents update the terminal
    title while they work; when the title stops changing, the tab ages.
    The comparison also absorbs the attach-time title re-emission for free.
+   The signal is not the change: VTE's `window-title-notify` fires on
+   every title *write*, including writes that set the same string — an
+   "update" and an "update that changed something" are indistinguishable
+   at the signal level. Change detection is therefore always an app-side
+   comparison against the stored `last_title`; the signal only prompts
+   the comparison, and is never itself evidence of activity.
 
 Dropped from v1: `contents-changed` as a source (entirely), the
 unchanged-title stamps, the `#{window_activity}`/`#{session_activity}`
