@@ -19,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # LGPL-3.0-or-later, linked by this MIT binary. Pinned to a published tag
 # rather than a sibling path so a fresh clone builds without a local checkout.
-klamottenkiste = { git = "https://github.com/ThePixelPilgrim/klamottenkiste", tag = "v0.2.0" }
+klamottenkiste = { git = "https://github.com/ThePixelPilgrim/klamottenkiste", tag = "v0.2.1" }
 
 [target.'cfg(unix)'.dependencies]
 # Only for `kill(pid, SIGTERM)`: std can send SIGKILL but not SIGTERM.
