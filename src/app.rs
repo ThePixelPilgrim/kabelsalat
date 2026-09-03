@@ -187,6 +187,9 @@ pub struct App {
     sidebar_visible: bool,
     style: adw::StyleManager,
     tab_list: gtk::ListBox,
+    /// Scroll wrapper around `tab_list`; owns the vertical adjustment used to
+    /// keep the active sidebar row on screen.
+    list_scroller: gtk::ScrolledWindow,
     tab_bar: gtk::Box,
     /// Scroll wrapper around `tab_bar`; owns the horizontal adjustment used to
     /// keep the active tab on screen.
@@ -525,7 +528,7 @@ impl SimpleComponent for App {
                                 },
                             },
 
-                            gtk::ScrolledWindow {
+                            append = &list_scroller.clone() {
                                 set_vexpand: true,
                                 set_hscrollbar_policy: gtk::PolicyType::Never,
 
@@ -659,6 +662,7 @@ impl SimpleComponent for App {
             sidebar_visible: true,
             style,
             tab_list: gtk::ListBox::new(),
+            list_scroller: gtk::ScrolledWindow::new(),
             tab_bar: gtk::Box::new(gtk::Orientation::Horizontal, 2),
             tab_scroller: gtk::ScrolledWindow::new(),
             stack: gtk::Stack::new(),
@@ -697,6 +701,7 @@ impl SimpleComponent for App {
         };
 
         let tab_list = model.tab_list.clone();
+        let list_scroller = model.list_scroller.clone();
         let tab_bar = model.tab_bar.clone();
         let tab_scroller = model.tab_scroller.clone();
         let stack = model.stack.clone();
@@ -2564,11 +2569,48 @@ impl App {
             while let Some(row) = self.tab_list.row_at_index(i) {
                 if row.widget_name() == active.to_string() {
                     self.tab_list.select_row(Some(&row));
+                    self.scroll_row_into_view(&row);
                     break;
                 }
                 i += 1;
             }
         }
+    }
+
+    /// Bring the active sidebar row into the list scroller's visible range.
+    ///
+    /// `ListBox::select_row` neither scrolls nor focuses, and focus goes to
+    /// the terminal on activation, so the viewport's scroll-to-focus never
+    /// fires. Without this, the list only appears to follow the selection
+    /// because collapsing/expanding groups changes the content height and the
+    /// adjustment gets clamped as a side effect — which does nothing when the
+    /// active group alone is taller than the viewport.
+    ///
+    /// Deferred to idle for the same reason as `scroll_active_into_view`:
+    /// the rows were only just appended and have no allocation yet.
+    fn scroll_row_into_view(&self, row: &gtk::ListBoxRow) {
+        let scroller = self.list_scroller.clone();
+        let list = self.tab_list.clone();
+        let row = row.clone();
+        gtk::glib::idle_add_local_once(move || {
+            // rebuild_list runs on every title/age change; a later rebuild may
+            // already have torn this row out, and a detached row's bounds are
+            // garbage.
+            if row.parent().as_ref() != Some(list.upcast_ref::<gtk::Widget>()) {
+                return;
+            }
+            let Some(bounds) = row.compute_bounds(&list) else {
+                return;
+            };
+            let (y, height) = (bounds.y() as f64, bounds.height() as f64);
+            let vadj = scroller.vadjustment();
+            let (value, page) = (vadj.value(), vadj.page_size());
+            if y < value {
+                vadj.set_value(y);
+            } else if y + height > value + page {
+                vadj.set_value(y + height - page);
+            }
+        });
     }
 
     /// Horizontal tab strip above the terminal, mirroring the active group.
