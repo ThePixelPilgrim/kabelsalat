@@ -252,6 +252,26 @@ pub struct App {
     /// Whether the "could not save state" notice was already shown; keeps a
     /// full disk from stacking one dialog per layout change.
     save_error_shown: Cell<bool>,
+    /// Set while `rebuild_list` re-selects the active row programmatically.
+    /// The sidebar's `row-selected` handler shares it and stays silent while
+    /// it is set, so a rebuild never echoes a `Msg::Select` back into the
+    /// input queue. Relying on `activate`'s no-op guard instead is not
+    /// enough: the echo is queued behind whatever else is pending, and two
+    /// queued tab switches then ping-pong forever and freeze the main loop.
+    reselecting: Rc<Cell<bool>>,
+    /// Icon name for the group drag handle, resolved once against the
+    /// display's cached icon theme.
+    drag_handle_icon: &'static str,
+}
+
+/// Decide whether a sidebar `row-selected` event is a user action that
+/// should become `Msg::Select`. `None` while a rebuild is re-selecting
+/// programmatically, and for deselection (`row_id == None`).
+fn user_selection(reselecting: bool, row_id: Option<usize>) -> Option<usize> {
+    if reselecting {
+        return None;
+    }
+    row_id
 }
 
 #[derive(Debug, Clone)]
@@ -536,8 +556,9 @@ impl SimpleComponent for App {
                                 #[wrap(Some)]
                                 set_child = &tab_list -> gtk::ListBox {
                                     add_css_class: "navigation-sidebar",
-                                    connect_row_selected[sender] => move |_, row| {
-                                        if let Some(id) = row.and_then(|r| r.widget_name().parse().ok()) {
+                                    connect_row_selected[sender, reselecting] => move |_, row| {
+                                        let row_id = row.and_then(|r| r.widget_name().parse().ok());
+                                        if let Some(id) = user_selection(reselecting.get(), row_id) {
                                             sender.input(Msg::Select(id));
                                         }
                                     },
@@ -653,6 +674,20 @@ impl SimpleComponent for App {
         // icon's #[watch] visibility is correct on first render.
         let linger_dismissed = state::load(&state::state_file()).linger_warning_dismissed;
 
+        // The symbolic handle may be absent in a sparse icon theme; fall back
+        // to a menu glyph so the affordance never renders as a broken image.
+        // Resolved once: `IconTheme::for_display` is the cached theme, while
+        // `IconTheme::default()` is `gtk_icon_theme_new()` and re-reads every
+        // index.theme on disk per call.
+        let drag_handle_icon = match gtk::gdk::Display::default() {
+            Some(display)
+                if gtk::IconTheme::for_display(&display).has_icon("list-drag-handle-symbolic") =>
+            {
+                "list-drag-handle-symbolic"
+            }
+            _ => "open-menu-symbolic",
+        };
+
         let mut model = App {
             tabs: Vec::new(),
             groups: Vec::new(),
@@ -698,9 +733,12 @@ impl SimpleComponent for App {
             // model is actually built from.
             uuids_unpersisted: Cell::new(false),
             save_error_shown: Cell::new(false),
+            reselecting: Rc::new(Cell::new(false)),
+            drag_handle_icon,
         };
 
         let tab_list = model.tab_list.clone();
+        let reselecting = model.reselecting.clone();
         let list_scroller = model.list_scroller.clone();
         let tab_bar = model.tab_bar.clone();
         let tab_scroller = model.tab_scroller.clone();
@@ -794,7 +832,11 @@ impl SimpleComponent for App {
                 self.open_tab(group, &sender);
             }
             Msg::NewGroup => self.open_group(&sender),
-            Msg::Select(id) => self.activate(id),
+            Msg::Select(id) => {
+                if !self.activate(id) {
+                    return; // already active: nothing changed, nothing to save
+                }
+            }
             Msg::CloseTab(id) => self.close_tab(id),
             Msg::CloseActive => {
                 if let Some(id) = self.active {
@@ -2372,12 +2414,13 @@ impl App {
         self.groups.retain(|g| live.contains(&g.id));
     }
 
-    fn activate(&mut self, id: usize) {
+    /// Make `id` the active tab. Returns whether anything changed.
+    fn activate(&mut self, id: usize) -> bool {
         if self.active == Some(id) {
-            return; // also breaks the select_row → row-selected → Select cycle
+            return false;
         }
         let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
-            return;
+            return false;
         };
         self.active = Some(id);
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == tab.group) {
@@ -2390,6 +2433,7 @@ impl App {
         // only one: a tab *move* changes the active group with no tab
         // change, so the move handlers re-sync themselves.
         self.sync_browser_pane();
+        true
     }
 
     fn close_tab(&mut self, id: usize) {
@@ -2563,12 +2607,15 @@ impl App {
 
         self.rebuild_tab_bar();
 
-        // Re-select the active row; activate()'s no-op guard stops the echo.
+        // Re-select the active row with the row-selected handler muted, so
+        // the programmatic selection is never echoed back as a Msg::Select.
         if let Some(active) = self.active {
             let mut i = 0;
             while let Some(row) = self.tab_list.row_at_index(i) {
                 if row.widget_name() == active.to_string() {
+                    self.reselecting.set(true);
                     self.tab_list.select_row(Some(&row));
+                    self.reselecting.set(false);
                     self.scroll_row_into_view(&row);
                     break;
                 }
@@ -2869,14 +2916,7 @@ impl App {
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
             .build();
-        // The symbolic handle may be absent in a sparse icon theme; fall back
-        // to a menu glyph so the affordance never renders as a broken image.
-        let handle_icon = if gtk::IconTheme::default().has_icon("list-drag-handle-symbolic") {
-            "list-drag-handle-symbolic"
-        } else {
-            "open-menu-symbolic"
-        };
-        row_box.append(&gtk::Image::from_icon_name(handle_icon));
+        row_box.append(&gtk::Image::from_icon_name(self.drag_handle_icon));
         row_box.append(
             &gtk::Label::builder()
                 .label(&title)
@@ -3533,6 +3573,27 @@ fn spawn_shell(terminal: &Terminal, cwd: Option<&Path>, command: Option<&[String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- sidebar selection echo -------------------------------------------
+
+    #[test]
+    fn programmatic_reselect_does_not_emit_select() {
+        // The regression: rebuild_list's own select_row echoed back as a
+        // Msg::Select, which could ping-pong forever once two tab switches
+        // were queued back to back.
+        assert_eq!(user_selection(true, Some(24)), None);
+    }
+
+    #[test]
+    fn user_selection_of_a_row_emits_select() {
+        assert_eq!(user_selection(false, Some(24)), Some(24));
+    }
+
+    #[test]
+    fn deselection_never_emits_select() {
+        assert_eq!(user_selection(false, None), None);
+        assert_eq!(user_selection(true, None), None);
+    }
 
     #[test]
     fn live_browser_is_persisted_as_open() {
