@@ -82,9 +82,8 @@ and `Rename { group: String, name: String }`; both `needs_instance()`.
 
 `src/control.rs`: `handle_command_line` matches on the action.
 - `Spawn`: mints the tab uuid, prints it, sends
-  `Msg::SpawnCommand { group_uuid: Option<String>, new_group: Option<String>, tab_uuid, cwd, argv }`
-  where exactly one of `group_uuid` / `new_group` is `Some`. (Concretely the
-  message carries the `GroupTarget` enum.)
+  `Msg::SpawnCommand { group: GroupTarget, tab_uuid, cwd, argv }`. The
+  `group_uuid: String` field of today's message is replaced by the enum.
 - `Rename`: sends `Msg::RenameGroup { group_uuid, name }`. Prints nothing on
   success.
 - A failed send prints "no window to spawn into" and returns 1, as today.
