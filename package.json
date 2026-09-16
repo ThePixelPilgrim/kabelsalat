@@ -1,0 +1,20 @@
+{
+  "name": "kabelsalat",
+  "version": "0.6.0",
+  "description": "Drive a running kabelsalat terminal: launch commands into visible, persistent group panes and co-browse the group's embedded browser over CDP.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "skills",
+    "terminal",
+    "tmux",
+    "browser",
+    "cdp",
+    "playwright"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  }
+}
