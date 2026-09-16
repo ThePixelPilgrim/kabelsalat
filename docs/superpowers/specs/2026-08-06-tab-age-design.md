@@ -270,3 +270,12 @@ last_title: Option<String>,         // dedupe anchor across restarts
 - `SavedTab` round-trip with and without the new fields (old state files
   must load; `state.rs` reconciliation carries the values through).
 - Age seeding: persisted value wins; absent → now.
+
+## Amendment 2026-09-14: contents-changed is back
+
+`contents-changed` is an activity source again, alongside Enter/Escape and
+title changes, so that output alone (a finished build, a log line) counts as
+activity and drives the activity-sorted sidebar. The v1 attach-settle window
+returns with it (`ACTIVITY_SETTLE_MS`, 750 ms after spawn) to protect the
+persisted seed from the reattach repaint. The v2 finding still holds and is
+accepted as the trade-off: a TUI that repaints while idle never ages.

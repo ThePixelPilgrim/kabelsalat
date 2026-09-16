@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -15,7 +15,7 @@ use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
 use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::control;
-use crate::state::{self, SavedGroup, SavedState, SavedTab};
+use crate::state::{self, SavedGroup, SavedState, SavedTab, SidebarOrder};
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
 
 pub const GROUP_PALETTE: [&str; 6] = [
@@ -75,6 +75,11 @@ const BROWSER_POLL_SECS: u32 = 2;
 /// How often the tab age prefixes are recomputed. The display has minute
 /// granularity, so a 30 s tick shows a stale "now" for at most 89 s.
 const AGE_TICK_SECS: u32 = 30;
+/// How long after spawn/attach `contents-changed` is ignored as an activity
+/// source. Attaching a tmux session repaints the whole screen; without this
+/// window every restored tab would be stamped "now" and the persisted age
+/// seed (applied right after `add_tab`) would be lost.
+const ACTIVITY_SETTLE_MS: u64 = 750;
 
 /// CDP discovery: poll the profile's DevToolsActivePort file this often…
 const CDP_POLL_MS: u64 = 100;
@@ -185,6 +190,11 @@ pub struct App {
     next_tab_id: usize,
     next_group_id: usize,
     sidebar_visible: bool,
+    /// How a group's tabs are ordered in the sidebar and tab bar; persisted.
+    sidebar_order: SidebarOrder,
+    /// Tab ids in the order the sidebar last rendered them, so an activity
+    /// stamp can tell whether the list needs a rebuild or just a relabel.
+    shown_order: RefCell<Vec<usize>>,
     style: adw::StyleManager,
     tab_list: gtk::ListBox,
     /// Scroll wrapper around `tab_list`; owns the vertical adjustment used to
@@ -318,6 +328,7 @@ pub enum Msg {
     GroupPrev,
     ToggleSidebar,
     SetSidebar(bool),
+    SetSidebarOrder(SidebarOrder),
     ShowHelp,
     SchemeChanged,
     /// The pane-died hook reported a crashed shell: (tab uuid, exit code).
@@ -378,16 +389,23 @@ pub enum Msg {
     /// klamottenkiste's `CaptureError` is not `Clone`, and both failure kinds
     /// mean the same thing here — a toast and a line on stderr.
     ScreenshotCaptured(usize, Result<CapturedFrame, String>),
-    /// A `kabelsalat run` invocation: create a tab in the group with this
-    /// uuid, running `argv` in `cwd`. Deliberately inert otherwise — it does
-    /// not activate the tab, raise the window, change the active group, or
-    /// touch the group's browser pane, because the user may be typing
+    /// A `kabelsalat run` invocation: create a tab in the group named by
+    /// `group` — an existing one, or a new one created here for
+    /// `--create` — running `argv` in `cwd`. Deliberately inert otherwise: it
+    /// does not activate the tab, raise the window, change the active group,
+    /// or touch the group's browser pane, because the user may be typing
     /// somewhere else when an agent fires this.
     SpawnCommand {
-        group_uuid: String,
+        group: crate::cli::GroupTarget,
         tab_uuid: String,
         cwd: PathBuf,
         argv: Vec<String>,
+    },
+    /// A `kabelsalat rename` invocation: set the group's name. Like
+    /// `SpawnCommand` it changes no focus and raises no window.
+    RenameGroup {
+        group_uuid: String,
+        name: String,
     },
 }
 
@@ -533,6 +551,21 @@ impl SimpleComponent for App {
                                     set_label: "tabs",
                                     set_hexpand: true,
                                     set_halign: gtk::Align::Start,
+                                },
+
+                                gtk::ToggleButton {
+                                    set_icon_name: "view-sort-descending-symbolic",
+                                    set_tooltip_text: Some("Sort tabs by activity (off: manual order, newest on top)"),
+                                    #[watch]
+                                    set_active: model.sidebar_order == SidebarOrder::Activity,
+                                    connect_toggled[sender] => move |button| {
+                                        let order = if button.is_active() {
+                                            SidebarOrder::Activity
+                                        } else {
+                                            SidebarOrder::Manual
+                                        };
+                                        sender.input(Msg::SetSidebarOrder(order));
+                                    },
                                 },
 
                                 gtk::Button {
@@ -695,6 +728,8 @@ impl SimpleComponent for App {
             next_tab_id: 1,
             next_group_id: 1,
             sidebar_visible: true,
+            sidebar_order: SidebarOrder::default(),
+            shown_order: RefCell::new(Vec::new()),
             style,
             tab_list: gtk::ListBox::new(),
             list_scroller: gtk::ScrolledWindow::new(),
@@ -1032,14 +1067,15 @@ impl SimpleComponent for App {
             // every 30 s would be a regression.
             Msg::AgeTick => {
                 self.refresh_ages();
+                self.resort_if_stale();
                 return;
             }
             Msg::MoveTabPicker => self.show_group_picker(PickerMode::Move),
             Msg::MoveTabTo(target) => self.move_active_tab(target),
             Msg::JumpPicker => self.show_group_picker(PickerMode::Jump),
             Msg::JumpToGroup(id) => {
-                if let Some(tab) = self.tabs.iter().find(|t| t.group == id) {
-                    self.activate(tab.id);
+                if let Some(first) = self.group_members(id).first().map(|t| t.id) {
+                    self.activate(first);
                 }
             }
             Msg::DropTab { src, dest } => self.drop_tab(src, dest),
@@ -1063,6 +1099,7 @@ impl SimpleComponent for App {
             Msg::GroupNext => self.navigate_group(1),
             Msg::GroupPrev => self.navigate_group(-1),
             Msg::ToggleSidebar => self.set_sidebar(!self.sidebar_visible),
+            Msg::SetSidebarOrder(order) => self.set_sidebar_order(order),
             Msg::SetSidebar(visible) => self.set_sidebar(visible),
             Msg::ShowHelp => self.show_help(),
             Msg::SchemeChanged => {
@@ -1071,21 +1108,52 @@ impl SimpleComponent for App {
                 }
             }
             Msg::SpawnCommand {
-                group_uuid,
+                group,
                 tab_uuid,
                 cwd,
                 argv,
             } => {
-                // The snapshot the CLI validated against is a copy, so the
-                // group can in principle be gone by the time this arrives.
-                let Some(group_id) = self
-                    .groups
-                    .iter()
-                    .find(|g| g.uuid == group_uuid)
-                    .map(|g| g.id)
-                else {
-                    eprintln!("spawn request for unknown group {group_uuid}");
-                    return;
+                let group_id = match group {
+                    // The snapshot the CLI validated against is a copy, so the
+                    // group can in principle be gone by the time this arrives.
+                    crate::cli::GroupTarget::Existing(group_uuid) => {
+                        let Some(id) = self
+                            .groups
+                            .iter()
+                            .find(|g| g.uuid == group_uuid)
+                            .map(|g| g.id)
+                        else {
+                            eprintln!("spawn request for unknown group {group_uuid}");
+                            return;
+                        };
+                        id
+                    }
+                    // `--create`: a new group at the end of the list, named
+                    // and otherwise left alone — no activation, no raise.
+                    crate::cli::GroupTarget::Create { name } => {
+                        // The CLI decided "nothing matches" against a snapshot
+                        // copy. Two invocations racing that copy would both
+                        // land here and make two groups with the same name,
+                        // which no later `-g <name>` could tell apart. Recheck
+                        // the live model: a unique match is spawned into, as
+                        // the spec's "unique match" row says.
+                        let existing: Vec<usize> = self
+                            .groups
+                            .iter()
+                            .filter(|g| g.name == name)
+                            .map(|g| g.id)
+                            .collect();
+                        match existing.as_slice() {
+                            [only] => *only,
+                            _ => {
+                                let id = self.create_group();
+                                if let Some(created) = self.groups.iter_mut().find(|g| g.id == id) {
+                                    created.name = name;
+                                }
+                                id
+                            }
+                        }
+                    }
                 };
                 let title = crate::cli::command_title(&argv);
                 // Without tmux, VTE's spawn just fails for a nonexistent
@@ -1095,7 +1163,7 @@ impl SimpleComponent for App {
                 // default location instead (tmux itself tolerates a missing
                 // -c directory, so this only matters for the no-tmux path).
                 let cwd = cwd.is_dir().then_some(cwd);
-                self.add_tab(
+                let id = self.add_tab(
                     tab_uuid,
                     group_id,
                     Some(title),
@@ -1104,10 +1172,41 @@ impl SimpleComponent for App {
                     Some(&argv),
                     &sender,
                 );
+                self.move_tab_to_group_front(id);
                 // add_tab alone leaves the sidebar stale; the usual funnel for
                 // that is activate(), which we deliberately do not call. The
                 // bottom-of-update save_state() below still runs, since this
                 // arm does not return early.
+                self.rebuild_list();
+            }
+            Msg::RenameGroup { group_uuid, name } => {
+                // Same race as SpawnCommand: the CLI validated against a copy.
+                let Some(group) = self.groups.iter_mut().find(|g| g.uuid == group_uuid) else {
+                    eprintln!("rename request for unknown group {group_uuid}");
+                    return;
+                };
+                let group_id = group.id;
+                // The CLI's duplicate refusal was decided against a snapshot
+                // copy, so two renames racing it could both pick the same
+                // name. Recheck against the live model and drop the loser,
+                // rather than leaving two groups the CLI cannot tell apart.
+                if let Some(clash) = self
+                    .groups
+                    .iter()
+                    .find(|g| g.id != group_id && g.name == name)
+                {
+                    eprintln!(
+                        "rename refused: a group named '{name}' already exists ({})",
+                        clash.uuid
+                    );
+                    return;
+                }
+                let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) else {
+                    return;
+                };
+                group.name = name;
+                // save_state() at the bottom of update() republishes the
+                // snapshot the CLI reads; rebuild_list() redraws the header.
                 self.rebuild_list();
             }
         }
@@ -1162,11 +1261,13 @@ impl App {
         self.active_tab().map(|t| t.group)
     }
 
-    /// Tab ids in display order: groups in creation order, tabs within them.
+    /// Tab ids in display order: groups in sidebar order, each group's tabs
+    /// as `group_members` shows them. Keyboard navigation and the
+    /// close-neighbour pick follow this so they match the sidebar.
     fn nav_order(&self) -> Vec<usize> {
         self.groups
             .iter()
-            .flat_map(|g| self.tabs.iter().filter(|t| t.group == g.id).map(|t| t.id))
+            .flat_map(|g| self.group_members(g.id).into_iter().map(|t| t.id))
             .collect()
     }
 
@@ -1207,6 +1308,7 @@ impl App {
             self.persist(&saved);
         }
         self.sidebar_visible = saved.sidebar_visible;
+        self.sidebar_order = saved.sidebar_order;
 
         // Live sessions (and which panes are dead) from our private server.
         let (live, dead): (Vec<String>, Vec<state::DeadPane>) = match &self.tmux {
@@ -1422,6 +1524,7 @@ impl App {
             active,
             sidebar_visible: self.sidebar_visible,
             linger_warning_dismissed: self.linger_dismissed,
+            sidebar_order: self.sidebar_order,
         };
         self.persist(&state);
         // Same choke point as the save, so the CLI always sees what was last
@@ -2221,7 +2324,21 @@ impl App {
         let cwd = self.active_tab_cwd();
         let uuid = gtk::glib::uuid_string_random().to_string();
         let id = self.add_tab(uuid, group, None, None, cwd.as_deref(), None, sender);
+        self.move_tab_to_group_front(id);
         self.activate(id);
+    }
+
+    /// Newest first: `add_tab` appends, which is what restore wants (saved
+    /// order is display order). A tab the user just created instead moves
+    /// to the top of its group's block so the sidebar sorts by age.
+    fn move_tab_to_group_front(&mut self, id: usize) {
+        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let tab = self.tabs.remove(pos);
+        let groups: Vec<usize> = self.tabs.iter().map(|t| t.group).collect();
+        let at = state::newest_first_index(&groups, tab.group);
+        self.tabs.insert(at, tab);
     }
 
     /// Working directory of the currently active tab, for seeding a new tab.
@@ -2312,6 +2429,23 @@ impl App {
             }
         });
         terminal.add_controller(keys);
+
+        // Output counts too: anything that changes the visible screen stamps
+        // the tab, once the attach repaint has settled. Known cost: a TUI
+        // that repaints while idle (spinner, clock) keeps its tab fresh.
+        let armed = Rc::new(Cell::new(false));
+        gtk::glib::timeout_add_local_once(Duration::from_millis(ACTIVITY_SETTLE_MS), {
+            let armed = armed.clone();
+            move || armed.set(true)
+        });
+        terminal.connect_contents_changed({
+            let last = last_activity.clone();
+            move |_| {
+                if armed.get() {
+                    last.set(SystemTime::now());
+                }
+            }
+        });
 
         #[allow(deprecated)] // successor termprop API needs VTE >= 0.78 feature gates
         terminal.connect_window_title_notify({
@@ -2571,8 +2705,8 @@ impl App {
         };
         let next = (pos as isize + step).rem_euclid(self.groups.len() as isize) as usize;
         let target = self.groups[next].id;
-        if let Some(first) = self.tabs.iter().find(|t| t.group == target) {
-            self.activate(first.id);
+        if let Some(first) = self.group_members(target).first().map(|t| t.id) {
+            self.activate(first);
         }
     }
 
@@ -2585,11 +2719,13 @@ impl App {
         }
 
         let active_group = self.active_group();
+        let mut shown = Vec::with_capacity(self.tabs.len());
         for group in &self.groups {
-            let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == group.id).collect();
+            let members = self.group_members(group.id);
             if members.is_empty() {
                 continue;
             }
+            shown.extend(members.iter().map(|t| t.id));
             self.tab_list.append(&self.make_group_header(group));
             if Some(group.id) == active_group {
                 for tab in &members {
@@ -2605,6 +2741,7 @@ impl App {
             }
         }
 
+        *self.shown_order.borrow_mut() = shown;
         self.rebuild_tab_bar();
 
         // Re-select the active row with the row-selected handler muted, so
@@ -2668,7 +2805,7 @@ impl App {
             self.tab_bar.remove(&child);
         }
         let members: Vec<&Tab> = match self.active_group() {
-            Some(group) => self.tabs.iter().filter(|t| t.group == group).collect(),
+            Some(group) => self.group_members(group),
             None => Vec::new(),
         };
         self.tab_bar.set_visible(members.len() > 1);
@@ -2820,6 +2957,52 @@ impl App {
         let tab = self.tabs.iter().find(|t| t.id == id).unwrap();
         self.refresh_sidebar_label(tab);
         self.refresh_tab_bar_label(tab);
+        self.resort_if_stale();
+    }
+
+    /// A group's tabs in display order. Manual keeps the vec order (which
+    /// `save_state` persists and drag-and-drop edits); Activity sorts by the
+    /// last activity stamp, most recent first, and leaves the vec alone.
+    fn group_members(&self, group: usize) -> Vec<&Tab> {
+        let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == group).collect();
+        match self.sidebar_order {
+            SidebarOrder::Manual => members,
+            SidebarOrder::Activity => {
+                let stamps: Vec<u64> = members
+                    .iter()
+                    .map(|t| {
+                        t.last_activity
+                            .get()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs())
+                    })
+                    .collect();
+                state::activity_order(&stamps)
+                    .into_iter()
+                    .map(|i| members[i])
+                    .collect()
+            }
+        }
+    }
+
+    /// Rebuild the list when an activity stamp has changed the display order
+    /// since the last render. Cheap when nothing moved: one vec comparison.
+    fn resort_if_stale(&self) {
+        if self.sidebar_order != SidebarOrder::Activity {
+            return;
+        }
+        let stale = self.nav_order() != *self.shown_order.borrow();
+        if stale {
+            self.rebuild_list();
+        }
+    }
+
+    fn set_sidebar_order(&mut self, order: SidebarOrder) {
+        if self.sidebar_order == order {
+            return;
+        }
+        self.sidebar_order = order;
+        self.rebuild_list();
     }
 
     /// Update the sidebar row that displays `tab`, if any: its own row when

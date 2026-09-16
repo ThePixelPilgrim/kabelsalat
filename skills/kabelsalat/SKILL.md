@@ -26,7 +26,7 @@ empty for unnamed groups. Run this first — you cannot guess group names.
 
 ## Running a command
 
-    kabelsalat run --group <name|uuid> [--cwd DIR] -- COMMAND [ARGS...]
+    kabelsalat run --group <name|uuid> [--create] [--cwd DIR] -- COMMAND [ARGS...]
 
 Everything after `--` is the command, taken literally. The `--` is required.
 
@@ -47,6 +47,33 @@ uuid is printed.
 If several groups share a name, the command fails and prints their uuids —
 retry with one of those. Unnamed groups can only be targeted by uuid.
 
+## Creating a group
+
+Add `--create` when the user asks for a new group, or names a group that
+`kabelsalat groups` does not list:
+
+    kabelsalat run -g newproj --create -- claude
+
+If `--group` already resolves to a unique existing group, `--create` is a
+no-op and that group is reused. Otherwise a new group is created named
+exactly `<selector>` — used verbatim, case-sensitive, no fuzzy matching — and
+the command's tab is its first tab. An ambiguous selector still fails with
+exit 3; `--create` does not resolve ambiguity.
+
+The new group appears in the sidebar **without being activated** — same
+no-steal-focus rule as any new tab. Always tell the user which group you
+created, or they will not notice it.
+
+## Renaming a group
+
+    kabelsalat rename <name|uuid> <new-name>
+
+Renames an existing group. `<name|uuid>` resolves exactly like `--group`
+above. The command refuses to create a duplicate: if another group already
+has `<new-name>`, it fails with exit 3 and does not rename anything. If
+`<new-name>` is already the target's current name, it succeeds without doing
+anything.
+
 ## Exit codes
 
 | Code | Meaning | What to do |
@@ -54,7 +81,7 @@ retry with one of those. Unnamed groups can only be targeted by uuid.
 | 0 | Tab created | Tell the user which group it went to |
 | 1 | kabelsalat is not running | Report this to the user and stop. Do not retry, and do not try to start it — that is theirs to do |
 | 2 | Usage error | Fix the invocation; check `--` is present |
-| 3 | Group not found or ambiguous | Re-run `kabelsalat groups` and retry with a uuid |
+| 3 | Group not found, ambiguous, or (rename) name already in use | Re-run `kabelsalat groups` and retry with a uuid, or pick a different name |
 
 ## After launching
 

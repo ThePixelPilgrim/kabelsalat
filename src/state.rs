@@ -146,6 +146,23 @@ pub struct SavedState {
     /// with `false` (warning still shown).
     #[serde(default)]
     pub linger_warning_dismissed: bool,
+    /// How the sidebar orders the tabs of a group. `serde(default)` so older
+    /// state files load with the activity ordering.
+    #[serde(default)]
+    pub sidebar_order: SidebarOrder,
+}
+
+/// Sidebar ordering of a group's tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarOrder {
+    /// Most recent activity on top; the persisted vec order is ignored for
+    /// display, which makes drag-and-drop within a group meaningless.
+    #[default]
+    Activity,
+    /// The persisted vec order: new tabs on top of their group, drag-and-drop
+    /// rearranges freely.
+    Manual,
 }
 
 impl Default for SavedState {
@@ -156,6 +173,7 @@ impl Default for SavedState {
             active: None,
             sidebar_visible: true,
             linger_warning_dismissed: false,
+            sidebar_order: SidebarOrder::default(),
         }
     }
 }
@@ -295,6 +313,27 @@ pub struct ReconcilePlan {
     pub adopt: Vec<OrphanTab>,
 }
 
+/// Where a freshly created tab belongs so that the sidebar reads newest
+/// first: directly before the group's current first tab, or at the end when
+/// the group has no tabs yet (group blocks are rendered per group, so the
+/// position among other groups' tabs does not matter). `tab_groups` is the
+/// group id of every existing tab in display order.
+pub fn newest_first_index(tab_groups: &[usize], group: usize) -> usize {
+    tab_groups
+        .iter()
+        .position(|g| *g == group)
+        .unwrap_or(tab_groups.len())
+}
+
+/// Display order for the activity sort: indices into `stamps` (unix seconds
+/// of each tab's last activity, in vec order), most recent first. Stable, so
+/// tabs with equal stamps keep their vec order.
+pub fn activity_order(stamps: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..stamps.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(stamps[i]));
+    order
+}
+
 /// Pure reconciliation of saved state against the live session list.
 /// `live` holds the tab UUIDs of running `ks-<uuid>` sessions; `dead` the
 /// subset whose pane has died, with the shell's real exit code.
@@ -374,6 +413,7 @@ mod tests {
             active: Some("bbb".into()),
             sidebar_visible: false,
             linger_warning_dismissed: true,
+            sidebar_order: SidebarOrder::default(),
         }
     }
 
@@ -796,5 +836,42 @@ mod tests {
         assert_eq!(plan.respawn[0].last_title.as_deref(), Some("vim"));
         assert_eq!(plan.respawn[1].last_activity, None);
         assert_eq!(plan.respawn[1].last_title, None);
+    }
+
+    #[test]
+    fn newest_first_index_lands_before_the_groups_first_tab() {
+        // Tabs of groups 0,1,1,2 already exist. A new group-1 tab goes in
+        // front of the first group-1 tab; a new group-2 tab in front of the
+        // only group-2 tab; a group with no tabs yet appends at the end.
+        let groups = [0, 1, 1, 2];
+        assert_eq!(newest_first_index(&groups, 1), 1);
+        assert_eq!(newest_first_index(&groups, 2), 3);
+        assert_eq!(newest_first_index(&groups, 0), 0);
+        assert_eq!(newest_first_index(&groups, 7), 4);
+        assert_eq!(newest_first_index(&[], 0), 0);
+    }
+
+    #[test]
+    fn activity_order_is_most_recent_first_and_stable() {
+        assert_eq!(activity_order(&[10, 30, 20]), vec![1, 2, 0]);
+        // Equal stamps keep their vec order.
+        assert_eq!(activity_order(&[5, 9, 5, 9]), vec![1, 3, 0, 2]);
+        assert_eq!(activity_order(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn sidebar_order_defaults_to_activity_and_round_trips() {
+        let json = r#"{"groups": [], "tabs": [], "active": null, "sidebar_visible": true}"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.sidebar_order, SidebarOrder::Activity);
+
+        let manual = SavedState {
+            sidebar_order: SidebarOrder::Manual,
+            ..state
+        };
+        let json = serde_json::to_string(&manual).unwrap();
+        assert!(json.contains(r#""sidebar_order":"manual""#));
+        let back: SavedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sidebar_order, SidebarOrder::Manual);
     }
 }

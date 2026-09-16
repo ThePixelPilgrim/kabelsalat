@@ -18,7 +18,7 @@ use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 use crate::app::Msg;
-use crate::cli::{self, Cli, GroupInfo, SpawnRequest};
+use crate::cli::{self, Action, Cli, GroupInfo, GroupTarget};
 
 struct Control {
     groups: Arc<Mutex<Vec<GroupInfo>>>,
@@ -56,20 +56,38 @@ pub fn snapshot() -> Vec<GroupInfo> {
         .unwrap_or_default()
 }
 
-/// Ask the component to create the tab. Returns false when there is no
-/// component to ask, or when it has already shut down.
-pub fn request_spawn(request: SpawnRequest, tab_uuid: String) -> bool {
+/// Ask the component to create the tab, in an existing group or in one it
+/// creates for us. Returns false when there is no component to ask, or when
+/// it has already shut down.
+pub fn request_spawn(
+    group: GroupTarget,
+    cwd: std::path::PathBuf,
+    argv: Vec<String>,
+    tab_uuid: String,
+) -> bool {
     let Some(control) = CONTROL.get() else {
         return false;
     };
     control
         .sender
         .send(Msg::SpawnCommand {
-            group_uuid: request.group_uuid,
+            group,
             tab_uuid,
-            cwd: request.cwd,
-            argv: request.argv,
+            cwd,
+            argv,
         })
+        .is_ok()
+}
+
+/// Ask the component to rename a group. Returns false when there is no
+/// component to ask, or when it has already shut down.
+pub fn request_rename(group_uuid: String, name: String) -> bool {
+    let Some(control) = CONTROL.get() else {
+        return false;
+    };
+    control
+        .sender
+        .send(Msg::RenameGroup { group_uuid, name })
         .is_ok()
 }
 
@@ -117,17 +135,27 @@ pub fn handle_command_line(
         command_line.printerr_literal(&outcome.stderr);
     }
 
-    if let Some(request) = outcome.spawn {
-        // The tab's uuid is minted here, where glib is available, and echoed
-        // so the caller has the identity of the requested tab to correlate
-        // with — not a guarantee it was created; request_spawn only queues
-        // the message on the relm4 channel.
-        let tab_uuid = glib::uuid_string_random().to_string();
-        if !request_spawn(request, tab_uuid.clone()) {
-            command_line.printerr_literal("kabelsalat: no window to spawn into\n");
-            return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
+    match outcome.action {
+        Some(Action::Spawn { group, cwd, argv }) => {
+            // The tab's uuid is minted here, where glib is available, and
+            // echoed so the caller has the identity of the requested tab to
+            // correlate with — not a guarantee it was created; request_spawn
+            // only queues the message on the relm4 channel.
+            let tab_uuid = glib::uuid_string_random().to_string();
+            if !request_spawn(group, cwd, argv, tab_uuid.clone()) {
+                command_line.printerr_literal("kabelsalat: no window to spawn into\n");
+                return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
+            }
+            command_line.print_literal(&format!("{tab_uuid}\n"));
         }
-        command_line.print_literal(&format!("{tab_uuid}\n"));
+        // Renaming prints nothing on success.
+        Some(Action::Rename { group_uuid, name }) => {
+            if !request_rename(group_uuid, name) {
+                command_line.printerr_literal("kabelsalat: no window to spawn into\n");
+                return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
+            }
+        }
+        None => {}
     }
 
     glib::ExitCode::new(outcome.code)
@@ -147,13 +175,16 @@ mod tests {
     fn a_spawn_request_without_a_gui_is_refused() {
         // register() is never called in tests, so there is no sender to use.
         let refused = request_spawn(
-            SpawnRequest {
-                group_uuid: "aaa-111".into(),
-                cwd: std::path::PathBuf::from("/tmp"),
-                argv: vec!["ls".into()],
-            },
+            GroupTarget::Existing("aaa-111".into()),
+            std::path::PathBuf::from("/tmp"),
+            vec!["ls".into()],
             "tab-uuid".into(),
         );
         assert!(!refused);
+    }
+
+    #[test]
+    fn a_rename_request_without_a_gui_is_refused() {
+        assert!(!request_rename("aaa-111".into(), "frontend".into()));
     }
 }

@@ -25,10 +25,20 @@ pub enum Cli {
     Run {
         /// A group uuid or name, resolved later against the live instance.
         group: String,
+        /// `--create`: when the selector matches nothing, make a group with
+        /// that name instead of failing.
+        create: bool,
         /// `--cwd`, still possibly relative to the caller's directory.
         cwd: Option<PathBuf>,
         /// Everything after `--`, verbatim.
         argv: Vec<String>,
+    },
+    /// Give an existing group a new name.
+    Rename {
+        /// A group uuid or name, resolved like `run`'s `--group`.
+        group: String,
+        /// The new name, already trimmed and known to be non-empty.
+        name: String,
     },
 }
 
@@ -36,7 +46,7 @@ impl Cli {
     /// Whether answering this needs the running GUI. `Gui` and `Help` are
     /// handled entirely in the calling process.
     pub fn needs_instance(&self) -> bool {
-        matches!(self, Cli::Groups | Cli::Run { .. })
+        matches!(self, Cli::Groups | Cli::Run { .. } | Cli::Rename { .. })
     }
 }
 
@@ -92,17 +102,21 @@ pub fn help_text() -> &'static str {
 Usage:
   kabelsalat                                   Start the GUI, or activate the running instance
   kabelsalat groups                            List groups: uuid, name, tab count
-  kabelsalat run -g <group> [--cwd DIR] -- CMD [ARGS...]
+  kabelsalat run -g <group> [--create] [--cwd DIR] -- CMD [ARGS...]
                                                Run CMD in a new tab of <group>
+  kabelsalat rename <group> <new-name>         Rename an existing group
 
 Options for run:
   -g, --group <name|uuid>   Target group. A uuid always wins; otherwise the
                             name must match exactly and match only one group.
+      --create              When nothing matches, create a group named
+                            <group> and put the tab in it.
       --cwd <dir>           Working directory (default: the caller's).
       --                    Required. Everything after it is the command.
 
 Exit codes:
-  0 success   1 kabelsalat not running   2 usage error   3 group not found
+  0 success   1 kabelsalat not running   2 usage error
+  3 group not found, ambiguous, or the new name is already taken
 "
 }
 
@@ -125,6 +139,7 @@ pub fn parse(args: &[String]) -> Result<Cli, UsageError> {
             Ok(Cli::Groups)
         }
         "run" => parse_run(&rest[1..]),
+        "rename" => parse_rename(&rest[1..]),
         other => Err(UsageError(format!("unknown command '{other}'"))),
     }
 }
@@ -134,6 +149,7 @@ pub fn parse(args: &[String]) -> Result<Cli, UsageError> {
 fn parse_run(args: &[String]) -> Result<Cli, UsageError> {
     let mut group: Option<String> = None;
     let mut cwd: Option<PathBuf> = None;
+    let mut create = false;
     let mut i = 0;
 
     let argv = loop {
@@ -152,6 +168,12 @@ fn parse_run(args: &[String]) -> Result<Cli, UsageError> {
             }
         };
         match arg.as_str() {
+            // A boolean flag consumes one argument, not two.
+            "--create" => {
+                create = true;
+                i += 1;
+                continue;
+            }
             "--group" | "-g" => group = Some(value(i)?),
             "--cwd" => cwd = Some(PathBuf::from(value(i)?)),
             other => return Err(UsageError(format!("unknown option '{other}'"))),
@@ -166,16 +188,82 @@ fn parse_run(args: &[String]) -> Result<Cli, UsageError> {
     if argv.is_empty() {
         return Err(UsageError("no command given after '--'".into()));
     }
-    Ok(Cli::Run { group, cwd, argv })
+    // With --create the selector becomes the new group's name, so it has to
+    // survive `kabelsalat groups`. A plain lookup is left alone: it can only
+    // fail to match.
+    if create {
+        check_name_chars(&group)?;
+    }
+    Ok(Cli::Run {
+        group,
+        create,
+        cwd,
+        argv,
+    })
 }
 
-/// A validated `run`: everything `app.rs` needs to create the tab. The tab's
-/// own uuid is minted by the caller, not here, because that needs glib.
+/// A group name the CLI sets must stay on one `kabelsalat groups` line and
+/// keep its three tab-separated fields, so control characters — tabs and
+/// newlines above all — are a usage error. The GUI's single-line entry cannot
+/// produce them; only these paths could.
+fn check_name_chars(name: &str) -> Result<(), UsageError> {
+    if name.chars().any(char::is_control) {
+        return Err(UsageError(
+            "a group name must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// `rename <group> <new-name>`: exactly two positional arguments, no flags.
+/// The new name is trimmed, and must not be empty afterwards.
+fn parse_rename(args: &[String]) -> Result<Cli, UsageError> {
+    let (Some(group), Some(name)) = (args.first(), args.get(1)) else {
+        return Err(UsageError(
+            "rename needs a group and a new name (e.g. rename web frontend)".into(),
+        ));
+    };
+    if let Some(extra) = args.get(2) {
+        return Err(UsageError(format!(
+            "rename takes exactly two arguments (got '{extra}')"
+        )));
+    }
+    if group.is_empty() {
+        return Err(UsageError("rename needs a non-empty group".into()));
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(UsageError("the new name must not be empty".into()));
+    }
+    check_name_chars(name)?;
+    Ok(Cli::Rename {
+        group: group.clone(),
+        name: name.to_string(),
+    })
+}
+
+/// Where a spawned tab goes: an existing group, or one to be created.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpawnRequest {
-    pub group_uuid: String,
-    pub cwd: PathBuf,
-    pub argv: Vec<String>,
+pub enum GroupTarget {
+    /// A group that already exists, by uuid.
+    Existing(String),
+    /// No group matched and `--create` was given: make one with this name.
+    Create { name: String },
+}
+
+/// What the GUI is asked to do once the invocation validated. The tab's own
+/// uuid is minted by the caller, not here, because that needs glib.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    Spawn {
+        group: GroupTarget,
+        cwd: PathBuf,
+        argv: Vec<String>,
+    },
+    Rename {
+        group_uuid: String,
+        name: String,
+    },
 }
 
 /// The complete result of an invocation: what to print, what to exit with,
@@ -185,7 +273,7 @@ pub struct Outcome {
     pub stdout: String,
     pub stderr: String,
     pub code: u8,
-    pub spawn: Option<SpawnRequest>,
+    pub action: Option<Action>,
 }
 
 impl Outcome {
@@ -194,7 +282,7 @@ impl Outcome {
             stdout,
             stderr: String::new(),
             code: EXIT_OK,
-            spawn: None,
+            action: None,
         }
     }
 
@@ -203,7 +291,7 @@ impl Outcome {
             stdout: String::new(),
             stderr,
             code,
-            spawn: None,
+            action: None,
         }
     }
 }
@@ -221,35 +309,89 @@ pub fn dispatch(cli: &Cli, groups: &[GroupInfo], caller_cwd: &Path) -> Outcome {
                 .map(|g| format!("{}\t{}\t{}\n", g.uuid, g.name, g.tabs))
                 .collect(),
         ),
-        Cli::Run { group, cwd, argv } => match resolve_group(groups, group) {
-            Ok(found) => Outcome {
+        Cli::Run {
+            group,
+            create,
+            cwd,
+            argv,
+        } => {
+            // `join` with an absolute path replaces the base, so this handles
+            // both absolute and relative --cwd values.
+            let cwd = match cwd {
+                Some(dir) => caller_cwd.join(dir),
+                None => caller_cwd.to_path_buf(),
+            };
+            let target = match resolve_group(groups, group) {
+                Ok(found) => GroupTarget::Existing(found.uuid.clone()),
+                // A selector that looks like a uuid is not special-cased: with
+                // --create it simply becomes the new group's name.
+                Err(ResolveError::NotFound) if *create => GroupTarget::Create {
+                    name: group.clone(),
+                },
+                Err(err) => return resolve_failure(group, err),
+            };
+            Outcome {
                 stdout: String::new(),
                 stderr: String::new(),
                 code: EXIT_OK,
-                spawn: Some(SpawnRequest {
-                    group_uuid: found.uuid.clone(),
-                    // `join` with an absolute path replaces the base, so this
-                    // handles both absolute and relative --cwd values.
-                    cwd: match cwd {
-                        Some(dir) => caller_cwd.join(dir),
-                        None => caller_cwd.to_path_buf(),
-                    },
+                action: Some(Action::Spawn {
+                    group: target,
+                    cwd,
                     argv: argv.clone(),
                 }),
-            },
-            Err(ResolveError::NotFound) => Outcome::fail(
-                EXIT_GROUP,
-                format!("no group matching '{group}'; try `kabelsalat groups`\n"),
+            }
+        }
+        Cli::Rename { group, name } => {
+            let target = match resolve_group(groups, group) {
+                Ok(found) => found,
+                Err(err) => return resolve_failure(group, err),
+            };
+            // A rename that changes nothing succeeds even when the GUI has
+            // left a second group with that same name around: there is
+            // nothing to refuse, so this is checked before the clash.
+            if target.name == *name {
+                return Outcome::ok(String::new());
+            }
+            // Exact and case-sensitive, like name resolution. The target
+            // itself does not count as a clash.
+            if let Some(clash) = groups
+                .iter()
+                .find(|g| g.uuid != target.uuid && g.name == *name)
+            {
+                return Outcome::fail(
+                    EXIT_GROUP,
+                    format!("a group named '{name}' already exists ({})\n", clash.uuid),
+                );
+            }
+            Outcome {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: EXIT_OK,
+                action: Some(Action::Rename {
+                    group_uuid: target.uuid.clone(),
+                    name: name.clone(),
+                }),
+            }
+        }
+    }
+}
+
+/// The shared `run`/`rename` wording for a selector that matched nothing or
+/// matched too much.
+fn resolve_failure(selector: &str, err: ResolveError) -> Outcome {
+    match err {
+        ResolveError::NotFound => Outcome::fail(
+            EXIT_GROUP,
+            format!("no group matching '{selector}'; try `kabelsalat groups`\n"),
+        ),
+        ResolveError::Ambiguous(uuids) => Outcome::fail(
+            EXIT_GROUP,
+            format!(
+                "'{selector}' matches {} groups; use one of these uuids instead:\n{}",
+                uuids.len(),
+                uuids.iter().map(|u| format!("  {u}\n")).collect::<String>()
             ),
-            Err(ResolveError::Ambiguous(uuids)) => Outcome::fail(
-                EXIT_GROUP,
-                format!(
-                    "'{group}' matches {} groups; use one of these uuids instead:\n{}",
-                    uuids.len(),
-                    uuids.iter().map(|u| format!("  {u}\n")).collect::<String>()
-                ),
-            ),
-        },
+        ),
     }
 }
 
@@ -300,6 +442,7 @@ mod tests {
             parse(&args(&["run", "--group", "web", "--", "claude"])),
             Ok(Cli::Run {
                 group: "web".into(),
+                create: false,
                 cwd: None,
                 argv: vec!["claude".into()],
             })
@@ -312,6 +455,7 @@ mod tests {
             parse(&args(&["run", "-g", "web", "--cwd", "/tmp", "--", "ls"])),
             Ok(Cli::Run {
                 group: "web".into(),
+                create: false,
                 cwd: Some(PathBuf::from("/tmp")),
                 argv: vec!["ls".into()],
             })
@@ -326,6 +470,7 @@ mod tests {
             ])),
             Ok(Cli::Run {
                 group: "web".into(),
+                create: false,
                 cwd: None,
                 argv: vec![
                     "claude".into(),
@@ -445,8 +590,32 @@ mod tests {
     fn run(group: &str, cwd: Option<&str>, argv: &[&str]) -> Cli {
         Cli::Run {
             group: group.into(),
+            create: false,
             cwd: cwd.map(PathBuf::from),
             argv: argv.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn run_create(group: &str, argv: &[&str]) -> Cli {
+        Cli::Run {
+            group: group.into(),
+            create: true,
+            cwd: None,
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn rename(group: &str, name: &str) -> Cli {
+        Cli::Rename {
+            group: group.into(),
+            name: name.into(),
+        }
+    }
+
+    fn spawn_of(out: &Outcome) -> (&GroupTarget, &PathBuf, &Vec<String>) {
+        match out.action.as_ref().expect("an action") {
+            Action::Spawn { group, cwd, argv } => (group, cwd, argv),
+            other => panic!("expected Spawn, got {other:?}"),
         }
     }
 
@@ -458,7 +627,7 @@ mod tests {
             "aaa-111\tweb\t2\nbbb-222\tapi\t1\nccc-333\tapi\t3\nddd-444\t\t1\n"
         );
         assert_eq!(out.code, EXIT_OK);
-        assert!(out.spawn.is_none());
+        assert!(out.action.is_none());
     }
 
     #[test]
@@ -472,10 +641,10 @@ mod tests {
     fn run_produces_a_spawn_request_with_the_callers_cwd() {
         let cli = run("web", None, &["claude"]);
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u/proj"));
-        let spawn = out.spawn.expect("spawn request");
-        assert_eq!(spawn.group_uuid, "aaa-111");
-        assert_eq!(spawn.cwd, PathBuf::from("/home/u/proj"));
-        assert_eq!(spawn.argv, vec!["claude".to_string()]);
+        let (group, cwd, argv) = spawn_of(&out);
+        assert_eq!(*group, GroupTarget::Existing("aaa-111".into()));
+        assert_eq!(*cwd, PathBuf::from("/home/u/proj"));
+        assert_eq!(*argv, vec!["claude".to_string()]);
         assert_eq!(out.code, EXIT_OK);
     }
 
@@ -483,17 +652,14 @@ mod tests {
     fn an_absolute_cwd_flag_replaces_the_callers_cwd() {
         let cli = run("web", Some("/srv/app"), &["ls"]);
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u/proj"));
-        assert_eq!(out.spawn.unwrap().cwd, PathBuf::from("/srv/app"));
+        assert_eq!(*spawn_of(&out).1, PathBuf::from("/srv/app"));
     }
 
     #[test]
     fn a_relative_cwd_flag_is_resolved_against_the_caller() {
         let cli = run("web", Some("sub/dir"), &["ls"]);
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u/proj"));
-        assert_eq!(
-            out.spawn.unwrap().cwd,
-            PathBuf::from("/home/u/proj/sub/dir")
-        );
+        assert_eq!(*spawn_of(&out).1, PathBuf::from("/home/u/proj/sub/dir"));
     }
 
     #[test]
@@ -501,7 +667,7 @@ mod tests {
         let cli = run("nope", None, &["ls"]);
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u"));
         assert_eq!(out.code, EXIT_GROUP);
-        assert!(out.spawn.is_none());
+        assert!(out.action.is_none());
         assert!(out.stderr.contains("nope"));
     }
 
@@ -510,7 +676,7 @@ mod tests {
         let cli = run("api", None, &["ls"]);
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u"));
         assert_eq!(out.code, EXIT_GROUP);
-        assert!(out.spawn.is_none());
+        assert!(out.action.is_none());
         assert!(out.stderr.contains("bbb-222"), "stderr was: {}", out.stderr);
         assert!(out.stderr.contains("ccc-333"), "stderr was: {}", out.stderr);
     }
@@ -520,6 +686,148 @@ mod tests {
         let out = dispatch(&Cli::Help, &[], Path::new("/home/u"));
         assert!(out.stdout.starts_with("kabelsalat"));
         assert_eq!(out.code, EXIT_OK);
+    }
+
+    #[test]
+    fn run_parses_the_create_flag() {
+        assert_eq!(
+            parse(&args(&["run", "-g", "newproj", "--create", "--", "claude"])),
+            Ok(Cli::Run {
+                group: "newproj".into(),
+                create: true,
+                cwd: None,
+                argv: vec!["claude".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn create_reuses_a_unique_match() {
+        let out = dispatch(
+            &run_create("web", &["ls"]),
+            &sample_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(*spawn_of(&out).0, GroupTarget::Existing("aaa-111".into()));
+    }
+
+    #[test]
+    fn create_makes_a_new_group_when_nothing_matches() {
+        let out = dispatch(
+            &run_create("newproj", &["claude"]),
+            &sample_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(
+            *spawn_of(&out).0,
+            GroupTarget::Create {
+                name: "newproj".into()
+            }
+        );
+    }
+
+    #[test]
+    fn create_still_fails_on_an_ambiguous_name() {
+        let out = dispatch(
+            &run_create("api", &["ls"]),
+            &sample_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+        assert!(out.stderr.contains("bbb-222"), "stderr was: {}", out.stderr);
+    }
+
+    #[test]
+    fn rename_parses_two_arguments() {
+        assert_eq!(
+            parse(&args(&["rename", "web", "  frontend  "])),
+            Ok(Cli::Rename {
+                group: "web".into(),
+                name: "frontend".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rename_rejects_missing_or_empty_name() {
+        assert!(parse(&args(&["rename"])).is_err());
+        assert!(parse(&args(&["rename", "web"])).is_err());
+        assert!(parse(&args(&["rename", "web", ""])).is_err());
+        assert!(parse(&args(&["rename", "web", "   "])).is_err());
+        assert!(parse(&args(&["rename", "web", "a", "b"])).is_err());
+        assert!(parse(&args(&["rename", "", "a"])).is_err());
+    }
+
+    #[test]
+    fn rename_refuses_a_name_another_group_uses() {
+        let out = dispatch(&rename("web", "api"), &sample_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+        assert_eq!(out.stderr, "a group named 'api' already exists (bbb-222)\n");
+    }
+
+    #[test]
+    fn rename_to_the_current_name_is_a_noop_success() {
+        let out = dispatch(&rename("web", "web"), &sample_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "");
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn renaming_a_group_to_its_own_name_is_a_noop_even_with_a_twin() {
+        // bbb-222 and ccc-333 are both called "api" (the GUI allows that).
+        // Renaming one to "api" changes nothing, so there is nothing to
+        // refuse — the clash rule must not fire on the target's twin.
+        let out = dispatch(&rename("bbb-222", "api"), &sample_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stderr, "");
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn a_name_with_control_characters_is_a_usage_error() {
+        // These would break the one-line, tab-separated `groups` output.
+        assert!(parse(&args(&["rename", "web", "a\nb"])).is_err());
+        assert!(parse(&args(&["rename", "web", "a\tb"])).is_err());
+        assert!(parse(&args(&["run", "-g", "a\nb", "--create", "--", "ls"])).is_err());
+        // Without --create the selector is only ever looked up, never stored.
+        assert!(parse(&args(&["run", "-g", "a\nb", "--", "ls"])).is_ok());
+    }
+
+    #[test]
+    fn rename_targets_an_unnamed_group_by_uuid() {
+        let out = dispatch(
+            &rename("ddd-444", "scratch"),
+            &sample_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert_eq!(
+            out.action,
+            Some(Action::Rename {
+                group_uuid: "ddd-444".into(),
+                name: "scratch".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rename_on_an_unknown_group_fails() {
+        let out = dispatch(&rename("nope", "x"), &sample_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+        assert!(out.stderr.contains("nope"));
+
+        let ambiguous = dispatch(&rename("api", "x"), &sample_groups(), Path::new("/w"));
+        assert_eq!(ambiguous.code, EXIT_GROUP);
+        assert!(ambiguous.action.is_none());
+        assert!(ambiguous.stderr.contains("ccc-333"));
     }
 
     #[test]

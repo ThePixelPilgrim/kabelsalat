@@ -70,11 +70,16 @@ second window:
 
     kabelsalat groups                      # uuid, name and tab count per group
     kabelsalat run -g web -- npm run dev   # new tab in the "web" group
+    kabelsalat run -g newproj --create -- claude   # create "newproj" if missing
+    kabelsalat rename newproj proj2        # rename an existing group
 
 `--group` takes a group name or uuid; `--cwd` overrides the working directory,
 which defaults to the caller's. Everything after `--` is the command. The new
-tab does not steal focus. Exit codes: 0 success, 1 not running, 2 usage,
-3 no such group.
+tab does not steal focus. `run --create` reuses a unique existing match, or
+else creates a new group named exactly the given selector. `rename` refuses
+to create a duplicate name and is a no-op if the name is unchanged. Exit
+codes: 0 success, 1 not running, 2 usage, 3 no such group, ambiguous, or (for
+`rename`) name already in use.
 
 Claude Code learns this interface through the plugin below.
 
