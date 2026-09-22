@@ -1,7 +1,7 @@
 {
   "name": "kabelsalat",
   "displayName": "Kabelsalat",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Drive a running kabelsalat terminal: launch commands into visible, persistent group panes and co-browse the group's embedded browser over CDP.",
   "author": { "name": "Christoph Rauch", "url": "https://github.com/ThePixelPilgrim" },
   "repository": "https://github.com/ThePixelPilgrim/kabelsalat",
