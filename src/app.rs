@@ -75,11 +75,34 @@ const BROWSER_POLL_SECS: u32 = 2;
 /// How often the tab age prefixes are recomputed. The display has minute
 /// granularity, so a 30 s tick shows a stale "now" for at most 89 s.
 const AGE_TICK_SECS: u32 = 30;
-/// How long after spawn/attach `contents-changed` is ignored as an activity
-/// source. Attaching a tmux session repaints the whole screen; without this
-/// window every restored tab would be stamped "now" and the persisted age
-/// seed (applied right after `add_tab`) would be lost.
+/// How long after spawn/attach — and after every tab activation — the
+/// activity sources (`contents-changed`, title writes) are ignored.
+/// Attaching a tmux session repaints the whole screen; without this window
+/// every restored tab would be stamped "now" and the persisted age seed
+/// (applied right after `add_tab`) would be lost. Activating a tab can
+/// likewise make the program in the pane repaint (focus events), and that
+/// echo of the switch must never reorder an Activity-sorted sidebar.
 const ACTIVITY_SETTLE_MS: u64 = 750;
+
+/// How long after an activity stamp the sidebar re-sorts. The stamps are
+/// written by VTE callbacks outside the message loop (per output chunk), so
+/// they are coalesced into one `Msg::Resort` per window rather than a
+/// rebuild each.
+const ACTIVITY_RESORT_MS: u64 = 250;
+
+/// A frozen navigation order — group id plus that group's tab ids in
+/// display order, groups in sidebar order — and the expiry timeout that ends
+/// the burst.
+type NavBurst = Option<(Vec<(usize, Vec<usize>)>, gtk::glib::SourceId)>;
+
+/// How long a burst of Ctrl-Page_Up/Down keeps navigating the order it
+/// started with. The live order can reshuffle between presses (an idle tab
+/// receives an update and, in Activity sort, jumps to the front); without a
+/// frozen snapshot the walk would jump with it. Any other way of landing on
+/// a tab (click, jump, close) ends the burst early via the staleness check
+/// in `navigate`. The sidebar holds still for the same window (see
+/// `resort_if_stale`), so what the keys walk is what the list shows.
+const NAV_BURST_MS: u64 = 3000;
 
 /// CDP discovery: poll the profile's DevToolsActivePort file this often…
 const CDP_POLL_MS: u64 = 100;
@@ -154,6 +177,11 @@ pub struct Tab {
     /// which fires per keystroke and so must not go through the relm4
     /// message loop.
     last_activity: Rc<Cell<SystemTime>>,
+    /// Disarmed while an attach/activation settle window is open — see
+    /// `arm_activity_later`. Shared with the callbacks that stamp
+    /// `last_activity` so a repaint that is merely the echo of a switch
+    /// cannot reorder an Activity-sorted sidebar.
+    armed: Rc<Cell<bool>>,
     /// Age prefix currently rendered in the labels; the tick only touches a
     /// label when this changes.
     age_shown: String,
@@ -195,6 +223,14 @@ pub struct App {
     /// Tab ids in the order the sidebar last rendered them, so an activity
     /// stamp can tell whether the list needs a rebuild or just a relabel.
     shown_order: RefCell<Vec<usize>>,
+    /// A running burst of keyboard navigation: the frozen `nav_order` it
+    /// started with plus the timeout that ends it. `Rc` so the expiry
+    /// timeout can hold a cheap clone (`SourceId` is neither `Clone` nor
+    /// `Copy`, so the `RefCell` itself cannot be cloned). See `navigate`.
+    nav_burst: Rc<RefCell<NavBurst>>,
+    /// Whether a `Msg::Resort` is already scheduled; shared with every tab's
+    /// stamp callbacks so a burst of output sends one message, not hundreds.
+    resort_pending: Rc<Cell<bool>>,
     style: adw::StyleManager,
     tab_list: gtk::ListBox,
     /// Scroll wrapper around `tab_list`; owns the vertical adjustment used to
@@ -295,6 +331,9 @@ pub enum Msg {
     TitleChanged(usize, String),
     /// Periodic recomputation of the tab age prefixes.
     AgeTick,
+    /// Coalesced follow-up to an activity stamp: re-sort the sidebar if the
+    /// stamp changed the display order. See `request_resort`.
+    Resort,
     MoveTabPicker,
     MoveTabTo(Option<usize>), // None = new group
     JumpPicker,
@@ -730,6 +769,8 @@ impl SimpleComponent for App {
             sidebar_visible: true,
             sidebar_order: SidebarOrder::default(),
             shown_order: RefCell::new(Vec::new()),
+            nav_burst: Rc::new(RefCell::new(None)),
+            resort_pending: Rc::new(Cell::new(false)),
             style,
             tab_list: gtk::ListBox::new(),
             list_scroller: gtk::ScrolledWindow::new(),
@@ -1067,6 +1108,12 @@ impl SimpleComponent for App {
             // every 30 s would be a regression.
             Msg::AgeTick => {
                 self.refresh_ages();
+                self.resort_if_stale();
+                return;
+            }
+            // Like the tick: a re-sort is a paint, never a disk write.
+            Msg::Resort => {
+                self.resort_pending.set(false);
                 self.resort_if_stale();
                 return;
             }
@@ -2421,9 +2468,12 @@ impl App {
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed({
             let last = last_activity.clone();
+            let pending = self.resort_pending.clone();
+            let input = sender.input_sender().clone();
             move |_, key, _, _| {
                 if is_activity_key(key) {
                     last.set(SystemTime::now());
+                    request_resort(&pending, &input);
                 }
                 gtk::glib::Propagation::Proceed
             }
@@ -2434,15 +2484,16 @@ impl App {
         // the tab, once the attach repaint has settled. Known cost: a TUI
         // that repaints while idle (spinner, clock) keeps its tab fresh.
         let armed = Rc::new(Cell::new(false));
-        gtk::glib::timeout_add_local_once(Duration::from_millis(ACTIVITY_SETTLE_MS), {
-            let armed = armed.clone();
-            move || armed.set(true)
-        });
+        arm_activity_later(&armed, Duration::from_millis(ACTIVITY_SETTLE_MS));
         terminal.connect_contents_changed({
+            let armed = armed.clone();
             let last = last_activity.clone();
+            let pending = self.resort_pending.clone();
+            let input = sender.input_sender().clone();
             move |_| {
                 if armed.get() {
                     last.set(SystemTime::now());
+                    request_resort(&pending, &input);
                 }
             }
         });
@@ -2476,6 +2527,7 @@ impl App {
             crashed,
             terminal,
             last_activity,
+            armed,
             age_shown: age_prefix(Duration::ZERO),
         });
         id
@@ -2562,6 +2614,13 @@ impl App {
         }
         self.stack.set_visible_child(&tab.terminal);
         tab.terminal.grab_focus();
+        // A switch must never reorder the sidebar: the focus change can make
+        // the program in the pane repaint (tmux focus-events, TUI redraw on
+        // focus-in), and that repaint is the echo of the switch itself, not
+        // new activity. Reopen the settle window so both stamp sources
+        // (output, title) are deaf for a moment; genuine later output still
+        // stamps and reorders.
+        arm_activity_later(&tab.armed, Duration::from_millis(ACTIVITY_SETTLE_MS));
         self.rebuild_list();
         // The main funnel for swapping the parented browser pane. Not the
         // only one: a tab *move* changes the active group with no tab
@@ -2606,14 +2665,91 @@ impl App {
         self.rebuild_list();
     }
 
+    /// Ctrl-Page_Up/Down, following the sidebar: a step inside the expanded
+    /// active group moves one row; a step past either end lands on the
+    /// neighbouring group's collapsed row, i.e. its representative tab
+    /// (`state::nav_target`). The order may reshuffle at any moment (an idle
+    /// tab receives an update and, in Activity sort, jumps to the front), and
+    /// recomputing the position on every press would make the walk jump with
+    /// it. So a burst of navigation freezes the order it started with: the
+    /// first press snapshots the groups and their member order, later presses
+    /// keep stepping through that snapshot until `NAV_BURST_MS` passes
+    /// without navigation — or the user lands elsewhere (a click, a jump, a
+    /// close), which shows up as the active tab no longer being in the
+    /// snapshot or a snapshotted tab being gone. The sidebar defers its own
+    /// re-sort for the length of the burst, so the two stay in step.
     fn navigate(&mut self, step: isize) {
-        let order = self.nav_order();
         let Some(active) = self.active else { return };
-        let Some(pos) = order.iter().position(|&t| t == active) else {
-            return;
+        let taken = self.nav_burst.borrow_mut().take();
+        let order = match taken {
+            Some((order, source)) => {
+                source.remove();
+                let intact = order
+                    .iter()
+                    .flat_map(|(_, tabs)| tabs)
+                    .all(|id| self.tabs.iter().any(|t| t.id == *id));
+                let anchored = order.iter().any(|(_, tabs)| tabs.contains(&active));
+                if intact && anchored {
+                    order
+                } else {
+                    self.snapshot_nav_order()
+                }
+            }
+            None => self.snapshot_nav_order(),
         };
-        let next = (pos as isize + step).rem_euclid(order.len() as isize) as usize;
-        self.activate(order[next]);
+        // Representatives are read live, not frozen: leaving a group updates
+        // its `last_active`, and stepping back into it must land there.
+        let groups: Vec<state::NavGroup> = order
+            .iter()
+            .map(|(group, tabs)| state::NavGroup {
+                tabs: tabs.clone(),
+                representative: self.representative_of(*group, tabs),
+            })
+            .collect();
+        // Reopen (and thereby extend) the burst window around the order just
+        // used, so a reshuffle between presses cannot redirect the walk. When
+        // it closes, the sidebar catches up on anything it held back. Stored
+        // before the activation below so that its `rebuild_list` already
+        // renders the frozen order (`group_members` reads the burst).
+        let source = gtk::glib::timeout_add_local_once(Duration::from_millis(NAV_BURST_MS), {
+            let nav_burst = self.nav_burst.clone();
+            let input = self.input.clone();
+            move || {
+                *nav_burst.borrow_mut() = None;
+                let _ = input.send(Msg::Resort);
+            }
+        });
+        *self.nav_burst.borrow_mut() = Some((order, source));
+        if let Some(target) = state::nav_target(&groups, active, step) {
+            self.activate(target);
+        }
+    }
+
+    /// The display order as a nav burst freezes it: every group in sidebar
+    /// order with its member ids as `group_members` shows them.
+    fn snapshot_nav_order(&self) -> Vec<(usize, Vec<usize>)> {
+        self.groups
+            .iter()
+            .map(|g| {
+                (
+                    g.id,
+                    self.group_members(g.id).into_iter().map(|t| t.id).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The tab a collapsed group row shows and keyboard navigation enters
+    /// the group on: the group's last-active tab when it is still among
+    /// `members` (display order), else the first member. `members` must not
+    /// be empty.
+    fn representative_of(&self, group: usize, members: &[usize]) -> usize {
+        self.groups
+            .iter()
+            .find(|g| g.id == group)
+            .map(|g| g.last_active)
+            .filter(|id| members.contains(id))
+            .unwrap_or(members[0])
     }
 
     /// Reorder by drag-and-drop: insert `src` before `dest`. If `dest` is in
@@ -2695,7 +2831,8 @@ impl App {
         self.sync_browser_pane();
     }
 
-    /// Jump to the first tab of the next/previous group, wrapping around.
+    /// Jump to the representative tab of the next/previous group, wrapping
+    /// around — the same tab its collapsed sidebar row shows.
     fn navigate_group(&mut self, step: isize) {
         let Some(current) = self.active_group() else {
             return;
@@ -2705,8 +2842,9 @@ impl App {
         };
         let next = (pos as isize + step).rem_euclid(self.groups.len() as isize) as usize;
         let target = self.groups[next].id;
-        if let Some(first) = self.group_members(target).first().map(|t| t.id) {
-            self.activate(first);
+        let members: Vec<usize> = self.group_members(target).iter().map(|t| t.id).collect();
+        if !members.is_empty() {
+            self.activate(self.representative_of(target, &members));
         }
     }
 
@@ -2732,10 +2870,9 @@ impl App {
                     self.tab_list.append(&self.make_row(tab, group, None));
                 }
             } else {
-                let representative = members
-                    .iter()
-                    .find(|t| t.id == group.last_active)
-                    .unwrap_or(&members[0]);
+                let ids: Vec<usize> = members.iter().map(|t| t.id).collect();
+                let representative = self.representative_of(group.id, &ids);
+                let representative = members.iter().find(|t| t.id == representative).unwrap();
                 self.tab_list
                     .append(&self.make_row(representative, group, Some(members.len())));
             }
@@ -2946,13 +3083,19 @@ impl App {
         // the signal is only a prompt to compare and never itself evidence of
         // change. The comparison also absorbs the attach-time title
         // re-emission for free, which is why v2 needs no settle window.
-        tab.last_activity.set(SystemTime::now());
-        // `age_shown` caches what the labels render; the stamp above just
-        // invalidated it, and the two refreshes below read it. Without this
-        // the relabelled tab keeps showing its pre-stamp age ("3d · <new
-        // title>") until the next tick — a value the code knows is wrong at
-        // the moment it paints it. No disk write is involved.
-        tab.age_shown = age_prefix(Duration::ZERO);
+        // Both the stamp and the age relabel are activity side effects; a
+        // title written inside an open settle window (attach or the echo of
+        // an activation) is not evidence of activity, so neither fires until
+        // the sources are armed again.
+        if tab.armed.get() {
+            tab.last_activity.set(SystemTime::now());
+            // `age_shown` caches what the labels render; the stamp above just
+            // invalidated it, and the two refreshes below read it. Without this
+            // the relabelled tab keeps showing its pre-stamp age ("3d · <new
+            // title>") until the next tick — a value the code knows is wrong at
+            // the moment it paints it. No disk write is involved.
+            tab.age_shown = age_prefix(Duration::ZERO);
+        }
         tab.title = title;
         let tab = self.tabs.iter().find(|t| t.id == id).unwrap();
         self.refresh_sidebar_label(tab);
@@ -2962,11 +3105,24 @@ impl App {
 
     /// A group's tabs in display order. Manual keeps the vec order (which
     /// `save_state` persists and drag-and-drop edits); Activity sorts by the
-    /// last activity stamp, most recent first, and leaves the vec alone.
+    /// last activity stamp, most recent first, and leaves the vec alone —
+    /// except during a keyboard-navigation burst, which pins the order the
+    /// burst froze (tabs created since, unknown to the snapshot, lead).
     fn group_members(&self, group: usize) -> Vec<&Tab> {
-        let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == group).collect();
+        let mut members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == group).collect();
         match self.sidebar_order {
             SidebarOrder::Manual => members,
+            SidebarOrder::Activity
+                if let Some(frozen) = self
+                    .nav_burst
+                    .borrow()
+                    .as_ref()
+                    .and_then(|(order, _)| order.iter().find(|(g, _)| *g == group))
+                    .map(|(_, tabs)| tabs.clone()) =>
+            {
+                members.sort_by_key(|t| frozen.iter().position(|id| *id == t.id));
+                members
+            }
             SidebarOrder::Activity => {
                 let stamps: Vec<u64> = members
                     .iter()
@@ -2987,8 +3143,11 @@ impl App {
 
     /// Rebuild the list when an activity stamp has changed the display order
     /// since the last render. Cheap when nothing moved: one vec comparison.
+    /// Held back while a keyboard-navigation burst is running, so the list
+    /// cannot drift from the frozen order the keys walk; the burst's expiry
+    /// sends a `Msg::Resort` that catches up.
     fn resort_if_stale(&self) {
-        if self.sidebar_order != SidebarOrder::Activity {
+        if self.sidebar_order != SidebarOrder::Activity || self.nav_burst.borrow().is_some() {
             return;
         }
         let stale = self.nav_order() != *self.shown_order.borrow();
@@ -3015,17 +3174,8 @@ impl App {
                 display_title(&tab.age_shown, &tab.title, tab.crashed, None),
             )
         } else {
-            let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == tab.group).collect();
-            let last_active = self
-                .groups
-                .iter()
-                .find(|g| g.id == tab.group)
-                .map(|g| g.last_active);
-            let representative = members
-                .iter()
-                .find(|t| Some(t.id) == last_active)
-                .unwrap_or(&members[0]);
-            if representative.id != tab.id {
+            let members: Vec<usize> = self.group_members(tab.group).iter().map(|t| t.id).collect();
+            if self.representative_of(tab.group, &members) != tab.id {
                 return;
             }
             (
@@ -3058,9 +3208,8 @@ impl App {
             return;
         }
         let Some(index) = self
-            .tabs
+            .group_members(tab.group)
             .iter()
-            .filter(|t| t.group == tab.group)
             .position(|t| t.id == tab.id)
         else {
             return;
@@ -3479,6 +3628,33 @@ fn crashed_tab_label(title: &str, crashed: Option<i32>) -> String {
         Some(code) => format!("{title} [exit {code}]"),
         None => title.to_string(),
     }
+}
+
+/// Schedule one `Msg::Resort` for `ACTIVITY_RESORT_MS` from now unless one
+/// is already pending. Called from the VTE stamp callbacks, which run outside
+/// the message loop and, for `contents-changed`, per output chunk.
+fn request_resort(pending: &Rc<Cell<bool>>, input: &relm4::Sender<Msg>) {
+    if pending.replace(true) {
+        return;
+    }
+    gtk::glib::timeout_add_local_once(Duration::from_millis(ACTIVITY_RESORT_MS), {
+        let input = input.clone();
+        move || {
+            let _ = input.send(Msg::Resort);
+        }
+    });
+}
+
+/// Disarm a tab's activity sources, then re-arm them after `delay`. Used
+/// once per tab at attach (the whole-screen tmux repaint) and once per
+/// activation (the repaint the pane's program may do on focus — the echo of
+/// the switch itself, which must never reorder an Activity-sorted sidebar).
+fn arm_activity_later(armed: &Rc<Cell<bool>>, delay: Duration) {
+    armed.set(false);
+    gtk::glib::timeout_add_local_once(delay, {
+        let armed = armed.clone();
+        move || armed.set(true)
+    });
 }
 
 /// Whether a key press counts as tab activity. Strict by design: in an agent

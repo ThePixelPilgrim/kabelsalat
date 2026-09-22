@@ -334,6 +334,49 @@ pub fn activity_order(stamps: &[u64]) -> Vec<usize> {
     order
 }
 
+/// One sidebar group as keyboard navigation sees it: its tabs in display
+/// order plus the tab its collapsed row shows (`Group::last_active`, falling
+/// back to the first tab).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavGroup {
+    pub tabs: Vec<usize>,
+    pub representative: usize,
+}
+
+/// The tab Ctrl-Page_Up/Down (`step` = ±1) lands on from `active`, following
+/// what the sidebar shows: the active group is expanded, so a step inside it
+/// moves one row; every other group is a single row showing its
+/// representative, so a step past either end of the active group lands on
+/// the neighbouring group's representative, wrapping around at both ends.
+/// A lone group wraps within itself. `None` when `active` is in no group.
+pub fn nav_target(groups: &[NavGroup], active: usize, step: isize) -> Option<usize> {
+    let (g, pos) = groups.iter().enumerate().find_map(|(g, group)| {
+        group
+            .tabs
+            .iter()
+            .position(|&t| t == active)
+            .map(|pos| (g, pos))
+    })?;
+    let len = groups[g].tabs.len() as isize;
+    let next = pos as isize + step;
+    if (0..len).contains(&next) {
+        return Some(groups[g].tabs[next as usize]);
+    }
+    let count = groups.len() as isize;
+    let mut h = g as isize;
+    for _ in 0..count {
+        h = (h + step.signum()).rem_euclid(count);
+        if h == g as isize {
+            // Every other group is empty (or there is only one): wrap inside.
+            return Some(groups[g].tabs[next.rem_euclid(len) as usize]);
+        }
+        if !groups[h as usize].tabs.is_empty() {
+            return Some(groups[h as usize].representative);
+        }
+    }
+    None
+}
+
 /// Pure reconciliation of saved state against the live session list.
 /// `live` holds the tab UUIDs of running `ks-<uuid>` sessions; `dead` the
 /// subset whose pane has died, with the shell's real exit code.
@@ -857,6 +900,53 @@ mod tests {
         // Equal stamps keep their vec order.
         assert_eq!(activity_order(&[5, 9, 5, 9]), vec![1, 3, 0, 2]);
         assert_eq!(activity_order(&[]), Vec::<usize>::new());
+    }
+
+    fn nav(tabs: &[usize], representative: usize) -> NavGroup {
+        NavGroup {
+            tabs: tabs.to_vec(),
+            representative,
+        }
+    }
+
+    #[test]
+    fn nav_target_steps_inside_the_active_group() {
+        let groups = [nav(&[1, 2, 3], 2), nav(&[4, 5], 5)];
+        assert_eq!(nav_target(&groups, 1, 1), Some(2));
+        assert_eq!(nav_target(&groups, 2, 1), Some(3));
+        assert_eq!(nav_target(&groups, 3, -1), Some(2));
+    }
+
+    #[test]
+    fn nav_target_enters_the_neighbouring_group_on_its_representative() {
+        // Group 1's collapsed row shows tab 5, so that is where a step past
+        // the end of group 0 lands — in either direction, not on the
+        // neighbouring group's first or last tab.
+        let groups = [nav(&[1, 2, 3], 2), nav(&[4, 5, 6], 5)];
+        assert_eq!(nav_target(&groups, 3, 1), Some(5));
+        assert_eq!(nav_target(&groups, 4, -1), Some(2));
+        // Wraps around at both ends.
+        assert_eq!(nav_target(&groups, 6, 1), Some(2));
+        assert_eq!(nav_target(&groups, 1, -1), Some(5));
+    }
+
+    #[test]
+    fn nav_target_skips_empty_groups_and_wraps_a_lone_group() {
+        let groups = [nav(&[], 0), nav(&[1, 2], 1), nav(&[], 0), nav(&[3], 3)];
+        assert_eq!(nav_target(&groups, 2, 1), Some(3));
+        assert_eq!(nav_target(&groups, 1, -1), Some(3));
+        assert_eq!(nav_target(&groups, 3, 1), Some(1));
+
+        let lone = [nav(&[1, 2, 3], 1)];
+        assert_eq!(nav_target(&lone, 3, 1), Some(1));
+        assert_eq!(nav_target(&lone, 1, -1), Some(3));
+        assert_eq!(nav_target(&[nav(&[7], 7)], 7, 1), Some(7));
+    }
+
+    #[test]
+    fn nav_target_is_none_for_an_unknown_tab() {
+        assert_eq!(nav_target(&[nav(&[1, 2], 1)], 9, 1), None);
+        assert_eq!(nav_target(&[], 1, 1), None);
     }
 
     #[test]
