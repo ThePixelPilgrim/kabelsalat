@@ -325,12 +325,28 @@ pub fn newest_first_index(tab_groups: &[usize], group: usize) -> usize {
         .unwrap_or(tab_groups.len())
 }
 
-/// Display order for the activity sort: indices into `stamps` (unix seconds
-/// of each tab's last activity, in vec order), most recent first. Stable, so
-/// tabs with equal stamps keep their vec order.
-pub fn activity_order(stamps: &[u64]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..stamps.len()).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(stamps[i]));
+/// The age bucket an elapsed time (seconds) falls in, as the bucket's lower
+/// bound: `0` for anything under a minute, then whole minutes, hours and
+/// days — exactly the granularity the age prefix labels show. Both the
+/// labels and the activity sort derive from this, so two tabs that read the
+/// same age never swap places.
+pub fn age_bucket(elapsed_secs: u64) -> u64 {
+    let unit = match elapsed_secs {
+        0..60 => return 0,
+        60..3600 => 60,
+        3600..86_400 => 3600,
+        _ => 86_400,
+    };
+    elapsed_secs / unit * unit
+}
+
+/// Display order for the activity sort: indices into `ages` (each tab's age
+/// bucket, `age_bucket`, in vec order), youngest first. Stable, so tabs of
+/// equal age keep their vec order — a burst of output in two "now" tabs
+/// must not make them flap.
+pub fn activity_order(ages: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ages.len()).collect();
+    order.sort_by_key(|&i| ages[i]);
     order
 }
 
@@ -895,11 +911,35 @@ mod tests {
     }
 
     #[test]
-    fn activity_order_is_most_recent_first_and_stable() {
-        assert_eq!(activity_order(&[10, 30, 20]), vec![1, 2, 0]);
-        // Equal stamps keep their vec order.
-        assert_eq!(activity_order(&[5, 9, 5, 9]), vec![1, 3, 0, 2]);
+    fn activity_order_is_youngest_first_and_stable() {
+        assert_eq!(activity_order(&[3600, 0, 60]), vec![1, 2, 0]);
+        // Equal ages keep their vec order.
+        assert_eq!(activity_order(&[60, 0, 60, 0]), vec![1, 3, 0, 2]);
         assert_eq!(activity_order(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn age_bucket_matches_the_label_granularity() {
+        // Everything under a minute is one bucket, so two tabs that both
+        // read "now" compare equal however their seconds differ.
+        assert_eq!(age_bucket(0), 0);
+        assert_eq!(age_bucket(59), 0);
+        assert_eq!(age_bucket(60), 60);
+        assert_eq!(age_bucket(119), 60);
+        assert_eq!(age_bucket(120), 120);
+        assert_eq!(age_bucket(3_599), 59 * 60);
+        assert_eq!(age_bucket(3_600), 3_600);
+        assert_eq!(age_bucket(7_199), 3_600);
+        assert_eq!(age_bucket(86_399), 23 * 3_600);
+        assert_eq!(age_bucket(86_400), 86_400);
+        assert_eq!(age_bucket(40 * 86_400 + 5), 40 * 86_400);
+        // Monotonic: never orders an older tab above a younger one.
+        let samples = [0, 1, 59, 60, 61, 3_599, 3_600, 86_399, 86_400, 900_000];
+        assert!(
+            samples
+                .windows(2)
+                .all(|w| age_bucket(w[0]) <= age_bucket(w[1]))
+        );
     }
 
     fn nav(tabs: &[usize], representative: usize) -> NavGroup {

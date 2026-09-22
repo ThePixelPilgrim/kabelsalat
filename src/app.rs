@@ -3134,16 +3134,20 @@ impl App {
                 members
             }
             SidebarOrder::Activity => {
-                let stamps: Vec<u64> = members
+                // Sort by the age *bucket* the label shows, not the raw
+                // stamp: two tabs that both read "now" keep their vec order
+                // instead of swapping on every chunk of output.
+                let now = SystemTime::now();
+                let ages: Vec<u64> = members
                     .iter()
                     .map(|t| {
-                        t.last_activity
-                            .get()
-                            .duration_since(UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs())
+                        let elapsed = now
+                            .duration_since(t.last_activity.get())
+                            .unwrap_or(Duration::ZERO);
+                        state::age_bucket(elapsed.as_secs())
                     })
                     .collect();
-                state::activity_order(&stamps)
+                state::activity_order(&ages)
                     .into_iter()
                     .map(|i| members[i])
                     .collect()
@@ -3760,7 +3764,9 @@ fn seed_activity(persisted: Option<u64>, now: SystemTime) -> SystemTime {
 /// Age prefix for a tab: minute granularity, never seconds, uncapped at the
 /// day end ("45d" is honest and needs no fourth unit).
 fn age_prefix(elapsed: Duration) -> String {
-    let secs = elapsed.as_secs();
+    // Derived from the same bucket the activity sort uses, so equal labels
+    // always mean equal sort keys.
+    let secs = state::age_bucket(elapsed.as_secs());
     if secs < 60 {
         "now".to_string()
     } else if secs < 3600 {
