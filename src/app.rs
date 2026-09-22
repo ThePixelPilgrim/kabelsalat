@@ -75,13 +75,14 @@ const BROWSER_POLL_SECS: u32 = 2;
 /// How often the tab age prefixes are recomputed. The display has minute
 /// granularity, so a 30 s tick shows a stale "now" for at most 89 s.
 const AGE_TICK_SECS: u32 = 30;
-/// How long after spawn/attach — and after every tab activation — the
-/// activity sources (`contents-changed`, title writes) are ignored.
+/// How long after a tab's first output — and after every tab activation —
+/// the activity sources (`contents-changed`, title writes) stay ignored.
 /// Attaching a tmux session repaints the whole screen; without this window
 /// every restored tab would be stamped "now" and the persisted age seed
 /// (applied right after `add_tab`) would be lost. Activating a tab can
 /// likewise make the program in the pane repaint (focus events), and that
-/// echo of the switch must never reorder an Activity-sorted sidebar.
+/// echo of the switch must never reorder an Activity-sorted sidebar. See
+/// `ActivityArm`.
 const ACTIVITY_SETTLE_MS: u64 = 750;
 
 /// How long after an activity stamp the sidebar re-sorts. The stamps are
@@ -177,11 +178,11 @@ pub struct Tab {
     /// which fires per keystroke and so must not go through the relm4
     /// message loop.
     last_activity: Rc<Cell<SystemTime>>,
-    /// Disarmed while an attach/activation settle window is open — see
-    /// `arm_activity_later`. Shared with the callbacks that stamp
-    /// `last_activity` so a repaint that is merely the echo of a switch
-    /// cannot reorder an Activity-sorted sidebar.
-    armed: Rc<Cell<bool>>,
+    /// Gate on the output/title activity sources — see `ActivityArm`.
+    /// Shared with the callbacks that stamp `last_activity` so a repaint
+    /// that is merely the echo of an attach or a switch cannot reorder an
+    /// Activity-sorted sidebar.
+    armed: Rc<ActivityArm>,
     /// Age prefix currently rendered in the labels; the tick only touches a
     /// label when this changes.
     age_shown: String,
@@ -1114,6 +1115,9 @@ impl SimpleComponent for App {
             // Like the tick: a re-sort is a paint, never a disk write.
             Msg::Resort => {
                 self.resort_pending.set(false);
+                // The stamp that got us here invalidated the stamped tab's
+                // cached age prefix; relabel before the rebuild paints it.
+                self.refresh_ages();
                 self.resort_if_stale();
                 return;
             }
@@ -2481,17 +2485,23 @@ impl App {
         terminal.add_controller(keys);
 
         // Output counts too: anything that changes the visible screen stamps
-        // the tab, once the attach repaint has settled. Known cost: a TUI
-        // that repaints while idle (spinner, clock) keeps its tab fresh.
-        let armed = Rc::new(Cell::new(false));
-        arm_activity_later(&armed, Duration::from_millis(ACTIVITY_SETTLE_MS));
+        // the tab, once the attach repaint has settled. The settle window
+        // opens on the *first* output, not on construction: the attach is
+        // spawned asynchronously and its whole-screen repaint lands well
+        // after a wall-clock window started here would have closed (every
+        // restored tab would then be stamped "now" and its persisted age
+        // lost). Known cost: a TUI that repaints while idle (spinner, clock)
+        // keeps its tab fresh.
+        let armed = Rc::new(ActivityArm::new());
         terminal.connect_contents_changed({
             let armed = armed.clone();
             let last = last_activity.clone();
             let pending = self.resort_pending.clone();
             let input = sender.input_sender().clone();
             move |_| {
-                if armed.get() {
+                if let Some(generation) = armed.output() {
+                    arm_later(&armed, generation);
+                } else if armed.is_armed() {
                     last.set(SystemTime::now());
                     request_resort(&pending, &input);
                 }
@@ -2620,7 +2630,7 @@ impl App {
         // new activity. Reopen the settle window so both stamp sources
         // (output, title) are deaf for a moment; genuine later output still
         // stamps and reorders.
-        arm_activity_later(&tab.armed, Duration::from_millis(ACTIVITY_SETTLE_MS));
+        arm_later(&tab.armed, tab.armed.disarm());
         self.rebuild_list();
         // The main funnel for swapping the parented browser pane. Not the
         // only one: a tab *move* changes the active group with no tab
@@ -3087,7 +3097,7 @@ impl App {
         // title written inside an open settle window (attach or the echo of
         // an activation) is not evidence of activity, so neither fires until
         // the sources are armed again.
-        if tab.armed.get() {
+        if tab.armed.is_armed() {
             tab.last_activity.set(SystemTime::now());
             // `age_shown` caches what the labels render; the stamp above just
             // invalidated it, and the two refreshes below read it. Without this
@@ -3645,15 +3655,67 @@ fn request_resort(pending: &Rc<Cell<bool>>, input: &relm4::Sender<Msg>) {
     });
 }
 
-/// Disarm a tab's activity sources, then re-arm them after `delay`. Used
-/// once per tab at attach (the whole-screen tmux repaint) and once per
-/// activation (the repaint the pane's program may do on focus — the echo of
-/// the switch itself, which must never reorder an Activity-sorted sidebar).
-fn arm_activity_later(armed: &Rc<Cell<bool>>, delay: Duration) {
-    armed.set(false);
-    gtk::glib::timeout_add_local_once(delay, {
+/// The gate on a tab's output and title activity sources. A tab starts
+/// deaf and waiting for its first output (the attach or spawn repaint);
+/// that output opens a settle window, and only its expiry arms the gate.
+/// Every activation reopens the window (`disarm`), since the pane's program
+/// may repaint on focus — the echo of the switch itself, not activity. Each
+/// window carries a generation, so a timer from a superseded window is a
+/// no-op instead of arming early. Pure state: the timers live in
+/// `arm_later`, which keeps this testable.
+#[derive(Debug, Default)]
+struct ActivityArm {
+    armed: Cell<bool>,
+    awaiting_output: Cell<bool>,
+    generation: Cell<u32>,
+}
+
+impl ActivityArm {
+    fn new() -> Self {
+        Self {
+            awaiting_output: Cell::new(true),
+            ..Self::default()
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.get()
+    }
+
+    /// Open a settle window: deaf from now until `arm` is called with the
+    /// returned generation (and no first output is still outstanding).
+    fn disarm(&self) -> u32 {
+        self.armed.set(false);
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        generation
+    }
+
+    /// Output arrived. For the first output after spawn this opens the
+    /// settle window and returns its generation for the caller to `arm`
+    /// later; otherwise `None`, and `is_armed` says whether it counts.
+    fn output(&self) -> Option<u32> {
+        if !self.awaiting_output.replace(false) {
+            return None;
+        }
+        Some(self.disarm())
+    }
+
+    /// A settle window expired. Arms only if it is still the current window
+    /// and the first output has been seen — an activation before the attach
+    /// repaint must not arm ahead of it.
+    fn arm(&self, generation: u32) {
+        if generation == self.generation.get() && !self.awaiting_output.get() {
+            self.armed.set(true);
+        }
+    }
+}
+
+/// Arm `armed` for `generation` once `ACTIVITY_SETTLE_MS` have passed.
+fn arm_later(armed: &Rc<ActivityArm>, generation: u32) {
+    gtk::glib::timeout_add_local_once(Duration::from_millis(ACTIVITY_SETTLE_MS), {
         let armed = armed.clone();
-        move || armed.set(true)
+        move || armed.arm(generation)
     });
 }
 
@@ -4286,6 +4348,51 @@ mod tests {
     }
 
     // --- tab activity sources (v2) ----------------------------------------
+
+    #[test]
+    fn activity_arm_opens_its_window_on_the_first_output() {
+        let arm = ActivityArm::new();
+        assert!(!arm.is_armed());
+        // The attach repaint has not arrived: nothing may arm before it.
+        let early = arm.disarm();
+        arm.arm(early);
+        assert!(!arm.is_armed());
+        // First output opens the window; its expiry arms.
+        let first = arm.output().expect("first output starts the settle window");
+        assert!(!arm.is_armed());
+        arm.arm(first);
+        assert!(arm.is_armed());
+        // Later output is plain activity, not another window.
+        assert_eq!(arm.output(), None);
+        assert!(arm.is_armed());
+    }
+
+    #[test]
+    fn activity_arm_ignores_a_superseded_window() {
+        let arm = ActivityArm::new();
+        arm.arm(arm.output().unwrap());
+        let older = arm.disarm();
+        let newer = arm.disarm();
+        arm.arm(older);
+        assert!(!arm.is_armed(), "the older timer must not arm early");
+        arm.arm(newer);
+        assert!(arm.is_armed());
+    }
+
+    #[test]
+    fn activity_arm_activation_before_attach_does_not_arm_ahead_of_it() {
+        // Restore: add_tab, then activate (disarm), then the activation's
+        // timer, then the attach repaint, then that window's timer.
+        let arm = ActivityArm::new();
+        let activation = arm.disarm();
+        arm.arm(activation);
+        assert!(!arm.is_armed());
+        let attach = arm.output().unwrap();
+        arm.arm(activation);
+        assert!(!arm.is_armed());
+        arm.arm(attach);
+        assert!(arm.is_armed());
+    }
 
     #[test]
     fn only_esc_and_enter_count_as_input_activity() {
