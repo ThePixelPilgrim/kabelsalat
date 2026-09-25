@@ -1,0 +1,57 @@
+config from args: OptionalWprscConfig {
+    print_default_config_and_exit: None,
+    config_file: None,
+    socket: Some(
+        "/home/christoph/Projects/kabelsalat/.poc/run/relay-dev.sock",
+    ),
+    control_socket: Some(
+        "/home/christoph/Projects/kabelsalat/.poc/run/wprsc-dev-ctrl.sock",
+    ),
+    log_file: None,
+    stderr_log_level: None,
+    file_log_level: None,
+    log_priv_data: None,
+    title_prefix: None,
+}
+config file does not exist at "/home/christoph/.config/wprs/wprsc.ron"
+running config: WprscConfig {
+    print_default_config_and_exit: false,
+    config_file: "/home/christoph/.config/wprs/wprsc.ron",
+    socket: "/home/christoph/Projects/kabelsalat/.poc/run/relay-dev.sock",
+    control_socket: "/home/christoph/Projects/kabelsalat/.poc/run/wprsc-dev-ctrl.sock",
+    log_file: None,
+    stderr_log_level: SerializableLevel(
+        Level(
+            Info,
+        ),
+    ),
+    file_log_level: SerializableLevel(
+        Level(
+            Trace,
+        ),
+    ),
+    log_priv_data: false,
+    title_prefix: "",
+}
+[2m2026-09-25T18:26:22.204237Z[0m [33m WARN[0m ThreadId(01) [2mwprs::error_utils[0m[2m:[0m [2msrc/error_utils.rs[0m[2m:[0m[2m144:[0m wprs::client::WprsClientState::new at src/client/mod.rs:187
+
+Caused by:
+    0: wprs::client::WprsClientState::new at src/client/mod.rs:186: wp_viewporter is not available
+    1: the requested global was not found in the registry
+[2m2026-09-25T18:26:22.204280Z[0m [33m WARN[0m ThreadId(01) [2mwprs::error_utils[0m[2m:[0m [2msrc/error_utils.rs[0m[2m:[0m[2m144:[0m wprs::client::WprsClientState::new at src/client/mod.rs:193
+
+Caused by:
+    0: wprs::client::WprsClientState::new at src/client/mod.rs:192: primary selection manager is not available
+    1: the requested global was not found in the registry
+[2m2026-09-25T18:26:22.225372Z[0m [31mERROR[0m ThreadId(01) [1mhandle_request[0m[1m{[0m[3mrequest[0m[2m=[0mObject(Surface(SurfaceRequest { client: ClientId(6961116553929376407), surface: WlSurfaceId(14346554531868693124), payload: Commit(SurfaceState { client: ClientId(6961116553929376407), id: WlSurfaceId(14346554531868693124), buffer: Some(New(Buffer { metadata: BufferMetadata { width: 1280, height: 720, stride: 5120, format: Xrgb8888 }, data: External })), role: Some(XdgToplevel(XdgToplevelState { id: XdgToplevelId(14541413554450306470), parent: None, title: Some("animbox"), app_id: Some("animbox"), decoration_mode: None, maximized: None, fullscreen: None })), buffer_scale: 1, buffer_transform: Some(Normal), opaque_region: None, input_region: None, z_ordered_children: [SubsurfacePosition { id: WlSurfaceId(14346554531868693124), position: Point { x: 0, y: 0 } }], damage: Some([Rectangle { loc: Point { x: 0, y: 0 }, size: Size { w: 1280, h: 720 } }, Rectangle { loc: Point { x: 0, y: 0 }, size: Size { w: 120, h: 120 } }]), output_ids: [], viewport_state: Some(ViewportState { src: None, dst: None }), xdg_surface_state: None }) }))[1m}[0m[2m:[0m [2mwprs::error_utils[0m[2m:[0m [2msrc/error_utils.rs[0m[2m:[0m[2m152:[0m wprs::client::server_handlers::<impl wprs::client::WprsClientState>::handle_request at src/client/server_handlers.rs:603
+
+Caused by:
+    0: wprs::client::server_handlers::<impl wprs::client::WprsClientState>::handle_surface at src/client/server_handlers.rs:224
+    1: wprs::client::server_handlers::<impl wprs::client::WprsClientState>::handle_commit at src/client/server_handlers.rs:93
+    2: Received buffer commit with empty data. This can happen if wprsc reattaches between wprsd sending a buffer message and a commit message.
+server disconnected: Err(wprs::serialization::read_loop at src/serialization/mod.rs:304
+
+Caused by:
+    0: <wprs::serialization::MessageType as wprs::serialization::framing::Framed>::framed_read at src/serialization/mod.rs:286
+    1: <u8 as wprs::serialization::framing::Framed>::framed_read at src/serialization/framing.rs:40
+    2: failed to fill whole buffer)

@@ -1,0 +1,15 @@
+phase u-plasma rate=0 mode=plasma start=1790359393.396618483
+sshexec .092772827
+sshexec .113174063
+sshexec .110008056
+sshexec .112866465
+sshexec .163683640
+sshexec .233361452
+probe 0: before=(16, 192, 16) latency_ms=122 shot_ms=39
+probe 1: before=(208, 16, 16) latency_ms=121 shot_ms=38
+probe 2: before=(16, 192, 16) latency_ms=126 shot_ms=42
+SUMMARY n=3/3 min=121 median=122 max=126 ms
+end=1790359407.790102920
+1790359394.284207783 23520 9684
+1790359407.775806385 24596 9684
+fps=2 fps=61 fps=58 fps=58 fps=48 fps=62 fps=53 fps=61 fps=56 fps=54 fps=57 fps=46 fps=48 fps=61 fps=61 relay: 14 s, down avg 332661 B/s (2.66 Mbit/s), peak 386151 B/s, up avg 58 B/s

@@ -1,0 +1,15 @@
+phase u-idle rate=0 mode=idle start=1790359378.414468103
+sshexec .116972750
+sshexec .170800230
+sshexec .272767386
+sshexec .133494567
+sshexec .249051033
+sshexec .274553597
+probe 0: before=(208, 16, 16) latency_ms=67 shot_ms=12
+probe 1: before=(16, 192, 16) latency_ms=72 shot_ms=11
+probe 2: before=(208, 16, 16) latency_ms=64 shot_ms=11
+SUMMARY n=3/3 min=64 median=67 max=72 ms
+end=1790359393.151642688
+1790359379.038604081 24072 9684
+1790359392.229571287 24116 9684
+fps=53 fps=2 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=1 relay: 15 s, down avg 29943 B/s (0.24 Mbit/s), peak 327983 B/s, up avg 162 B/s

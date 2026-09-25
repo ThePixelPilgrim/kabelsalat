@@ -1,0 +1,11 @@
+[package]
+name = "kst-harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+klamottenkiste = { git = "https://github.com/ThePixelPilgrim/klamottenkiste", tag = "v0.2.1" }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }

@@ -1,0 +1,25 @@
+phase t1-plasma rate=1000000 mode=plasma start=1790360255.617714450
+sshexec .104772297
+sshexec .138351536
+sshexec .136808443
+sshexec .149535114
+sshexec .160400905
+sshexec .102952744
+sshexec .097174474
+sshexec .158968541
+sshexec .242932452
+sshexec .145875971
+sshexec .416725091
+sshexec .104686144
+sshexec .136752869
+sshexec .179445832
+probe 0: before=(16, 192, 16) latency_ms=51345 shot_ms=28
+probe 1: before=(208, 16, 16) latency_ms=TIMEOUT shot_ms=27
+probe 2: before=(208, 16, 16) latency_ms=TIMEOUT shot_ms=28
+SUMMARY n=1/3 min=51345 median=51345 max=51345 ms
+end=1790360458.486062344
+1790360255.662186354 316252 12740
+1790360458.346061656 1494632 12740
+fps=0 fps=58 fps=57 fps=49 fps=42 fps=57 fps=60 fps=64 fps=54 fps=56 fps=57 fps=59 fps=60 fps=55 fps=50 fps=50 fps=52 fps=52 fps=58 fps=49 fps=50 fps=45 fps=51 fps=62 fps=51 fps=56 fps=55 fps=55 fps=60 fps=55 fps=59 fps=53 fps=58 fps=53 fps=63 fps=65 fps=59 fps=59 fps=47 fps=54 fps=54 fps=47 fps=55 fps=53 fps=56 fps=45 fps=57 fps=58 fps=61 fps=59 fps=61 fps=58 fps=63 fps=46 fps=55 fps=43 fps=54 fps=61 fps=63 fps=56 fps=60 fps=62 fps=59 fps=59 fps=53 fps=53 fps=55 fps=62 fps=52 fps=61 fps=57 fps=53 fps=53 fps=58 fps=62 fps=64 fps=62 fps=61 fps=63 fps=63 fps=64 fps=64 fps=62 fps=63 fps=50 fps=54 fps=56 fps=48 fps=53 fps=58 fps=53 fps=55 fps=49 fps=56 fps=59 fps=61 fps=61 fps=62 fps=60 fps=61 fps=60 fps=63 fps=53 fps=58 fps=51 fps=64 fps=52 fps=57 fps=58 fps=52 fps=62 fps=57 fps=57 fps=63 fps=60 fps=63 fps=61 fps=62 fps=63 fps=63 fps=64 fps=64 fps=64 fps=61 fps=63 fps=58 fps=61 fps=63 fps=59 fps=55 fps=56 fps=60 fps=60 fps=51 fps=64 fps=63 fps=64 fps=63 fps=64 fps=65 fps=65 fps=65 fps=65 fps=62 fps=56 fps=58 fps=59 fps=64 fps=62 fps=63 fps=64 fps=64 fps=64 fps=64 fps=64 fps=64 fps=64 fps=63 fps=64 fps=63 fps=65 fps=64 fps=65 fps=58 fps=64 fps=65 fps=64 fps=64 fps=61 fps=61 fps=60 fps=62 fps=60 fps=60 fps=57 fps=57 fps=59 fps=56 fps=55 fps=48 fps=56 fps=61 fps=58 fps=57 fps=61 fps=59 fps=56 fps=59 fps=56 fps=62 fps=56 fps=64 fps=55 fps=64 fps=63 fps=62 fps=60 fps=62 fps=62 fps=61 fps=60 relay: 203 s, down avg 124124 B/s (0.99 Mbit/s), peak 125982 B/s, up avg 12 B/s
+drain: 49.0 MB backlog delivered in 15 s after unthrottle
+1790360472.787487343 496412 12740

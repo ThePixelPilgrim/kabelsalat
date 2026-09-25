@@ -1,0 +1,14 @@
+phase u-noise rate=0 mode=noise start=1790359422.790295953
+sshexec .228164945
+sshexec .335110468
+sshexec .434168331
+sshexec .470744301
+sshexec .453435563
+probe 0: before=(16, 192, 16) latency_ms=26828 shot_ms=24
+probe 1: before=(208, 16, 16) latency_ms=TIMEOUT shot_ms=23
+probe 2: before=(208, 16, 16) latency_ms=6340 shot_ms=24
+SUMMARY n=2/3 min=6340 median=26828 max=26828 ms
+end=1790359529.100305342
+1790359423.595700130 26880 9684
+1790359528.491540305 2235308 13180
+fps=45 fps=51 fps=56 fps=48 fps=56 fps=50 fps=35 fps=39 fps=43 fps=42 fps=46 fps=47 fps=44 fps=41 fps=38 fps=39 fps=45 fps=37 fps=40 fps=34 fps=32 fps=47 fps=43 fps=53 fps=54 fps=50 fps=53 fps=46 fps=52 fps=49 fps=43 fps=42 fps=38 fps=39 fps=37 fps=36 fps=37 fps=42 fps=43 fps=56 fps=25 fps=48 fps=39 fps=22 fps=35 fps=31 fps=34 fps=41 fps=54 fps=49 fps=58 fps=19 fps=24 fps=47 fps=18 fps=26 fps=35 fps=35 fps=46 fps=28 fps=47 fps=44 fps=42 fps=47 fps=31 fps=33 fps=43 fps=42 fps=45 fps=49 fps=43 fps=47 fps=30 fps=32 fps=32 fps=33 fps=29 fps=17 fps=19 fps=28 fps=34 fps=31 fps=30 fps=30 fps=38 fps=48 fps=42 fps=50 fps=52 fps=33 fps=46 fps=39 fps=42 fps=32 fps=32 fps=40 fps=33 fps=34 fps=22 fps=13 fps=35 fps=33 fps=31 fps=24 relay: 107 s, down avg 7657560 B/s (61.26 Mbit/s), peak 10446679 B/s, up avg 30 B/s

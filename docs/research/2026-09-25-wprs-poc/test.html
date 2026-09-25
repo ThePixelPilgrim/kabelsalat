@@ -1,0 +1,17 @@
+<!doctype html><html><head><title>wprs poc</title><style>
+body{font:16px sans-serif;margin:20px}
+#spin{width:120px;height:120px;background:linear-gradient(45deg,#e33,#33e);animation:r 1s linear infinite;margin:10px}
+@keyframes r{to{transform:rotate(360deg)}}
+#box{width:120px;height:120px;background:#d01010}
+</style></head><body>
+<div id="box"></div>
+<p>Type here: <input id="t" autofocus style="font-size:20px"> <span id="echo"></span></p>
+<select id="s" style="font-size:20px"><option>alpha</option><option>beta</option><option>gamma</option></select>
+<div id="spin"></div>
+<script>
+document.getElementById('box').onclick=e=>{const b=e.target;b.style.background=b.style.background.includes('16, 192')?'#d01010':'rgb(16, 192, 16)'};
+document.getElementById('t').oninput=e=>document.getElementById('echo').textContent='echo: '+e.target.value;
+const r=document.getElementById('spin'); const qs=new URLSearchParams(location.search); if(qs.get('spin')!=='1') r.style.animationPlayState='paused';
+let h=''; for(let i=0;i<3000;i++) h+='<p>Line '+i+' — lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore.</p>'; document.body.insertAdjacentHTML('beforeend',h);
+if(qs.get('autoscroll')==='1'){let y=0; (function f(){y+=6; window.scrollTo(0,y%200000); requestAnimationFrame(f)})();}
+</script></body></html>

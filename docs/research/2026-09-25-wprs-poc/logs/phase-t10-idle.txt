@@ -1,0 +1,25 @@
+phase t10-idle rate=10000000 mode=idle start=1790359682.375399318
+sshexec .187061196
+sshexec .291489152
+sshexec .243422613
+sshexec .185756300
+sshexec .205101540
+sshexec .178841469
+sshexec .173200135
+sshexec .212917656
+sshexec .162083278
+sshexec .296569983
+sshexec .148781120
+sshexec .196703719
+sshexec .194727700
+sshexec .213093707
+probe 0: before=(16, 192, 16) latency_ms=108 shot_ms=11
+probe 1: before=(208, 16, 16) latency_ms=81 shot_ms=11
+probe 2: before=(16, 192, 16) latency_ms=73 shot_ms=12
+SUMMARY n=3/3 min=73 median=81 max=108 ms
+end=1790359714.740809142
+1790359683.237016022 65336 13060
+1790359714.064728783 34516 13060
+fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=0 fps=3 relay: 32 s, down avg 124 B/s (0.00 Mbit/s), peak 3959 B/s, up avg 25 B/s
+drain: 0.0 MB backlog delivered in 5 s after unthrottle
+1790359719.385841366 30676 12912

@@ -1,0 +1,15 @@
+phase u-scroll rate=0 mode=scroll start=1790359408.150816652
+sshexec .153287027
+sshexec .082322204
+sshexec .163297773
+sshexec .120172992
+sshexec .103451139
+sshexec .126462937
+probe 0: before=(208, 16, 16) latency_ms=104 shot_ms=25
+probe 1: before=(16, 192, 16) latency_ms=108 shot_ms=20
+probe 2: before=(208, 16, 16) latency_ms=150 shot_ms=19
+SUMMARY n=3/3 min=104 median=108 max=150 ms
+end=1790359422.432948745
+1790359408.798208561 26040 9684
+1790359421.277830419 25588 9684
+fps=53 fps=45 fps=55 fps=49 fps=42 fps=44 fps=43 fps=48 fps=48 fps=47 fps=42 fps=44 fps=42 fps=39 relay: 14 s, down avg 1016310 B/s (8.13 Mbit/s), peak 1281141 B/s, up avg 115 B/s

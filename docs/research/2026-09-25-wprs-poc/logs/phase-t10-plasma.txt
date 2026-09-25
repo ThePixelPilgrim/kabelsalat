@@ -1,0 +1,24 @@
+phase t10-plasma rate=10000000 mode=plasma start=1790359720.385179177
+sshexec .148435419
+sshexec .175630528
+sshexec .232166744
+sshexec .301114773
+sshexec .626043174
+sshexec .287915068
+sshexec .207714005
+sshexec .192865457
+sshexec .326896243
+sshexec .216227714
+sshexec .235903835
+sshexec .855588276
+sshexec .435607239
+probe 0: before=(208, 16, 16) latency_ms=120 shot_ms=40
+probe 1: before=(16, 192, 16) latency_ms=123 shot_ms=42
+probe 2: before=(208, 16, 16) latency_ms=117 shot_ms=38
+SUMMARY n=3/3 min=117 median=120 max=123 ms
+end=1790359752.243781506
+1790359720.438035835 30316 12784
+1790359752.176623863 29232 12760
+fps=0 fps=53 fps=53 fps=46 fps=54 fps=47 fps=52 fps=46 fps=52 fps=37 fps=50 fps=49 fps=50 fps=42 fps=49 fps=50 fps=53 fps=55 fps=44 fps=46 fps=47 fps=42 fps=37 fps=48 fps=42 fps=29 fps=32 fps=40 fps=41 fps=46 fps=56 fps=57 relay: 32 s, down avg 281570 B/s (2.25 Mbit/s), peak 352894 B/s, up avg 76 B/s
+drain: 0.5 MB backlog delivered in 5 s after unthrottle
+1790359757.427615706 29444 12760

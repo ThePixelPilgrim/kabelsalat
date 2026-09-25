@@ -1,0 +1,52 @@
+wayland=wayland-2 control=/tmp/kabelsalat-spike-control-3060795-0.sock
+spawned pid 3060813
+config from args: OptionalWprscConfig {
+    print_default_config_and_exit: None,
+    config_file: None,
+    socket: Some(
+        "/home/christoph/Projects/kabelsalat/.poc/run/relay.sock",
+    ),
+    control_socket: Some(
+        "/home/christoph/Projects/kabelsalat/.poc/run/wprsc-ctrl.sock",
+    ),
+    log_file: None,
+    stderr_log_level: None,
+    file_log_level: None,
+    log_priv_data: None,
+    title_prefix: None,
+}
+config file does not exist at "/home/christoph/.config/wprs/wprsc.ron"
+running config: WprscConfig {
+    print_default_config_and_exit: false,
+    config_file: "/home/christoph/.config/wprs/wprsc.ron",
+    socket: "/home/christoph/Projects/kabelsalat/.poc/run/relay.sock",
+    control_socket: "/home/christoph/Projects/kabelsalat/.poc/run/wprsc-ctrl.sock",
+    log_file: None,
+    stderr_log_level: SerializableLevel(
+        Level(
+            Info,
+        ),
+    ),
+    file_log_level: SerializableLevel(
+        Level(
+            Trace,
+        ),
+    ),
+    log_priv_data: false,
+    title_prefix: "",
+}
+[2m2026-09-25T17:58:50.517844Z[0m [33m WARN[0m ThreadId(01) [2mwprs::error_utils[0m[2m:[0m [2msrc/error_utils.rs[0m[2m:[0m[2m144:[0m wprs::client::WprsClientState::new at src/client/mod.rs:187
+
+Caused by:
+    0: wprs::client::WprsClientState::new at src/client/mod.rs:186: wp_viewporter is not available
+    1: the requested global was not found in the registry
+[2m2026-09-25T17:58:50.517879Z[0m [33m WARN[0m ThreadId(01) [2mwprs::error_utils[0m[2m:[0m [2msrc/error_utils.rs[0m[2m:[0m[2m144:[0m wprs::client::WprsClientState::new at src/client/mod.rs:193
+
+Caused by:
+    0: wprs::client::WprsClientState::new at src/client/mod.rs:192: primary selection manager is not available
+    1: the requested global was not found in the registry
+[2m2026-09-25T18:27:46.708734Z[0m [33m WARN[0m ThreadId(01) [1mhandle_request[0m[1m{[0m[3mrequest[0m[2m=[0mObject(Toplevel(ToplevelRequest { client: ClientId(1309645838520048539), surface: WlSurfaceId(15876943141115323946), payload: SetMaximized }))[1m}[0m[2m:[0m[1mhandle_toplevel[0m[1m{[0m[3mrequest[0m[2m=[0mToplevelRequest { client: ClientId(1309645838520048539), surface: WlSurfaceId(15876943141115323946), payload: SetMaximized }[1m}[0m[2m:[0m [2mwprs::client::server_handlers[0m[2m:[0m [2msrc/client/server_handlers.rs[0m[2m:[0m[2m248:[0m received request for unknown surface
+[2m2026-09-25T18:28:04.841064Z[0m [33m WARN[0m ThreadId(01) [1mhandle_request[0m[1m{[0m[3mrequest[0m[2m=[0mObject(Toplevel(ToplevelRequest { client: ClientId(4638962052468762037), surface: WlSurfaceId(4450797568709641257), payload: SetMaximized }))[1m}[0m[2m:[0m[1mhandle_toplevel[0m[1m{[0m[3mrequest[0m[2m=[0mToplevelRequest { client: ClientId(4638962052468762037), surface: WlSurfaceId(4450797568709641257), payload: SetMaximized }[1m}[0m[2m:[0m [2mwprs::client::server_handlers[0m[2m:[0m [2msrc/client/server_handlers.rs[0m[2m:[0m[2m248:[0m received request for unknown surface
+[2m2026-09-25T18:28:23.004280Z[0m [33m WARN[0m ThreadId(01) [1mhandle_request[0m[1m{[0m[3mrequest[0m[2m=[0mObject(Toplevel(ToplevelRequest { client: ClientId(17076037222444094217), surface: WlSurfaceId(5547757957087067548), payload: SetMaximized }))[1m}[0m[2m:[0m[1mhandle_toplevel[0m[1m{[0m[3mrequest[0m[2m=[0mToplevelRequest { client: ClientId(17076037222444094217), surface: WlSurfaceId(5547757957087067548), payload: SetMaximized }[1m}[0m[2m:[0m [2mwprs::client::server_handlers[0m[2m:[0m [2msrc/client/server_handlers.rs[0m[2m:[0m[2m248:[0m received request for unknown surface
+[2m2026-09-25T18:28:57.320342Z[0m [33m WARN[0m ThreadId(01) [1mhandle_request[0m[1m{[0m[3mrequest[0m[2m=[0mObject(Toplevel(ToplevelRequest { client: ClientId(724974371061924602), surface: WlSurfaceId(12219340630421275212), payload: SetMaximized }))[1m}[0m[2m:[0m[1mhandle_toplevel[0m[1m{[0m[3mrequest[0m[2m=[0mToplevelRequest { client: ClientId(724974371061924602), surface: WlSurfaceId(12219340630421275212), payload: SetMaximized }[1m}[0m[2m:[0m [2mwprs::client::server_handlers[0m[2m:[0m [2msrc/client/server_handlers.rs[0m[2m:[0m[2m248:[0m received request for unknown surface
+[2m2026-09-25T18:34:04.892155Z[0m [33m WARN[0m ThreadId(01) [1mhandle_request[0m[1m{[0m[3mrequest[0m[2m=[0mObject(Toplevel(ToplevelRequest { client: ClientId(4955307839248944229), surface: WlSurfaceId(11953280168061466888), payload: SetMaximized }))[1m}[0m[2m:[0m[1mhandle_toplevel[0m[1m{[0m[3mrequest[0m[2m=[0mToplevelRequest { client: ClientId(4955307839248944229), surface: WlSurfaceId(11953280168061466888), payload: SetMaximized }[1m}[0m[2m:[0m [2mwprs::client::server_handlers[0m[2m:[0m [2msrc/client/server_handlers.rs[0m[2m:[0m[2m248:[0m received request for unknown surface

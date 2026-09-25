@@ -1,0 +1,19 @@
+phase t10-noise rate=10000000 mode=noise start=1790359794.587147071
+sshexec .190840907
+sshexec .172166601
+sshexec .335967681
+sshexec .390557916
+sshexec .218240081
+sshexec .235225740
+sshexec .191546545
+sshexec .198365636
+sshexec .248350755
+probe 0: before=(208, 16, 16) latency_ms=TIMEOUT shot_ms=17
+probe 1: before=(208, 16, 16) latency_ms=TIMEOUT shot_ms=17
+SUMMARY n=0/2 all timed out
+end=1790359935.663963701
+1790359794.665898160 28700 12740
+1790359935.241999453 3610640 12740
+fps=0 fps=43 fps=45 fps=41 fps=45 fps=40 fps=35 fps=28 fps=35 fps=40 fps=37 fps=42 fps=42 fps=44 fps=36 fps=39 fps=47 fps=40 fps=36 fps=41 fps=44 fps=44 fps=39 fps=45 fps=42 fps=45 fps=42 fps=42 fps=39 fps=41 fps=39 fps=40 fps=46 fps=44 fps=40 fps=39 fps=31 fps=36 fps=42 fps=43 fps=42 fps=39 fps=40 fps=43 fps=45 fps=43 fps=46 fps=43 fps=39 fps=33 fps=39 fps=38 fps=43 fps=43 fps=42 fps=45 fps=35 fps=40 fps=28 fps=34 fps=40 fps=31 fps=44 fps=41 fps=40 fps=36 fps=32 fps=40 fps=41 fps=41 fps=42 fps=44 fps=43 fps=47 fps=44 fps=39 fps=31 fps=43 fps=47 fps=46 fps=43 fps=40 fps=39 fps=45 fps=39 fps=49 fps=55 fps=48 fps=42 fps=43 fps=47 fps=44 fps=50 fps=43 fps=45 fps=50 fps=45 fps=48 fps=54 fps=46 fps=40 fps=42 fps=46 fps=48 fps=38 fps=45 fps=44 fps=49 fps=52 fps=46 fps=46 fps=50 fps=50 fps=43 fps=43 fps=35 fps=50 fps=49 fps=44 fps=49 fps=41 fps=49 fps=46 fps=48 fps=42 fps=38 fps=42 fps=48 fps=48 fps=38 fps=44 fps=49 fps=46 fps=44 fps=53 fps=41 fps=55 fps=54 fps=50 fps=50 relay: 141 s, down avg 1241727 B/s (9.93 Mbit/s), peak 1291506 B/s, up avg 11 B/s
+drain: 2762.2 MB backlog delivered in 282 s after unthrottle
+1790360217.551359905 2996840 12740

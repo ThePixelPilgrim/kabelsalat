@@ -1,0 +1,24 @@
+phase t10-scroll rate=10000000 mode=scroll start=1790359757.982747499
+sshexec .125821440
+sshexec .234367996
+sshexec .243085188
+sshexec .180872712
+sshexec .191960053
+sshexec .274906782
+sshexec .339456075
+sshexec .316228491
+sshexec .226817530
+sshexec .199564111
+sshexec .196118066
+sshexec .197565951
+sshexec .216567343
+probe 0: before=(16, 192, 16) latency_ms=106 shot_ms=27
+probe 1: before=(208, 16, 16) latency_ms=139 shot_ms=27
+probe 2: before=(16, 192, 16) latency_ms=188 shot_ms=24
+SUMMARY n=3/3 min=106 median=139 max=188 ms
+end=1790359788.599043271
+1790359758.460898822 29556 12760
+1790359788.287591649 28672 12740
+fps=0 fps=43 fps=37 fps=33 fps=40 fps=42 fps=36 fps=37 fps=37 fps=42 fps=31 fps=31 fps=31 fps=37 fps=32 fps=39 fps=33 fps=33 fps=36 fps=35 fps=44 fps=39 fps=36 fps=43 fps=43 fps=41 fps=43 fps=38 fps=35 fps=34 relay: 30 s, down avg 873393 B/s (6.99 Mbit/s), peak 1030978 B/s, up avg 54 B/s
+drain: 0.7 MB backlog delivered in 5 s after unthrottle
+1790359793.628496033 28700 12740
