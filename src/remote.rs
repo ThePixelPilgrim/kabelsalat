@@ -366,6 +366,21 @@ pub enum ControlOp {
     Exit,
 }
 
+/// File name of `dest`'s master socket: a fixed FNV-1a hash of the
+/// destination, not ssh's `%C`. `%C` hashes in `%j` (ProxyJump), and the
+/// tabs' `-o ProxyCommand=false` clears ProxyJump, so for a host with a
+/// ProxyJump in `~/.ssh/config` the tabs would look for a different socket
+/// than the master's and never find it. A literal name is the same for every
+/// command; `ks-` plus 16 hex digits stays far below the socket path limit.
+pub fn control_socket_name(dest: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in dest.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("ks-{hash:016x}")
+}
+
 pub fn control_argv(dest: &str, control_path: &Path, op: ControlOp) -> Vec<String> {
     let op = match op {
         ControlOp::Check => "check",
@@ -887,6 +902,19 @@ mod tests {
             control_argv("me@box", Path::new("/c/%C"), ControlOp::Exit),
             ["ssh", "-S", "/c/%C", "-O", "exit", "me@box"]
         );
+    }
+
+    #[test]
+    fn the_control_socket_is_named_by_the_destination_alone() {
+        let name = control_socket_name("me@box");
+        // Stable across runs and builds: a master left running by the last
+        // run must be found again.
+        assert_eq!(name, control_socket_name("me@box"));
+        assert_eq!(name, "ks-fae6588ce9ae0dd2");
+        assert_ne!(name, control_socket_name("me@box2"));
+        // No ssh tokens: every command must name the same literal file.
+        assert!(!control_socket_name("%C%j@h").contains('%'));
+        assert!(name.len() < 32);
     }
 
     #[test]

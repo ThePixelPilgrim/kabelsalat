@@ -2047,7 +2047,7 @@ impl App {
     }
 
     fn spawn_worker(&self, host: &str) -> Result<HostLink, String> {
-        let control_path = remote_worker::control_path()
+        let control_path = remote_worker::control_path(host)
             .map_err(|err| format!("no directory for the ssh control socket: {err}"))?;
         let input = self.input.clone();
         let reply_host = host.to_string();
