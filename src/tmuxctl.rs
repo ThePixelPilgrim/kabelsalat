@@ -313,7 +313,8 @@ impl TmuxCtl {
     }
 
     /// A handle for `dest`'s shared server, through the master at
-    /// `control_path` (`…/ssh/%C`, expanded by ssh itself).
+    /// `control_path` (`…/ssh/ks-<hash of dest>`, see
+    /// `remote::control_socket_name`).
     pub fn remote(dest: &str, control_path: &Path) -> Self {
         Self {
             target: Target::Remote {
