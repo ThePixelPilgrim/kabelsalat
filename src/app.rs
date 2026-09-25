@@ -846,8 +846,8 @@ impl SimpleComponent for App {
 
         // Watch the pane-died events directory before reconciling so no crash
         // report is missed; clear stale files from previous runs first.
-        if let Some(ctl) = &model.tmux {
-            let events_dir = ctl.events_dir().to_path_buf();
+        if let Some(events_dir) = model.tmux.as_ref().and_then(|ctl| ctl.events_dir()) {
+            let events_dir = events_dir.to_path_buf();
             if let Ok(entries) = std::fs::read_dir(&events_dir) {
                 for entry in entries.flatten() {
                     let _ = std::fs::remove_file(entry.path());

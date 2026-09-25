@@ -6,7 +6,9 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+use crate::remote;
 
 /// Minimum tmux version required for `remain-on-exit failed` and
 /// `prefix None`.
@@ -246,14 +248,42 @@ set -g default-terminal xterm-256color
 set-hook -g pane-died 'run-shell \"printf \\\"%s %s\\\" \\\"#{session_name}\\\" \\\"#{pane_dead_status}\\\" > \\\"{events_dir}/#{session_name}\\\"\"'
 ";
 
-/// Handle to the private kabelsalat tmux server: socket, config and
-/// event-file paths. Construction writes the config and creates the
-/// runtime directories.
+/// The config every remote server is given (`source-file -`): `TMUX_CONF`
+/// without the pane-died file hook, which writes into a *local* directory.
+/// Remote crashes are read from `pane_dead` in `list-sessions` instead.
+/// Shared by every kabelsalat version on the host, so changes to
+/// `TMUX_CONF` must stay backward compatible.
+pub fn remote_conf() -> String {
+    TMUX_CONF
+        .lines()
+        .filter(|line| !line.starts_with("set-hook -g pane-died"))
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+/// Where a [`TmuxCtl`] sends its commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The private local server: its socket, the config file it is started
+    /// with, and the directory the pane-died hook writes into.
+    Local {
+        socket: PathBuf,
+        conf: PathBuf,
+        events_dir: PathBuf,
+    },
+    /// The shared `tmux -L kabelsalat` server on a remote host, reached
+    /// through that host's ssh control master. The same argv builders and
+    /// parsers apply; the argv is wrapped in ssh and quoted for the remote
+    /// login shell.
+    Remote { dest: String, control_path: PathBuf },
+}
+
+/// Handle to a kabelsalat tmux server: the private local one, or a remote
+/// host's. Local construction writes the config and creates the runtime
+/// directories; a remote handle is plain data.
 #[derive(Debug, Clone)]
 pub struct TmuxCtl {
-    socket: PathBuf,
-    conf: PathBuf,
-    events_dir: PathBuf,
+    target: Target,
 }
 
 impl TmuxCtl {
@@ -274,15 +304,77 @@ impl TmuxCtl {
         let body = TMUX_CONF.replace("{events_dir}", &events_dir.to_string_lossy());
         std::fs::write(&conf, body)?;
         Ok(Self {
-            socket: runtime_dir.join("tmux.sock"),
-            conf,
-            events_dir,
+            target: Target::Local {
+                socket: runtime_dir.join("tmux.sock"),
+                conf,
+                events_dir,
+            },
         })
     }
 
+    /// A handle for `dest`'s shared server, through the master at
+    /// `control_path` (`…/ssh/%C`, expanded by ssh itself).
+    pub fn remote(dest: &str, control_path: &Path) -> Self {
+        Self {
+            target: Target::Remote {
+                dest: dest.to_string(),
+                control_path: control_path.to_path_buf(),
+            },
+        }
+    }
+
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self.target, Target::Remote { .. })
+    }
+
     /// Directory the pane-died hook writes "<uuid> <exit-code>" files into.
-    pub fn events_dir(&self) -> &Path {
-        &self.events_dir
+    /// Local only: the hook is not installed on remote servers.
+    pub fn events_dir(&self) -> Option<&Path> {
+        match &self.target {
+            Target::Local { events_dir, .. } => Some(events_dir),
+            Target::Remote { .. } => None,
+        }
+    }
+
+    /// Full argv for one tmux subcommand against this target: `tmux -S <sock>
+    /// <args>` locally, or the same tmux words behind `ssh … <dest> --`
+    /// (quoted once more for the login shell, no tty) on a remote host.
+    pub fn command_argv(&self, args: &[String]) -> Vec<String> {
+        match &self.target {
+            Target::Local { socket, .. } => {
+                let mut argv = vec![
+                    "tmux".to_string(),
+                    "-S".into(),
+                    socket.to_string_lossy().into_owned(),
+                ];
+                argv.extend(args.iter().cloned());
+                argv
+            }
+            Target::Remote { dest, control_path } => {
+                let mut remote_argv = remote::remote_tmux_prefix();
+                remote_argv.extend(args.iter().cloned());
+                remote::mux_argv(dest, control_path, false, &remote_argv)
+            }
+        }
+    }
+
+    /// A ready-to-run `Command` for `args`. Remote commands get stdin from
+    /// `/dev/null`: ssh would otherwise read the app's own stdin.
+    fn command(&self, args: &[String]) -> Result<Command, TmuxError> {
+        let argv = self.command_argv(args);
+        let (program, rest) = argv
+            .split_first()
+            .ok_or_else(|| TmuxError::Command("empty tmux argv".into()))?;
+        let mut command = Command::new(program);
+        command.args(rest);
+        if self.is_remote() {
+            command.stdin(Stdio::null());
+        }
+        Ok(command)
     }
 
     /// Argv for spawning (or reattaching) the backing session of a tab:
@@ -304,6 +396,10 @@ impl TmuxCtl {
     /// wants a single shell-command string, so it is quoted and joined here
     /// rather than handed to tmux as separate words (tmux would re-join them
     /// on spaces and lose the original boundaries).
+    ///
+    /// On a remote target the argv is `ssh … -t <dest> -- '<tmux words>'`,
+    /// and without `command` no shell-command word is passed at all, so tmux
+    /// starts the remote user's default shell.
     pub fn spawn_argv(
         &self,
         uuid: &str,
@@ -311,50 +407,66 @@ impl TmuxCtl {
         command: Option<&[String]>,
         env: &[(&str, &str)],
     ) -> Vec<String> {
-        let mut argv = vec![
-            "tmux".into(),
-            "-S".into(),
-            self.socket.to_string_lossy().into_owned(),
-            "-f".into(),
-            self.conf.to_string_lossy().into_owned(),
-            "new-session".into(),
-            "-A".into(),
-        ];
+        let mut session: Vec<String> = vec!["new-session".into(), "-A".into()];
         // -e stamps the variable into the new session's environment table
         // atomically with its creation, so the very first shell already
         // inherits it. Like -c, it takes effect only when the session is
         // created; a -A reattach ignores it (reattached sessions get an
         // explicit refresh instead).
         for (key, value) in env {
-            argv.push("-e".into());
-            argv.push(format!("{key}={value}"));
+            session.push("-e".into());
+            session.push(format!("{key}={value}"));
         }
         if let Some(dir) = cwd {
-            argv.push("-c".into());
-            argv.push(escape_tmux_format(&dir.to_string_lossy()));
+            session.push("-c".into());
+            session.push(escape_tmux_format(&dir.to_string_lossy()));
         }
-        argv.push("-s".into());
-        argv.push(format!("{SESSION_PREFIX}{uuid}"));
-        argv.push(match command {
-            Some(command) if !command.is_empty() => shell_quote_argv(command),
-            _ => std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into()),
-        });
-        argv
+        session.push("-s".into());
+        session.push(format!("{SESSION_PREFIX}{uuid}"));
+        let command = command
+            .filter(|command| !command.is_empty())
+            .map(shell_quote_argv);
+        match &self.target {
+            Target::Local { socket, conf, .. } => {
+                let mut argv = vec![
+                    "tmux".to_string(),
+                    "-S".into(),
+                    socket.to_string_lossy().into_owned(),
+                    "-f".into(),
+                    conf.to_string_lossy().into_owned(),
+                ];
+                argv.extend(session);
+                argv.push(command.unwrap_or_else(|| {
+                    std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
+                }));
+                argv
+            }
+            Target::Remote { dest, control_path } => {
+                let mut remote_argv = remote::remote_tmux_prefix();
+                remote_argv.extend(session);
+                remote_argv.extend(command);
+                remote::mux_argv(dest, control_path, true, &remote_argv)
+            }
+        }
+    }
+
+    /// Argv tail of the `pane_current_path` query.
+    pub fn pane_current_path_args(uuid: &str) -> Vec<String> {
+        vec![
+            "display-message".into(),
+            "-p".into(),
+            "-t".into(),
+            format!("{SESSION_PREFIX}{uuid}"),
+            "#{pane_current_path}".into(),
+        ]
     }
 
     /// The current working directory of a tab's tmux pane, via
     /// `display-message -p -t ks-<uuid> '#{pane_current_path}'`. An empty
     /// reply (no such pane) is a `Parse` error rather than a bogus path.
     pub fn pane_current_path(&self, uuid: &str) -> Result<PathBuf, TmuxError> {
-        let output = Command::new("tmux")
-            .args(["-S", &self.socket.to_string_lossy()])
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &format!("{SESSION_PREFIX}{uuid}"),
-                "#{pane_current_path}",
-            ])
+        let output = self
+            .command(&Self::pane_current_path_args(uuid))?
             .output()?;
         if !output.status.success() {
             return Err(TmuxError::Command(
@@ -379,12 +491,17 @@ impl TmuxCtl {
     /// scope. An explicit detached `start-server` claims the socket first, and
     /// later clients merely attach to the already-running server.
     pub fn server_start_argv(&self, use_systemd_run: bool) -> Vec<String> {
+        // A remote server is started by its host's connect sequence
+        // (remote::start_server_argv), never from here.
+        let Target::Local { socket, conf, .. } = &self.target else {
+            return Vec::new();
+        };
         let tmux = vec![
             "tmux".to_string(),
             "-S".into(),
-            self.socket.to_string_lossy().into_owned(),
+            socket.to_string_lossy().into_owned(),
             "-f".into(),
-            self.conf.to_string_lossy().into_owned(),
+            conf.to_string_lossy().into_owned(),
             "start-server".into(),
         ];
         if use_systemd_run {
@@ -406,8 +523,16 @@ impl TmuxCtl {
     /// only means clients will start the server themselves (attached, so it
     /// won't survive logout), which is the pre-existing fallback behavior.
     pub fn ensure_server(&self, use_systemd_run: bool) -> Result<(), TmuxError> {
+        let Target::Local { socket, conf, .. } = &self.target else {
+            return Err(TmuxError::Command(
+                "a remote server is started by its host's connect sequence".into(),
+            ));
+        };
         let argv = self.server_start_argv(use_systemd_run);
-        let output = Command::new(&argv[0]).args(&argv[1..]).output()?;
+        let (program, rest) = argv
+            .split_first()
+            .ok_or_else(|| TmuxError::Command("empty tmux argv".into()))?;
+        let output = Command::new(program).args(rest).output()?;
         if !output.status.success() {
             return Err(TmuxError::Command(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -418,9 +543,9 @@ impl TmuxCtl {
         // newer binary. Live sessions are unaffected.
         let output = Command::new("tmux")
             .arg("-S")
-            .arg(&self.socket)
+            .arg(socket)
             .arg("source-file")
-            .arg(&self.conf)
+            .arg(conf)
             .output()?;
         if output.status.success() {
             Ok(())
@@ -431,25 +556,47 @@ impl TmuxCtl {
         }
     }
 
+    /// Argv tail of the session listing: name, pane-dead flag, dead status.
+    pub fn list_sessions_args() -> Vec<String> {
+        vec![
+            "list-sessions".into(),
+            "-F".into(),
+            "#{session_name}\t#{pane_dead}\t#{pane_dead_status}".into(),
+        ]
+    }
+
     /// List live `ks-*` sessions with their pane-dead state.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>, TmuxError> {
-        let output = Command::new("tmux")
-            .args(["-S", &self.socket.to_string_lossy()])
-            .args([
-                "list-sessions",
-                "-F",
-                "#{session_name}\t#{pane_dead}\t#{pane_dead_status}",
-            ])
-            .output()?;
-        if !output.status.success() {
-            // A missing socket / stopped server simply means no sessions.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if is_no_server_stderr(&stderr) {
+        let output = self.command(&Self::list_sessions_args())?.output()?;
+        self.list_sessions_from_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    /// Interpret a finished `list-sessions`. A stopped server is an empty
+    /// list, not an error. On a remote target only tmux's own exit status 1
+    /// can say that: ssh's 255 (or no status at all) is the transport
+    /// failing, which says nothing about the sessions — and ssh's errors can
+    /// contain "No such file" too. Mistaking one for "empty" would close
+    /// live tabs.
+    pub fn list_sessions_from_output(
+        &self,
+        code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<Vec<SessionInfo>, TmuxError> {
+        if code != Some(0) {
+            let from_tmux = !self.is_remote() || code == Some(1);
+            if from_tmux && is_no_server_stderr(stderr) {
                 return Ok(Vec::new());
+            }
+            if self.is_remote() && code == Some(remote::SSH_FAILED) {
+                return Err(TmuxError::Command(format!("ssh: {}", stderr.trim())));
             }
             return Err(TmuxError::Command(stderr.trim().to_string()));
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let mut sessions = Vec::new();
         for line in stdout.lines() {
             if let Some(session) = parse_session_line(line)? {
@@ -459,14 +606,32 @@ impl TmuxCtl {
         Ok(sessions)
     }
 
+    /// Argv tail that kills a tab's session.
+    pub fn kill_session_args(uuid: &str) -> Vec<String> {
+        vec![
+            "kill-session".into(),
+            "-t".into(),
+            format!("{SESSION_PREFIX}{uuid}"),
+        ]
+    }
+
     /// Kill the backing session of a tab (explicit tab close).
     pub fn kill_session(&self, uuid: &str) -> Result<(), TmuxError> {
-        self.run(&["kill-session", "-t", &format!("{SESSION_PREFIX}{uuid}")])
+        self.run(&Self::kill_session_args(uuid))
+    }
+
+    /// Argv tail that reruns the shell in a tab's dead pane.
+    pub fn respawn_pane_args(uuid: &str) -> Vec<String> {
+        vec![
+            "respawn-pane".into(),
+            "-t".into(),
+            format!("{SESSION_PREFIX}{uuid}"),
+        ]
     }
 
     /// Rerun the shell in a crashed tab's dead pane (tab restart).
     pub fn respawn_pane(&self, uuid: &str) -> Result<(), TmuxError> {
-        self.run(&["respawn-pane", "-t", &format!("{SESSION_PREFIX}{uuid}")])
+        self.run(&Self::respawn_pane_args(uuid))
     }
 
     /// Argv tail for publishing one variable into a tab's session environment.
@@ -496,23 +661,16 @@ impl TmuxCtl {
     /// by processes created in the session afterwards; a process already
     /// running sees it only by querying `show-environment`.
     pub fn set_environment(&self, uuid: &str, key: &str, value: &str) -> Result<(), TmuxError> {
-        let args = Self::set_environment_args(uuid, key, value);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(&refs)
+        self.run(&Self::set_environment_args(uuid, key, value))
     }
 
     /// Remove `key` from a tab session's environment table.
     pub fn unset_environment(&self, uuid: &str, key: &str) -> Result<(), TmuxError> {
-        let args = Self::unset_environment_args(uuid, key);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(&refs)
+        self.run(&Self::unset_environment_args(uuid, key))
     }
 
-    fn run(&self, args: &[&str]) -> Result<(), TmuxError> {
-        let output = Command::new("tmux")
-            .args(["-S", &self.socket.to_string_lossy()])
-            .args(args)
-            .output()?;
+    fn run(&self, args: &[String]) -> Result<(), TmuxError> {
+        let output = self.command(args)?.output()?;
         if output.status.success() {
             Ok(())
         } else {
@@ -990,12 +1148,13 @@ mod tests {
     fn writes_config_with_events_dir() {
         let dir = temp_dir("conf");
         let ctl = test_ctl(&dir);
+        let events_dir = ctl.events_dir().unwrap().to_path_buf();
         let conf = std::fs::read_to_string(dir.join("state/tmux.conf")).unwrap();
         assert!(conf.contains("set -g status off"));
         assert!(conf.contains("remain-on-exit failed"));
-        assert!(conf.contains(&*ctl.events_dir().to_string_lossy()));
+        assert!(conf.contains(&*events_dir.to_string_lossy()));
         assert!(!conf.contains("{events_dir}"));
-        assert!(ctl.events_dir().is_dir());
+        assert!(events_dir.is_dir());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1181,5 +1340,233 @@ mod tests {
         ctl.kill_session("itest").unwrap();
         assert!(ctl.list_sessions().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- remote target ---
+
+    fn remote_ctl() -> TmuxCtl {
+        TmuxCtl::remote("me@box", Path::new("/run/ks/ssh/%C"))
+    }
+
+    /// The words `sh` makes of a string of shell words (see remote.rs).
+    fn sh_words(command: &str) -> Vec<String> {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\037' {command}"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let mut words: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .split('\u{1f}')
+            .map(String::from)
+            .collect();
+        words.pop();
+        words
+    }
+
+    #[test]
+    fn a_local_ctl_targets_its_socket() {
+        let dir = temp_dir("target-local");
+        let ctl = test_ctl(&dir);
+        assert!(!ctl.is_remote());
+        assert!(matches!(ctl.target(), Target::Local { .. }));
+        let argv = ctl.command_argv(&TmuxCtl::kill_session_args("abc"));
+        assert_eq!(argv[0], "tmux");
+        assert_eq!(argv[1], "-S");
+        assert!(argv[2].ends_with("run/tmux.sock"));
+        assert_eq!(&argv[3..], ["kill-session", "-t", "ks-abc"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_remote_ctl_wraps_the_same_command_in_ssh() {
+        let ctl = remote_ctl();
+        assert!(ctl.is_remote());
+        assert_eq!(ctl.events_dir(), None);
+        let argv = ctl.command_argv(&TmuxCtl::kill_session_args("abc"));
+        assert_eq!(&argv[..3], ["ssh", "-S", "/run/ks/ssh/%C"]);
+        assert!(argv.contains(&"ControlMaster=no".to_string()));
+        assert!(argv.contains(&"BatchMode=yes".to_string()));
+        // No pty for a query.
+        assert!(!argv[..argv.len() - 1].contains(&"-t".to_string()));
+        assert_eq!(
+            sh_words(argv.last().unwrap()),
+            [
+                "tmux",
+                "-L",
+                "kabelsalat",
+                "-f",
+                "/dev/null",
+                "kill-session",
+                "-t",
+                "ks-abc"
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_spawn_argv_attaches_through_the_master_with_a_tty() {
+        let argv = remote_ctl().spawn_argv("1234", Some(Path::new("/srv/#x")), None, &[]);
+        assert_eq!(&argv[..3], ["ssh", "-S", "/run/ks/ssh/%C"]);
+        let dest = argv.iter().position(|a| a == "me@box").unwrap();
+        assert_eq!(argv[dest - 1], "-t");
+        assert_eq!(argv[dest + 1], "--");
+        assert_eq!(dest + 3, argv.len());
+        // No command: no shell-command word at all, so tmux starts the remote
+        // user's default shell — the local $SHELL means nothing there.
+        assert_eq!(
+            sh_words(&argv[dest + 2]),
+            [
+                "tmux",
+                "-L",
+                "kabelsalat",
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-A",
+                "-c",
+                "/srv/##x",
+                "-s",
+                "ks-1234"
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_spawn_argv_quotes_the_command_for_both_shells() {
+        let command = vec!["echo".to_string(), "it's $HOME".to_string()];
+        let argv = remote_ctl().spawn_argv("1234", None, Some(&command), &[]);
+        let words = sh_words(argv.last().unwrap());
+        assert_eq!(&words[5..9], ["new-session", "-A", "-s", "ks-1234"]);
+        assert_eq!(words.len(), 10);
+        // tmux hands its one shell-command word to `sh -c`, which must see
+        // the original argv again.
+        assert_eq!(sh_words(&words[9]), command);
+    }
+
+    #[test]
+    fn a_remote_ssh_failure_is_never_an_empty_session_list() {
+        let ctl = remote_ctl();
+        // ssh's own failure, even with a "No such file" in its stderr.
+        assert!(
+            ctl.list_sessions_from_output(
+                Some(255),
+                "",
+                "Control socket connect(/run/ks/ssh/x): No such file or directory"
+            )
+            .is_err()
+        );
+        // ssh never ran (spawn error): no status at all.
+        assert!(
+            ctl.list_sessions_from_output(None, "", "No such file or directory (os error 2)")
+                .is_err()
+        );
+        // The remote shell has no tmux.
+        assert!(
+            ctl.list_sessions_from_output(Some(127), "", "tmux: command not found")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_remote_server_that_is_not_running_is_an_empty_list() {
+        let ctl = remote_ctl();
+        assert_eq!(
+            ctl.list_sessions_from_output(
+                Some(1),
+                "",
+                "no server running on /tmp/tmux-1000/kabelsalat\n"
+            )
+            .unwrap(),
+            Vec::new()
+        );
+        assert_eq!(
+            ctl.list_sessions_from_output(
+                Some(1),
+                "",
+                "error connecting to /tmp/tmux-1000/kabelsalat (No such file or directory)\n"
+            )
+            .unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn list_sessions_from_output_parses_both_targets_alike() {
+        let dir = temp_dir("target-parse");
+        let local = test_ctl(&dir);
+        for ctl in [&local, &remote_ctl()] {
+            let sessions = ctl
+                .list_sessions_from_output(Some(0), "ks-a\t0\t\nother\t0\t\nks-b\t1\t2\n", "")
+                .unwrap();
+            assert_eq!(
+                sessions,
+                vec![
+                    SessionInfo {
+                        uuid: "a".into(),
+                        pane_dead: false,
+                        dead_status: None
+                    },
+                    SessionInfo {
+                        uuid: "b".into(),
+                        pane_dead: true,
+                        dead_status: Some(2)
+                    },
+                ]
+            );
+        }
+        // Local keeps its old rule: any no-server stderr is an empty list.
+        assert!(
+            local
+                .list_sessions_from_output(Some(1), "", "no server running on /x")
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_remote_ctl_does_not_start_a_local_server() {
+        let ctl = remote_ctl();
+        assert!(ctl.server_start_argv(false).is_empty());
+        assert!(ctl.ensure_server(false).is_err());
+    }
+
+    #[test]
+    fn the_remote_config_is_the_local_one_without_the_file_hook() {
+        let remote = remote_conf();
+        assert!(!remote.contains("pane-died"));
+        assert!(!remote.contains("{events_dir}"));
+        assert!(remote.contains("remain-on-exit failed"));
+        assert!(remote.contains("set -s exit-empty off"));
+        assert!(remote.contains("set -g prefix None"));
+        assert_eq!(remote.lines().count(), TMUX_CONF.lines().count() - 1);
+    }
+
+    #[test]
+    fn query_argv_builders_keep_their_shapes() {
+        assert_eq!(
+            TmuxCtl::list_sessions_args(),
+            [
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{pane_dead}\t#{pane_dead_status}"
+            ]
+        );
+        assert_eq!(
+            TmuxCtl::respawn_pane_args("u"),
+            ["respawn-pane", "-t", "ks-u"]
+        );
+        assert_eq!(
+            TmuxCtl::pane_current_path_args("u"),
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "ks-u",
+                "#{pane_current_path}"
+            ]
+        );
     }
 }
