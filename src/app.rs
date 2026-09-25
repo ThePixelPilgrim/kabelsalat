@@ -151,6 +151,9 @@ const DRAG_THRESHOLD_PX: f64 = 8.0;
 /// exactly as if the user had pressed the keys.
 const CTRL_V: u8 = 0x16;
 
+/// Toast for a tab move across hosts, the drop-time authority's refusal.
+const CROSS_HOST_TOAST: &str = "Can't move a tab between hosts";
+
 /// Floor for the *active* tab. It is deliberately a floor and not a pin: every
 /// tab asks for its full title as natural width, so it renders unabbreviated
 /// whenever the bar has the room, and only gives ground when the window is
@@ -438,6 +441,10 @@ pub struct App {
     /// Icon name for the group drag handle, resolved once against the
     /// display's cached icon theme.
     drag_handle_icon: &'static str,
+    /// Per-render host table behind the `tab:<id>:<host-key>` drag payloads:
+    /// the key is `local` or an index into this list, so a `:` in a
+    /// destination cannot break the payload. Rebuilt by `rebuild_list`.
+    host_keys: RefCell<Vec<String>>,
 }
 
 /// Decide whether a sidebar `row-selected` event is a user action that
@@ -977,6 +984,7 @@ impl SimpleComponent for App {
             pending_kills: Vec::new(),
             reselecting: Rc::new(Cell::new(false)),
             drag_handle_icon,
+            host_keys: RefCell::new(Vec::new()),
         };
 
         let tab_list = model.tab_list.clone();
@@ -2895,10 +2903,27 @@ impl App {
 
     fn move_active_tab(&mut self, target: Option<usize>) {
         let Some(active) = self.active else { return };
+        let Some(src_group) = self.tabs.iter().find(|t| t.id == active).map(|t| t.group) else {
+            return;
+        };
+        let src_host = self.group_host(src_group);
         let target = match target {
-            Some(id) if self.groups.iter().any(|g| g.id == id) => id,
+            Some(id) if self.groups.iter().any(|g| g.id == id) => {
+                if !state::drop_allowed(src_host.as_deref(), self.group_host(id).as_deref()) {
+                    self.show_toast(CROSS_HOST_TOAST);
+                    return;
+                }
+                id
+            }
             Some(_) => return, // group vanished while the picker was open
-            None => self.create_group(),
+            // A new group on the tab's own host: a move never changes hosts.
+            None => {
+                let id = self.create_group();
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    group.host = src_host;
+                }
+                id
+            }
         };
         let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active) else {
             return;
@@ -2933,6 +2958,7 @@ impl App {
         let list = gtk::ListBox::new();
         list.add_css_class("navigation-sidebar");
 
+        let active_host = self.group_host(current_group);
         let mut first_row: Option<gtk::ListBoxRow> = None;
         for group in self.groups.iter().filter(|g| g.id != current_group) {
             let members: Vec<&Tab> = self.tabs.iter().filter(|t| t.group == group.id).collect();
@@ -2946,20 +2972,38 @@ impl App {
             } else {
                 &group.name
             };
+            let text = match &group.host {
+                Some(host) if host != name => format!("{name} ({}) · {host}", members.len()),
+                _ => format!("{} ({})", name, members.len()),
+            };
             let label = gtk::Label::builder()
-                .label(format!("{} ({})", name, members.len()))
+                .label(text)
                 .halign(gtk::Align::Start)
                 .margin_start(6)
                 .build();
             let row = gtk::ListBoxRow::builder().child(&label).build();
             row.set_widget_name(&group.id.to_string());
             row.add_css_class(group.css);
+            let reachable = mode == PickerMode::Jump
+                || state::drop_allowed(active_host.as_deref(), group.host.as_deref());
+            if reachable {
+                first_row.get_or_insert(row.clone());
+            } else {
+                // Shown, so the list still reads as "all groups", but a tab
+                // cannot move to another host.
+                row.set_sensitive(false);
+                row.set_activatable(false);
+                row.set_selectable(false);
+                row.set_tooltip_text(Some("On another host: tabs can't move between hosts"));
+            }
             list.append(&row);
-            first_row.get_or_insert(row);
         }
         if mode == PickerMode::Move {
             let new_label = gtk::Label::builder()
-                .label("New group")
+                .label(match &active_host {
+                    Some(host) => format!("New group on {host}"),
+                    None => "New group".to_string(),
+                })
                 .halign(gtk::Align::Start)
                 .margin_start(6)
                 .build();
@@ -3473,6 +3517,17 @@ impl App {
         if src == dest {
             return;
         }
+        let group_of = |id: usize| self.tabs.iter().find(|t| t.id == id).map(|t| t.group);
+        let (Some(src_group), Some(dest_group)) = (group_of(src), group_of(dest)) else {
+            return;
+        };
+        if !state::drop_allowed(
+            self.group_host(src_group).as_deref(),
+            self.group_host(dest_group).as_deref(),
+        ) {
+            self.show_toast(CROSS_HOST_TOAST);
+            return;
+        }
         let Some(si) = self.tabs.iter().position(|t| t.id == src) else {
             return;
         };
@@ -3519,6 +3574,14 @@ impl App {
             return;
         };
         if !self.groups.iter().any(|g| g.id == group) {
+            return;
+        }
+        let src_group = self.tabs[si].group;
+        if !state::drop_allowed(
+            self.group_host(src_group).as_deref(),
+            self.group_host(group).as_deref(),
+        ) {
+            self.show_toast(CROSS_HOST_TOAST);
             return;
         }
         let mut tab = self.tabs.remove(si);
@@ -3568,6 +3631,15 @@ impl App {
     fn rebuild_list(&self) {
         while let Some(row) = self.tab_list.row_at_index(0) {
             self.tab_list.remove(&row);
+        }
+        {
+            let mut keys = self.host_keys.borrow_mut();
+            keys.clear();
+            for host in self.groups.iter().filter_map(|g| g.host.as_ref()) {
+                if !keys.contains(host) {
+                    keys.push(host.clone());
+                }
+            }
         }
 
         let active_group = self.active_group();
@@ -4019,13 +4091,79 @@ impl App {
         });
         header.add_controller(drag);
 
-        let drop = gtk::DropTarget::new(gtk::glib::Type::STRING, gtk::gdk::DragAction::MOVE);
         let target = SidebarDropTarget::Header { group: group.id };
-        let input = self.input.clone();
-        drop.connect_drop(move |_, value, _, _| dispatch_sidebar_drop(&input, value, target));
-        header.add_controller(drop);
+        let key = self.host_key(group.host.as_deref());
+        header.add_controller(self.sidebar_drop_target(&header, target, key));
 
         header
+    }
+
+    /// The drag-payload key of a host in the current render.
+    fn host_key(&self, host: Option<&str>) -> String {
+        let Some(host) = host else {
+            return "local".to_string();
+        };
+        self.host_keys
+            .borrow()
+            .iter()
+            .position(|known| known == host)
+            .map_or_else(|| "unknown".to_string(), |index| index.to_string())
+    }
+
+    /// A sidebar drop target for `row`, whose group runs on the host keyed
+    /// `host_key`. The payload is preloaded, so hovering can already tell a
+    /// cross-host tab: `enter`/`motion` answer no action (the compositor's
+    /// no-drop cursor) and tint the row. The drop itself still goes through
+    /// `dispatch_sidebar_drop` and the drop handlers, which stay the
+    /// authority.
+    fn sidebar_drop_target(
+        &self,
+        row: &gtk::ListBoxRow,
+        target: SidebarDropTarget,
+        host_key: String,
+    ) -> gtk::DropTarget {
+        let drop = gtk::DropTarget::new(gtk::glib::Type::STRING, gtk::gdk::DragAction::MOVE);
+        drop.set_preload(true);
+        let judge = Rc::new({
+            let row = row.downgrade();
+            move |drop: &gtk::DropTarget| -> gtk::gdk::DragAction {
+                let refused = drop
+                    .value()
+                    .and_then(|value| value.get::<String>().ok())
+                    .is_some_and(|payload| drop_refused(&payload, &host_key));
+                if let Some(row) = row.upgrade() {
+                    if refused {
+                        row.add_css_class("drop-refused");
+                    } else {
+                        row.remove_css_class("drop-refused");
+                    }
+                }
+                if refused {
+                    gtk::gdk::DragAction::empty()
+                } else {
+                    gtk::gdk::DragAction::MOVE
+                }
+            }
+        });
+        drop.connect_enter({
+            let judge = judge.clone();
+            move |drop, _, _| judge(drop)
+        });
+        drop.connect_motion({
+            let judge = judge.clone();
+            move |drop, _, _| judge(drop)
+        });
+        drop.connect_leave({
+            let row = row.downgrade();
+            move |_| {
+                if let Some(row) = row.upgrade() {
+                    row.remove_css_class("drop-refused");
+                }
+            }
+        });
+        let input = self.input.clone();
+        drop.connect_drop(move |_, value, _, _| dispatch_sidebar_drop(&input, value, target));
+        drop
     }
 
     fn make_row(
@@ -4090,25 +4228,26 @@ impl App {
             row.add_css_class("tab-crashed");
         }
 
+        // The host key rides along so every drop target can judge the drag
+        // while it hovers, without looking the tab up.
+        let key = self.host_key(group.host.as_deref());
         let drag = gtk::DragSource::builder()
             .actions(gtk::gdk::DragAction::MOVE)
             .build();
         let src_id = tab.id;
+        let payload_key = key.clone();
         drag.connect_prepare(move |_, _, _| {
             Some(gtk::gdk::ContentProvider::for_value(
-                &format!("tab:{src_id}").to_value(),
+                &format!("tab:{src_id}:{payload_key}").to_value(),
             ))
         });
         row.add_controller(drag);
 
-        let drop = gtk::DropTarget::new(gtk::glib::Type::STRING, gtk::gdk::DragAction::MOVE);
         let target = SidebarDropTarget::Tab {
             tab: tab.id,
             group: group.id,
         };
-        let input = self.input.clone();
-        drop.connect_drop(move |_, value, _, _| dispatch_sidebar_drop(&input, value, target));
-        row.add_controller(drop);
+        row.add_controller(self.sidebar_drop_target(&row, target, key));
 
         row
     }
@@ -4341,7 +4480,7 @@ enum SidebarDropTarget {
     Header { group: usize },
 }
 
-/// Parse a namespaced sidebar DnD payload ("tab:<id>" / "group:<id>") and send
+/// Parse a namespaced sidebar DnD payload ("tab:<id>:<host-key>" / "group:<id>") and send
 /// the message appropriate to where it was dropped. Returns whether the drop
 /// was accepted. A missing prefix or unparsable id is rejected.
 fn dispatch_sidebar_drop(
@@ -4352,10 +4491,7 @@ fn dispatch_sidebar_drop(
     let Ok(payload) = value.get::<String>() else {
         return false;
     };
-    let Some((kind, id)) = payload.split_once(':') else {
-        return false;
-    };
-    let Ok(src) = id.parse::<usize>() else {
+    let Some((kind, src, _)) = parse_drop_payload(&payload) else {
         return false;
     };
     let msg = match (kind, target) {
@@ -4368,6 +4504,22 @@ fn dispatch_sidebar_drop(
     };
     let _ = input.send(msg);
     true
+}
+
+/// Split a sidebar payload into kind, id and (for tabs) host key. Pure.
+fn parse_drop_payload(payload: &str) -> Option<(&str, usize, Option<&str>)> {
+    let mut parts = payload.splitn(3, ':');
+    let kind = parts.next()?;
+    let id = parts.next()?.parse().ok()?;
+    Some((kind, id, parts.next()))
+}
+
+/// Would dropping `payload` on a row whose group is keyed `target_key` move
+/// a tab between hosts? Group payloads never are (reordering groups is always
+/// allowed), and a payload without a key is left to the drop-time check.
+/// Pure.
+fn drop_refused(payload: &str, target_key: &str) -> bool {
+    matches!(parse_drop_payload(payload), Some(("tab", _, Some(key))) if key != target_key)
 }
 
 /// Reorder a list of group ids by removing `src` and reinserting it immediately
@@ -5455,5 +5607,35 @@ mod tests {
         assert_eq!(decode_exit(255 << 8), remote::SSH_FAILED);
         assert_ne!(decode_exit(1 << 8), remote::SSH_FAILED);
         assert_ne!(decode_exit(9), remote::SSH_FAILED);
+    }
+
+    // --- cross-host drag and drop ----------------------------------------
+
+    #[test]
+    fn payloads_carry_kind_id_and_host_key() {
+        assert_eq!(
+            parse_drop_payload("tab:7:local"),
+            Some(("tab", 7, Some("local")))
+        );
+        assert_eq!(parse_drop_payload("tab:7:2"), Some(("tab", 7, Some("2"))));
+        assert_eq!(parse_drop_payload("group:3"), Some(("group", 3, None)));
+        assert_eq!(parse_drop_payload("tab:x:local"), None);
+        assert_eq!(parse_drop_payload("nonsense"), None);
+    }
+
+    #[test]
+    fn a_tab_from_another_host_is_refused() {
+        assert!(drop_refused("tab:7:0", "local"));
+        assert!(drop_refused("tab:7:local", "1"));
+        assert!(drop_refused("tab:7:0", "1"));
+        assert!(!drop_refused("tab:7:1", "1"));
+        assert!(!drop_refused("tab:7:local", "local"));
+    }
+
+    #[test]
+    fn groups_may_always_be_reordered_and_unknown_payloads_are_left_to_the_drop() {
+        assert!(!drop_refused("group:3", "1"));
+        assert!(!drop_refused("tab:7", "1"));
+        assert!(!drop_refused("garbage", "local"));
     }
 }
