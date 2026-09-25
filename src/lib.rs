@@ -9,6 +9,7 @@ pub mod browser;
 mod cli;
 mod control;
 pub mod remote;
+pub mod remote_worker;
 pub mod state;
 pub mod tmuxctl;
 
