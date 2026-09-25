@@ -210,6 +210,9 @@ pub struct Group {
     /// touches a running browser: it is a launch argument, and only a launch
     /// into a *fresh* profile uses it.
     default_url: Option<String>,
+    /// The ssh destination this group's tabs run on; `None` = this computer.
+    /// Fixed for the group's lifetime: tabs cannot move between hosts.
+    host: Option<String>,
 }
 
 pub struct App {
@@ -299,6 +302,10 @@ pub struct App {
     /// Whether the "could not save state" notice was already shown; keeps a
     /// full disk from stacking one dialog per layout change.
     save_error_shown: Cell<bool>,
+    /// Remote sessions whose tab is closed but whose kill the host has not
+    /// confirmed yet — an outbox, persisted in the state file and flushed
+    /// after the next successful connect to each host.
+    pending_kills: Vec<state::PendingKill>,
     /// Set while `rebuild_list` re-selects the active row programmatically.
     /// The sidebar's `row-selected` handler shares it and stays silent while
     /// it is set, so a rebuild never echoes a `Msg::Select` back into the
@@ -810,6 +817,7 @@ impl SimpleComponent for App {
             // model is actually built from.
             uuids_unpersisted: Cell::new(false),
             save_error_shown: Cell::new(false),
+            pending_kills: Vec::new(),
             reselecting: Rc::new(Cell::new(false)),
             drag_handle_icon,
         };
@@ -1312,6 +1320,15 @@ impl App {
         self.active_tab().map(|t| t.group)
     }
 
+    /// The host a group's tabs run on; `None` for a local group (or an
+    /// unknown id). Owned, so callers can hold it across `&mut self` calls.
+    fn group_host(&self, group: usize) -> Option<String> {
+        self.groups
+            .iter()
+            .find(|g| g.id == group)
+            .and_then(|g| g.host.clone())
+    }
+
     /// Tab ids in display order: groups in sidebar order, each group's tabs
     /// as `group_members` shows them. Keyboard navigation and the
     /// close-neighbour pick follow this so they match the sidebar.
@@ -1335,6 +1352,7 @@ impl App {
             browser_visible: false,
             browser_split: state::DEFAULT_BROWSER_SPLIT,
             default_url: None,
+            host: None,
         });
         id
     }
@@ -1360,6 +1378,9 @@ impl App {
         }
         self.sidebar_visible = saved.sidebar_visible;
         self.sidebar_order = saved.sidebar_order;
+        // Kept whether or not any tab comes back: a queued kill belongs to a
+        // host, not to a tab, and must survive until that host confirms it.
+        self.pending_kills = saved.pending_kills.clone();
 
         // Live sessions (and which panes are dead) from our private server.
         let (live, dead): (Vec<String>, Vec<state::DeadPane>) = match &self.tmux {
@@ -1383,8 +1404,10 @@ impl App {
             None => (Vec::new(), Vec::new()),
         };
 
-        let plan = state::reconcile(&saved, &live, &dead);
-        if plan.attach.is_empty() && plan.respawn.is_empty() && plan.adopt.is_empty() {
+        // The local bucket only: remote tabs are planned per host once that
+        // host answers (on_host_connected), and never respawned here.
+        let plan = state::reconcile_local(&saved, &live, &dead);
+        if saved.tabs.is_empty() && plan.adopt.is_empty() {
             // Empty state and no sessions → current fresh-start behavior.
             self.sidebar_visible = true;
             self.open_group(sender);
@@ -1411,6 +1434,7 @@ impl App {
                 browser_visible: group.browser_open,
                 browser_split: group.browser_split,
                 default_url: group.default_url.clone(),
+                host: group.host.clone(),
             });
         }
         self.next_group_id = saved.groups.iter().map(|g| g.id).max().map_or(1, |m| m + 1);
@@ -1541,7 +1565,7 @@ impl App {
                     g.browser_split
                 },
                 default_url: g.default_url.clone(),
-                host: None,
+                host: g.host.clone(),
             })
             .collect();
         let tabs = self
@@ -1577,7 +1601,7 @@ impl App {
             sidebar_visible: self.sidebar_visible,
             linger_warning_dismissed: self.linger_dismissed,
             sidebar_order: self.sidebar_order,
-            pending_kills: Vec::new(),
+            pending_kills: self.pending_kills.clone(),
         };
         self.persist(&state);
         // Same choke point as the save, so the CLI always sees what was last
@@ -1960,6 +1984,11 @@ impl App {
     /// the browser from working: log and continue.
     fn cdp_env_set(&self, group_id: usize, url: &str) {
         let Some(tmux) = &self.tmux else { return };
+        // The browser is local-only: its endpoint is never exported into a
+        // remote group's sessions (they live on another server anyway).
+        if self.group_host(group_id).is_some() {
+            return;
+        }
         for tab in self.tabs.iter().filter(|t| t.group == group_id) {
             for key in CDP_ENV_KEYS {
                 if let Err(err) = tmux.set_environment(&tab.uuid, key, url) {
@@ -1973,6 +2002,11 @@ impl App {
     /// started later does not inherit a dead endpoint.
     fn cdp_env_unset(&self, group_id: usize) {
         let Some(tmux) = &self.tmux else { return };
+        // The browser is local-only: its endpoint is never exported into a
+        // remote group's sessions (they live on another server anyway).
+        if self.group_host(group_id).is_some() {
+            return;
+        }
         for tab in self.tabs.iter().filter(|t| t.group == group_id) {
             for key in CDP_ENV_KEYS {
                 if let Err(err) = tmux.unset_environment(&tab.uuid, key) {
@@ -1988,6 +2022,10 @@ impl App {
     /// endpoint. Used when a session is (re)created and when a tab moves.
     fn session_env_refresh(&self, tab_uuid: &str, group_id: usize) {
         let Some(tmux) = &self.tmux else { return };
+        // KABELSALAT_GROUP and the endpoint pair stay local (spec).
+        if self.group_host(group_id).is_some() {
+            return;
+        }
         let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
             return;
         };
