@@ -1417,13 +1417,20 @@ impl SimpleComponent for App {
                     }
                 };
                 let title = crate::cli::command_title(&argv);
-                // Without tmux, VTE's spawn just fails for a nonexistent
-                // directory and the callback only logs to stderr, leaving a
-                // permanently empty tab even though the CLI already printed a
-                // uuid and exited 0. Drop the cwd so the tab starts in the
-                // default location instead (tmux itself tolerates a missing
-                // -c directory, so this only matters for the no-tmux path).
-                let cwd = cwd.filter(|dir| dir.is_dir());
+                // A remote group's directory is a path on its host (or None,
+                // the remote home): no local is_dir() check applies to it.
+                // Locally: without tmux, VTE's spawn just fails for a
+                // nonexistent directory and the callback only logs to stderr,
+                // leaving a permanently empty tab even though the CLI already
+                // printed a uuid and exited 0. Drop the cwd so the tab starts
+                // in the default location instead (tmux itself tolerates a
+                // missing -c directory, so this only matters for the no-tmux
+                // path).
+                let cwd = if self.group_host(group_id).is_some() {
+                    cwd
+                } else {
+                    cwd.filter(|dir| dir.is_dir())
+                };
                 let id = self.add_tab(
                     tab_uuid,
                     group_id,
