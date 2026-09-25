@@ -51,12 +51,14 @@ impl Cli {
 }
 
 /// One group as the CLI sees it: the stable uuid, the (possibly empty,
-/// possibly duplicated) name, and how many tabs it holds.
+/// possibly duplicated) name, how many tabs it holds, and — for a remote
+/// group — the ssh destination its tabs run on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupInfo {
     pub uuid: String,
     pub name: String,
     pub tabs: usize,
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +113,9 @@ Options for run:
                             name must match exactly and match only one group.
       --create              When nothing matches, create a group named
                             <group> and put the tab in it.
-      --cwd <dir>           Working directory (default: the caller's).
+      --cwd <dir>           Working directory (default: the caller's). For a
+                            remote group, a path on its host (default: the
+                            remote home).
       --                    Required. Everything after it is the command.
 
 Exit codes:
@@ -257,7 +261,11 @@ pub enum GroupTarget {
 pub enum Action {
     Spawn {
         group: GroupTarget,
-        cwd: PathBuf,
+        /// Where the tab starts. Always `Some` for a local group (the
+        /// caller's directory, or `--cwd` resolved against it). For a remote
+        /// group it is `--cwd` verbatim — a path on that host, never checked
+        /// here — and `None` (the remote home) without it.
+        cwd: Option<PathBuf>,
         argv: Vec<String>,
     },
     Rename {
@@ -315,20 +323,33 @@ pub fn dispatch(cli: &Cli, groups: &[GroupInfo], caller_cwd: &Path) -> Outcome {
             cwd,
             argv,
         } => {
-            // `join` with an absolute path replaces the base, so this handles
-            // both absolute and relative --cwd values.
-            let cwd = match cwd {
-                Some(dir) => caller_cwd.join(dir),
-                None => caller_cwd.to_path_buf(),
-            };
-            let target = match resolve_group(groups, group) {
-                Ok(found) => GroupTarget::Existing(found.uuid.clone()),
+            let (target, host) = match resolve_group(groups, group) {
+                Ok(found) => (
+                    GroupTarget::Existing(found.uuid.clone()),
+                    found.host.as_deref(),
+                ),
                 // A selector that looks like a uuid is not special-cased: with
-                // --create it simply becomes the new group's name.
-                Err(ResolveError::NotFound) if *create => GroupTarget::Create {
-                    name: group.clone(),
-                },
+                // --create it simply becomes the new group's name. `--create`
+                // only ever makes local groups.
+                Err(ResolveError::NotFound) if *create => (
+                    GroupTarget::Create {
+                        name: group.clone(),
+                    },
+                    None,
+                ),
                 Err(err) => return resolve_failure(group, err),
+            };
+            let cwd = match host {
+                // A remote tab runs on its host, where the caller's directory
+                // means nothing: --cwd passes through verbatim, and without it
+                // the shell starts in the remote home.
+                Some(_) => cwd.clone(),
+                // `join` with an absolute path replaces the base, so this
+                // handles both absolute and relative --cwd values.
+                None => Some(match cwd {
+                    Some(dir) => caller_cwd.join(dir),
+                    None => caller_cwd.to_path_buf(),
+                }),
             };
             Outcome {
                 stdout: String::new(),
@@ -509,21 +530,25 @@ mod tests {
                 uuid: "aaa-111".into(),
                 name: "web".into(),
                 tabs: 2,
+                host: None,
             },
             GroupInfo {
                 uuid: "bbb-222".into(),
                 name: "api".into(),
                 tabs: 1,
+                host: None,
             },
             GroupInfo {
                 uuid: "ccc-333".into(),
                 name: "api".into(),
                 tabs: 3,
+                host: None,
             },
             GroupInfo {
                 uuid: "ddd-444".into(),
                 name: String::new(),
                 tabs: 1,
+                host: None,
             },
         ]
     }
@@ -571,11 +596,13 @@ mod tests {
                 uuid: "xyz".into(),
                 name: "other".into(),
                 tabs: 1,
+                host: None,
             },
             GroupInfo {
                 uuid: "qqq".into(),
                 name: "xyz".into(),
                 tabs: 1,
+                host: None,
             },
         ];
         assert_eq!(resolve_group(&groups, "xyz").unwrap().uuid, "xyz");
@@ -612,7 +639,7 @@ mod tests {
         }
     }
 
-    fn spawn_of(out: &Outcome) -> (&GroupTarget, &PathBuf, &Vec<String>) {
+    fn spawn_of(out: &Outcome) -> (&GroupTarget, &Option<PathBuf>, &Vec<String>) {
         match out.action.as_ref().expect("an action") {
             Action::Spawn { group, cwd, argv } => (group, cwd, argv),
             other => panic!("expected Spawn, got {other:?}"),
@@ -643,7 +670,7 @@ mod tests {
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u/proj"));
         let (group, cwd, argv) = spawn_of(&out);
         assert_eq!(*group, GroupTarget::Existing("aaa-111".into()));
-        assert_eq!(*cwd, PathBuf::from("/home/u/proj"));
+        assert_eq!(*cwd, Some(PathBuf::from("/home/u/proj")));
         assert_eq!(*argv, vec!["claude".to_string()]);
         assert_eq!(out.code, EXIT_OK);
     }
@@ -652,14 +679,17 @@ mod tests {
     fn an_absolute_cwd_flag_replaces_the_callers_cwd() {
         let cli = run("web", Some("/srv/app"), &["ls"]);
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u/proj"));
-        assert_eq!(*spawn_of(&out).1, PathBuf::from("/srv/app"));
+        assert_eq!(*spawn_of(&out).1, Some(PathBuf::from("/srv/app")));
     }
 
     #[test]
     fn a_relative_cwd_flag_is_resolved_against_the_caller() {
         let cli = run("web", Some("sub/dir"), &["ls"]);
         let out = dispatch(&cli, &sample_groups(), Path::new("/home/u/proj"));
-        assert_eq!(*spawn_of(&out).1, PathBuf::from("/home/u/proj/sub/dir"));
+        assert_eq!(
+            *spawn_of(&out).1,
+            Some(PathBuf::from("/home/u/proj/sub/dir"))
+        );
     }
 
     #[test]
@@ -835,5 +865,84 @@ mod tests {
         assert_eq!(command_title(&["claude".to_string()]), "claude");
         assert_eq!(command_title(&["/usr/bin/htop".to_string()]), "htop");
         assert_eq!(command_title(&[]), "Terminal");
+    }
+
+    // --- remote groups ---
+
+    fn remote_groups() -> Vec<GroupInfo> {
+        vec![
+            GroupInfo {
+                uuid: "rrr-555".into(),
+                name: "box".into(),
+                tabs: 1,
+                host: Some("me@box".into()),
+            },
+            GroupInfo {
+                uuid: "lll-666".into(),
+                name: "here".into(),
+                tabs: 1,
+                host: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn run_on_a_remote_group_ignores_the_callers_cwd() {
+        let out = dispatch(
+            &run("box", None, &["ls"]),
+            &remote_groups(),
+            Path::new("/home/u/proj"),
+        );
+        let (group, cwd, argv) = spawn_of(&out);
+        assert_eq!(*group, GroupTarget::Existing("rrr-555".into()));
+        // None = the remote home; the local directory means nothing there.
+        assert_eq!(*cwd, None);
+        assert_eq!(*argv, vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn run_on_a_remote_group_passes_cwd_through_unchecked() {
+        // Relative stays relative (to the remote home), absolute stays as
+        // typed; neither is joined onto the caller's directory.
+        for dir in ["src/app", "/srv/app"] {
+            let out = dispatch(
+                &run("box", Some(dir), &["ls"]),
+                &remote_groups(),
+                Path::new("/home/u/proj"),
+            );
+            assert_eq!(*spawn_of(&out).1, Some(PathBuf::from(dir)));
+        }
+    }
+
+    #[test]
+    fn run_on_a_local_group_next_to_a_remote_one_is_unchanged() {
+        let out = dispatch(
+            &run("here", None, &["ls"]),
+            &remote_groups(),
+            Path::new("/home/u/proj"),
+        );
+        assert_eq!(*spawn_of(&out).1, Some(PathBuf::from("/home/u/proj")));
+    }
+
+    #[test]
+    fn create_still_makes_a_local_group() {
+        let out = dispatch(
+            &run_create("fresh", &["ls"]),
+            &remote_groups(),
+            Path::new("/w"),
+        );
+        let (group, cwd, _) = spawn_of(&out);
+        assert_eq!(
+            *group,
+            GroupTarget::Create {
+                name: "fresh".into()
+            }
+        );
+        assert_eq!(*cwd, Some(PathBuf::from("/w")));
+    }
+
+    #[test]
+    fn help_explains_cwd_on_remote_groups() {
+        assert!(help_text().contains("remote"));
     }
 }

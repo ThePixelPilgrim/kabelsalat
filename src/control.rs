@@ -61,7 +61,7 @@ pub fn snapshot() -> Vec<GroupInfo> {
 /// it has already shut down.
 pub fn request_spawn(
     group: GroupTarget,
-    cwd: std::path::PathBuf,
+    cwd: Option<std::path::PathBuf>,
     argv: Vec<String>,
     tab_uuid: String,
 ) -> bool {
@@ -176,7 +176,7 @@ mod tests {
         // register() is never called in tests, so there is no sender to use.
         let refused = request_spawn(
             GroupTarget::Existing("aaa-111".into()),
-            std::path::PathBuf::from("/tmp"),
+            Some(std::path::PathBuf::from("/tmp")),
             vec!["ls".into()],
             "tab-uuid".into(),
         );
