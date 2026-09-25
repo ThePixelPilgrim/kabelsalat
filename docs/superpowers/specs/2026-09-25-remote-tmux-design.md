@@ -347,6 +347,9 @@ Finally, `cargo fmt`, `cargo clippy` and `cargo test` must pass.
 
 ## Follow-up: remote display pane (separate spec)
 
+> **Superseded (2026-09-25):** the RDP-sink design below was rejected. See
+> `2026-09-25-remote-display-design.md` for the current decisions.
+
 Graphical programs started in remote tabs, and the screenshot paste into
 a remote `claude`.
 
