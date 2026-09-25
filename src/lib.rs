@@ -8,6 +8,7 @@ mod app;
 pub mod browser;
 mod cli;
 mod control;
+pub mod remote;
 pub mod state;
 pub mod tmuxctl;
 
