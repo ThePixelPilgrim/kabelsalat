@@ -438,7 +438,7 @@ pub enum Msg {
     SpawnCommand {
         group: crate::cli::GroupTarget,
         tab_uuid: String,
-        cwd: PathBuf,
+        cwd: Option<PathBuf>,
         argv: Vec<String>,
     },
     /// A `kabelsalat rename` invocation: set the group's name. Like
@@ -1213,7 +1213,7 @@ impl SimpleComponent for App {
                 // uuid and exited 0. Drop the cwd so the tab starts in the
                 // default location instead (tmux itself tolerates a missing
                 // -c directory, so this only matters for the no-tmux path).
-                let cwd = cwd.is_dir().then_some(cwd);
+                let cwd = cwd.filter(|dir| dir.is_dir());
                 let id = self.add_tab(
                     tab_uuid,
                     group_id,
@@ -1590,6 +1590,7 @@ impl App {
                     uuid: g.uuid.clone(),
                     name: g.name.clone(),
                     tabs: state.tabs.iter().filter(|t| t.group == g.id).count(),
+                    host: g.host.clone(),
                 })
                 .collect(),
         );
