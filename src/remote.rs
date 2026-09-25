@@ -140,6 +140,134 @@ pub fn askpass_env(mode: &AuthMode) -> Vec<(String, String)> {
     }
 }
 
+/// Why a host is not usable. Each variant carries a specific, actionable
+/// message (`message`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteError {
+    /// DNS failure, connection refused, timeout, lost connection.
+    Unreachable,
+    /// Wrong credentials (or a declined askpass prompt).
+    AuthFailed,
+    /// The login needs a prompt and no askpass program is available.
+    AuthNeedsAskpass,
+    /// The host key is not in `known_hosts`.
+    HostKeyUnknown,
+    /// The host key differs from `known_hosts`.
+    HostKeyChanged,
+    /// No tmux on the host.
+    TmuxMissing,
+    /// The host's tmux is older than 3.2; carries its version.
+    TmuxTooOld(String),
+    /// The local ssh client fails the version check.
+    SshUnsupported,
+    /// Anything else; carries the trimmed stderr.
+    Other(String),
+}
+
+impl RemoteError {
+    /// The text the disconnected page and the sidebar tooltip show.
+    pub fn message(&self, host: &str) -> String {
+        let (major, minor) = crate::tmuxctl::MIN_VERSION;
+        let (ssh_major, ssh_minor) = MIN_SSH;
+        match self {
+            RemoteError::Unreachable => format!(
+                "Can't reach {host}: the name did not resolve, the connection was \
+                 refused or lost, or it timed out. Check the network and the host, \
+                 then Reconnect."
+            ),
+            RemoteError::AuthFailed => {
+                format!("Logging in to {host} failed. Check your key or password, then Reconnect.")
+            }
+            RemoteError::AuthNeedsAskpass => format!(
+                "{host} asks for a password or passphrase, and no graphical askpass \
+                 program is installed. Add your key to ssh-agent, or install one \
+                 (Fedora: openssh-askpass, Debian: ssh-askpass-gnome), then Reconnect."
+            ),
+            RemoteError::HostKeyUnknown => format!(
+                "The host key of {host} is not known yet. Run `ssh {host}` once in a \
+                 terminal to check and accept it, then Reconnect."
+            ),
+            RemoteError::HostKeyChanged => format!(
+                "The host key of {host} differs from the one in ~/.ssh/known_hosts. \
+                 This can mean an attack. Verify the new key, remove the old one with \
+                 `ssh-keygen -R`, then Reconnect."
+            ),
+            RemoteError::TmuxMissing => format!(
+                "tmux is not installed on {host}. Remote groups need tmux \
+                 {major}.{minor} or newer on the host."
+            ),
+            RemoteError::TmuxTooOld(found) => format!(
+                "{host} has tmux {found}; remote groups need tmux {major}.{minor} or newer."
+            ),
+            RemoteError::SshUnsupported => format!(
+                "Remote groups need OpenSSH {ssh_major}.{ssh_minor} or newer on this computer."
+            ),
+            RemoteError::Other(detail) if detail.is_empty() => {
+                format!("Connecting to {host} failed.")
+            }
+            RemoteError::Other(detail) => format!("Connecting to {host} failed: {detail}"),
+        }
+    }
+}
+
+/// Map a failed ssh (or remote command) to a [`RemoteError`]. Order matters:
+/// a changed host key also ends in "Host key verification failed", so it is
+/// checked first. `mode` decides what "Permission denied" means — with no
+/// askpass, a password host fails exactly like a wrong password.
+pub fn classify(exit_code: Option<i32>, stderr: &str, mode: &AuthMode) -> RemoteError {
+    const UNREACHABLE: [&str; 7] = [
+        "Could not resolve hostname",
+        "Name or service not known",
+        "Connection refused",
+        "timed out",
+        "No route to host",
+        "Network is unreachable",
+        "Connection reset",
+    ];
+    const AUTH: [&str; 3] = [
+        "Permission denied",
+        "Too many authentication failures",
+        "Authentication failed",
+    ];
+    const NO_TMUX: [&str; 3] = [
+        "tmux: command not found",
+        "tmux: not found",
+        "Unknown command: tmux",
+    ];
+    if stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+        return RemoteError::HostKeyChanged;
+    }
+    if stderr.contains("host key is known for") || stderr.contains("Host key verification failed") {
+        return RemoteError::HostKeyUnknown;
+    }
+    if UNREACHABLE.iter().any(|needle| stderr.contains(needle)) {
+        return RemoteError::Unreachable;
+    }
+    if AUTH.iter().any(|needle| stderr.contains(needle)) {
+        return match mode {
+            AuthMode::BatchOnly => RemoteError::AuthNeedsAskpass,
+            AuthMode::Askpass(_) => RemoteError::AuthFailed,
+        };
+    }
+    if exit_code == Some(127) || NO_TMUX.iter().any(|needle| stderr.contains(needle)) {
+        return RemoteError::TmuxMissing;
+    }
+    RemoteError::Other(stderr.trim().to_string())
+}
+
+/// A remote host's state. It lives on the host, so all of a host's tabs
+/// change state together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostState {
+    /// The worker is logging in and checking the host.
+    Connecting,
+    /// The master is up and the host listed its sessions.
+    Live,
+    /// Not usable; the error says why. Only an explicit Reconnect leaves this
+    /// state — there are no automatic retries, so askpass never pops up unasked.
+    Disconnected(RemoteError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +450,161 @@ mod tests {
             ]
         );
         assert!(askpass_env(&AuthMode::BatchOnly).is_empty());
+    }
+
+    // --- classify ---
+
+    const BATCH: AuthMode = AuthMode::BatchOnly;
+
+    fn with_askpass() -> AuthMode {
+        AuthMode::Askpass(PathBuf::from("/usr/libexec/openssh/gnome-ssh-askpass"))
+    }
+
+    #[test]
+    fn network_failures_are_unreachable() {
+        for stderr in [
+            "ssh: Could not resolve hostname nohost.invalid: Name or service not known\r\n",
+            "ssh: connect to host 127.0.0.1 port 2222: Connection refused\r\n",
+            "ssh: connect to host 10.255.255.1 port 22: Connection timed out\r\n",
+            "ssh: connect to host 10.0.0.9 port 22: No route to host\r\n",
+            "ssh: connect to host 10.0.0.9 port 22: Network is unreachable\r\n",
+            "kex_exchange_identification: read: Connection reset by peer\r\n",
+        ] {
+            assert_eq!(
+                classify(Some(255), stderr, &BATCH),
+                RemoteError::Unreachable,
+                "{stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_host_key_is_host_key_unknown() {
+        let stderr = "No ED25519 host key is known for [localhost]:2222 and you have \
+                      requested strict checking.\r\nHost key verification failed.\r\n";
+        assert_eq!(
+            classify(Some(255), stderr, &BATCH),
+            RemoteError::HostKeyUnknown
+        );
+        // With askpass, a declined confirmation ends the same way.
+        assert_eq!(
+            classify(
+                Some(255),
+                "Host key verification failed.\r\n",
+                &with_askpass()
+            ),
+            RemoteError::HostKeyUnknown
+        );
+    }
+
+    #[test]
+    fn a_changed_host_key_is_host_key_changed() {
+        let stderr = "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                      @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n\
+                      @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                      IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\r\n\
+                      Host key verification failed.\r\n";
+        assert_eq!(
+            classify(Some(255), stderr, &BATCH),
+            RemoteError::HostKeyChanged
+        );
+    }
+
+    #[test]
+    fn permission_denied_depends_on_whether_a_prompt_was_possible() {
+        let stderr = "me@localhost: Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).\r\n";
+        assert_eq!(
+            classify(Some(255), stderr, &BATCH),
+            RemoteError::AuthNeedsAskpass
+        );
+        assert_eq!(
+            classify(Some(255), stderr, &with_askpass()),
+            RemoteError::AuthFailed
+        );
+        assert_eq!(
+            classify(
+                Some(255),
+                "Received disconnect from 10.0.0.9 port 22:2: Too many authentication failures\r\n",
+                &with_askpass()
+            ),
+            RemoteError::AuthFailed
+        );
+    }
+
+    #[test]
+    fn a_missing_remote_tmux_is_tmux_missing() {
+        for stderr in [
+            "bash: line 1: tmux: command not found\n",
+            "sh: 1: tmux: not found\n",
+            "fish: Unknown command: tmux\nfish: \ntmux -V\n^~~^\n",
+        ] {
+            assert_eq!(
+                classify(Some(127), stderr, &BATCH),
+                RemoteError::TmuxMissing,
+                "{stderr}"
+            );
+        }
+        // Exit 127 alone is enough, whatever the shell printed.
+        assert_eq!(classify(Some(127), "", &BATCH), RemoteError::TmuxMissing);
+    }
+
+    #[test]
+    fn anything_else_keeps_its_stderr() {
+        assert_eq!(
+            classify(
+                Some(255),
+                "  mux_client_request_session: read from master failed  \n",
+                &BATCH
+            ),
+            RemoteError::Other("mux_client_request_session: read from master failed".into())
+        );
+        assert_eq!(
+            classify(None, "", &BATCH),
+            RemoteError::Other(String::new())
+        );
+    }
+
+    #[test]
+    fn every_error_names_what_to_do() {
+        let host = "me@box";
+        assert!(
+            RemoteError::HostKeyUnknown
+                .message(host)
+                .contains("ssh me@box")
+        );
+        assert!(
+            RemoteError::HostKeyChanged
+                .message(host)
+                .contains("ssh-keygen -R")
+        );
+        assert!(
+            RemoteError::AuthNeedsAskpass
+                .message(host)
+                .contains("askpass")
+        );
+        assert!(
+            RemoteError::TmuxTooOld("3.1c".into())
+                .message(host)
+                .contains("3.1c")
+        );
+        assert!(
+            RemoteError::TmuxTooOld("3.1c".into())
+                .message(host)
+                .contains("3.2")
+        );
+        assert!(RemoteError::TmuxMissing.message(host).contains("3.2"));
+        assert!(RemoteError::SshUnsupported.message(host).contains("8.4"));
+        assert!(
+            RemoteError::Other("boom".into())
+                .message(host)
+                .contains("boom")
+        );
+        for err in [
+            RemoteError::Unreachable,
+            RemoteError::AuthFailed,
+            RemoteError::Other(String::new()),
+        ] {
+            assert!(err.message(host).contains(host), "{err:?}");
+        }
     }
 }
