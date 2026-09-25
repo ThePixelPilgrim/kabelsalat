@@ -233,6 +233,10 @@ bind -T copy-mode WheelUpPane send -X -N 3 scroll-up
 bind -T copy-mode WheelDownPane send -X -N 3 scroll-down
 bind -T copy-mode Escape send -X cancel
 bind -T copy-mode q send -X cancel
+# Ctrl-D in a dead pane (kept by remain-on-exit) closes it like a shell's
+# EOF would: killing the only pane ends the session, the client detaches
+# and the tab closes on the usual exit path. Live panes get a plain ^D.
+bind -n C-d if -F '#{pane_dead}' kill-pane 'send C-d'
 set -g detach-on-destroy on
 # exit-empty must stay OFF: ensure_server() pre-claims the socket with a
 # detached, out-of-scope `start-server` that holds zero sessions, so later
@@ -1206,6 +1210,16 @@ mod tests {
             TMUX_CONF.find("unbind -q -a -T copy-mode").unwrap()
                 < TMUX_CONF.find("bind -n WheelUpPane").unwrap()
         );
+    }
+
+    #[test]
+    fn tmux_conf_closes_dead_panes_on_ctrl_d() {
+        let bind = "bind -n C-d if -F '#{pane_dead}' kill-pane 'send C-d'";
+        assert!(TMUX_CONF.contains(bind));
+        // Must come after the unbind that wipes the root table.
+        assert!(TMUX_CONF.find("unbind -q -a -T root").unwrap() < TMUX_CONF.find(bind).unwrap());
+        // Remote servers get it too.
+        assert!(remote_conf().contains(bind));
     }
 
     #[test]
