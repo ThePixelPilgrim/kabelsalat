@@ -41,11 +41,11 @@ pub fn is_executable(path: &Path) -> bool {
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-/// `$XDG_RUNTIME_DIR/kabelsalat/ssh/%C` (falling back to the state
-/// directory, like the local tmux socket). The directory is created 0700;
-/// ssh expands `%C` to a hash of the connection, which keeps the socket path
-/// under the Unix socket length limit.
-pub fn control_path() -> io::Result<PathBuf> {
+/// `$XDG_RUNTIME_DIR/kabelsalat/ssh/<name>` for `dest`'s master (falling
+/// back to the state directory, like the local tmux socket). The directory
+/// is created 0700; the name is `remote::control_socket_name`, a literal
+/// file name rather than ssh's `%C` (see there for why).
+pub fn control_path(dest: &str) -> io::Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|dir| !dir.is_empty())
         .map(|dir| PathBuf::from(dir).join("kabelsalat"))
@@ -55,7 +55,7 @@ pub fn control_path() -> io::Result<PathBuf> {
         .recursive(true)
         .mode(0o700)
         .create(&dir)?;
-    Ok(dir.join("%C"))
+    Ok(dir.join(remote::control_socket_name(dest)))
 }
 
 /// A finished process: exit code (`None` if killed by a signal) and output.
