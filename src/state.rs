@@ -493,6 +493,118 @@ pub fn reconcile(saved: &SavedState, live: &[String], dead: &[DeadPane]) -> Reco
     plan
 }
 
+/// The host a saved group's tabs run on; `None` for a local group or an
+/// unknown id.
+pub fn group_host(saved: &SavedState, group: usize) -> Option<&str> {
+    saved
+        .groups
+        .iter()
+        .find(|g| g.id == group)
+        .and_then(|g| g.host.as_deref())
+}
+
+/// The startup reconciliation of the local bucket: [`reconcile`] over the
+/// tabs of local groups only. Remote tabs are neither respawned locally nor
+/// counted when deciding what to adopt — their host is reconciled on its own,
+/// by [`reconcile_remote`], once it answers.
+pub fn reconcile_local(saved: &SavedState, live: &[String], dead: &[DeadPane]) -> ReconcilePlan {
+    let local = SavedState {
+        tabs: saved
+            .tabs
+            .iter()
+            .filter(|t| group_host(saved, t.group).is_none())
+            .cloned()
+            .collect(),
+        ..saved.clone()
+    };
+    reconcile(&local, live, dead)
+}
+
+/// Every remote host that has at least one saved tab, once, in group order:
+/// the hosts to connect at startup. A host known only from its pending kills
+/// is not connected unasked; its queue flushes on the next connect.
+pub fn remote_hosts(saved: &SavedState) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for group in &saved.groups {
+        let Some(host) = &group.host else { continue };
+        if saved.tabs.iter().any(|t| t.group == group.id) && !hosts.contains(host) {
+            hosts.push(host.clone());
+        }
+    }
+    hosts
+}
+
+/// A successful `list-sessions` from a remote host, as plain data.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteListing {
+    /// Tab uuids of the live `ks-<uuid>` sessions.
+    pub live: Vec<String>,
+    /// The subset whose pane has died, with the exit code.
+    pub dead: Vec<DeadPane>,
+}
+
+/// A remote tab whose session is live: attach, crashed if its pane died.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteAttach {
+    pub uuid: String,
+    pub dead_exit: Option<i32>,
+}
+
+/// What to do with one host's tabs, as plain data.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemotePlan {
+    /// Tabs with a live session, in `tabs` order.
+    pub attach: Vec<RemoteAttach>,
+    /// Tabs without one: `new-session -A` creates a fresh session.
+    pub respawn: Vec<String>,
+    /// Tabs that must stay unspawned: there is no successful listing.
+    pub wait: Vec<String>,
+    /// Queued kills whose session still lives.
+    pub kill: Vec<String>,
+}
+
+/// Plan one remote host's tabs. `listing` is `None` until the host answered
+/// `list-sessions` successfully — and then every tab waits: an unreachable
+/// host, a failed login or a refused host never produces a fresh shell.
+/// Live `ks-*` sessions no tab claims are ignored, never adopted; they may
+/// belong to another installation sharing the host's server.
+pub fn reconcile_remote(
+    tabs: &[String],
+    listing: Option<&RemoteListing>,
+    pending_kills: &[String],
+) -> RemotePlan {
+    let Some(listing) = listing else {
+        return RemotePlan {
+            wait: tabs.to_vec(),
+            ..RemotePlan::default()
+        };
+    };
+    let dead_exit = |uuid: &str| {
+        listing
+            .dead
+            .iter()
+            .find(|d| d.uuid == uuid)
+            .map(|d| d.exit_code)
+    };
+    let mut plan = RemotePlan::default();
+    for uuid in tabs {
+        if listing.live.contains(uuid) {
+            plan.attach.push(RemoteAttach {
+                uuid: uuid.clone(),
+                dead_exit: dead_exit(uuid),
+            });
+        } else {
+            plan.respawn.push(uuid.clone());
+        }
+    }
+    plan.kill = pending_kills
+        .iter()
+        .filter(|uuid| listing.live.contains(uuid) && !tabs.contains(uuid))
+        .cloned()
+        .collect();
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,5 +1269,126 @@ mod tests {
         assert!(!drop_allowed(Some("a"), None));
         // Destinations are compared verbatim: two spellings are two hosts.
         assert!(!drop_allowed(Some("a"), Some("me@a")));
+    }
+
+    // --- per-host restore ---
+
+    fn remote_state() -> SavedState {
+        let mut state = sample_state();
+        // Group 1 ("work", tabs bbb and ccc) lives on a remote host.
+        state.groups[1].host = Some("me@box".into());
+        state
+    }
+
+    #[test]
+    fn a_local_only_state_reconciles_exactly_as_before() {
+        let state = sample_state();
+        for live in [
+            vec![],
+            vec!["aaa".to_string()],
+            vec!["zzz".to_string(), "bbb".to_string()],
+        ] {
+            let dead = vec![DeadPane {
+                uuid: "bbb".into(),
+                exit_code: 3,
+            }];
+            assert_eq!(
+                reconcile_local(&state, &live, &dead),
+                reconcile(&state, &live, &dead)
+            );
+        }
+    }
+
+    #[test]
+    fn local_reconcile_never_respawns_remote_tabs_locally() {
+        let plan = reconcile_local(&remote_state(), &[], &[]);
+        let respawned: Vec<_> = plan.respawn.iter().map(|t| t.uuid.as_str()).collect();
+        assert_eq!(respawned, ["aaa"]);
+        assert!(plan.attach.is_empty());
+        assert!(plan.adopt.is_empty());
+    }
+
+    #[test]
+    fn local_reconcile_still_adopts_local_orphans() {
+        let plan = reconcile_local(&remote_state(), &["zzz".to_string()], &[]);
+        let adopted: Vec<_> = plan.adopt.iter().map(|o| o.uuid.as_str()).collect();
+        assert_eq!(adopted, ["zzz"]);
+    }
+
+    #[test]
+    fn group_host_names_the_host_or_none() {
+        let state = remote_state();
+        assert_eq!(group_host(&state, 0), None);
+        assert_eq!(group_host(&state, 1), Some("me@box"));
+        assert_eq!(group_host(&state, 99), None);
+    }
+
+    #[test]
+    fn an_unreachable_host_never_respawns() {
+        // No successful list-sessions: every tab waits, nothing is spawned,
+        // attached or killed — whatever is queued.
+        let tabs = vec!["x".to_string(), "y".to_string()];
+        let plan = reconcile_remote(&tabs, None, &["k".to_string()]);
+        assert!(plan.attach.is_empty());
+        assert!(plan.respawn.is_empty());
+        assert!(plan.kill.is_empty());
+        assert_eq!(plan.wait, tabs);
+    }
+
+    #[test]
+    fn a_listed_host_attaches_and_respawns_but_never_adopts() {
+        let tabs = vec!["x".to_string(), "y".to_string()];
+        let listing = RemoteListing {
+            // "stranger" may belong to another installation: ignored.
+            live: vec!["stranger".to_string(), "x".to_string()],
+            dead: vec![DeadPane {
+                uuid: "x".into(),
+                exit_code: 3,
+            }],
+        };
+        let plan = reconcile_remote(&tabs, Some(&listing), &[]);
+        assert_eq!(
+            plan.attach,
+            vec![RemoteAttach {
+                uuid: "x".into(),
+                dead_exit: Some(3)
+            }]
+        );
+        assert_eq!(plan.respawn, vec!["y".to_string()]);
+        assert!(plan.wait.is_empty());
+        assert!(plan.kill.is_empty());
+    }
+
+    #[test]
+    fn pending_kills_flush_only_sessions_that_still_live() {
+        let listing = RemoteListing {
+            live: vec!["k1".to_string()],
+            dead: Vec::new(),
+        };
+        let plan = reconcile_remote(&[], Some(&listing), &["k1".to_string(), "k2".to_string()]);
+        assert_eq!(plan.kill, vec!["k1".to_string()]);
+    }
+
+    #[test]
+    fn remote_hosts_lists_each_host_with_tabs_once_in_group_order() {
+        let mut state = remote_state();
+        let mut second = SavedGroup::new(2, "again".into(), 0);
+        second.host = Some("me@box".into());
+        let mut empty = SavedGroup::new(3, "idle".into(), 0);
+        empty.host = Some("other".into());
+        let mut third = SavedGroup::new(4, "b".into(), 0);
+        third.host = Some("b-host".into());
+        state.groups.extend([second, empty, third]);
+        for (uuid, group) in [("d", 2), ("e", 4)] {
+            state.tabs.push(SavedTab {
+                uuid: uuid.into(),
+                group,
+                title: String::new(),
+                last_activity: None,
+                last_title: None,
+            });
+        }
+        assert_eq!(remote_hosts(&state), ["me@box", "b-host"]);
+        assert!(remote_hosts(&sample_state()).is_empty());
     }
 }
