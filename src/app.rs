@@ -27,6 +27,11 @@ pub const GROUP_PALETTE: [&str; 6] = [
 const SHORTCUTS: &[(&str, &str, Msg)] = &[
     ("<Control><Shift>t", "New tab in active group", Msg::NewTab),
     ("<Control><Shift>n", "New group", Msg::NewGroup),
+    (
+        "<Control><Shift>h",
+        "New remote group",
+        Msg::NewRemoteGroupDialog,
+    ),
     ("<Control><Shift>w", "Close active tab", Msg::CloseActive),
     (
         "<Control><Shift>m",
@@ -170,6 +175,14 @@ const REATTACH_GUARD: Duration = Duration::from_secs(2);
 enum PickerMode {
     Move,
     Jump,
+}
+
+/// Which form the group settings dialog shows: the one that creates a remote
+/// group, or the active group's settings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SettingsMode {
+    Create,
+    Edit,
 }
 
 /// What a remote tab spawns once its host is live: the directory and command
@@ -571,6 +584,16 @@ pub enum Msg {
     /// Rerun the connect sequence for a host — or, when it is live, reattach
     /// its detached tabs.
     Reconnect(String),
+    /// Ctrl+Shift+H / the sidebar button: open the create form for a remote
+    /// group, or explain why remote groups are unavailable.
+    NewRemoteGroupDialog,
+    /// Apply the create form: a new group on `host`, its first tab, and the
+    /// host's connect. `default_url` is already normalized.
+    CreateRemoteGroup {
+        host: String,
+        name: String,
+        default_url: Option<String>,
+    },
 }
 
 #[relm4::component(pub)]
@@ -736,6 +759,15 @@ impl SimpleComponent for App {
                                     set_icon_name: "folder-new-symbolic",
                                     set_tooltip_text: Some("New group (Ctrl+Shift+N)"),
                                     connect_clicked => Msg::NewGroup,
+                                },
+
+                                gtk::Button {
+                                    set_icon_name: "network-server-symbolic",
+                                    #[watch]
+                                    set_sensitive: model.ssh.is_available(),
+                                    #[watch]
+                                    set_tooltip_text: Some(model.remote_button_tooltip().as_str()),
+                                    connect_clicked => Msg::NewRemoteGroupDialog,
                                 },
 
                                 gtk::Button {
@@ -1268,7 +1300,41 @@ impl SimpleComponent for App {
             Msg::DropTab { src, dest } => self.drop_tab(src, dest),
             Msg::DropGroup { src, dest } => self.drop_group(src, dest),
             Msg::DropTabOnGroup { src, group } => self.drop_tab_on_group(src, group),
-            Msg::GroupSettingsDialog => self.show_group_settings_dialog(),
+            Msg::GroupSettingsDialog => self.show_group_settings(SettingsMode::Edit),
+            Msg::NewRemoteGroupDialog => {
+                match self.ssh.reason() {
+                    Some(reason) => self.show_notice(&reason),
+                    None => self.show_group_settings(SettingsMode::Create),
+                }
+                return;
+            }
+            Msg::CreateRemoteGroup {
+                host,
+                name,
+                default_url,
+            } => {
+                // The form only enables Create for a valid host; this guards
+                // the message itself.
+                if state::validate_host(&host).is_err() {
+                    return;
+                }
+                let id = self.create_group();
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    let name = name.trim();
+                    // An empty name defaults to the host.
+                    group.name = if name.is_empty() {
+                        host.clone()
+                    } else {
+                        name.to_string()
+                    };
+                    group.host = Some(host.clone());
+                    group.default_url = default_url;
+                }
+                // The tab appears at once, behind "Connecting…"; it spawns when
+                // the host is live, or shows why it is not.
+                self.open_tab(id, &sender);
+                self.connect_host(&host);
+            }
             Msg::ApplyGroupSettings {
                 id,
                 name,
@@ -2169,6 +2235,14 @@ impl App {
     // ---- browser pane ---------------------------------------------------
 
     /// Does the active group have a browser at all? Drives the overflow menu.
+    /// Tooltip of the "New remote group" button: its shortcut, or why it is
+    /// insensitive.
+    fn remote_button_tooltip(&self) -> String {
+        self.ssh
+            .reason()
+            .unwrap_or_else(|| "New remote group (Ctrl+Shift+H)".to_string())
+    }
+
     fn active_group_has_browser(&self) -> bool {
         self.active_group()
             .and_then(|id| self.groups.iter().find(|g| g.id == id))
@@ -3899,6 +3973,29 @@ impl App {
                 .halign(gtk::Align::Start)
                 .build(),
         );
+        // Remote groups name their host (unless the name already is the
+        // host) and show its state: nothing when live, a spinner while
+        // connecting, a warning with the reason when disconnected.
+        if let Some(host) = &group.host {
+            row_box.append(&gtk::Image::from_icon_name("network-server-symbolic"));
+            if group.name != *host {
+                let label = gtk::Label::builder().label(host.as_str()).build();
+                label.add_css_class("dim-label");
+                row_box.append(&label);
+            }
+            match self.host_state(host) {
+                HostState::Live => {}
+                HostState::Connecting => {
+                    row_box.append(&gtk::Spinner::builder().spinning(true).build());
+                }
+                HostState::Disconnected(err) => {
+                    let warning = gtk::Image::from_icon_name("dialog-warning-symbolic");
+                    warning.add_css_class("tmux-warning");
+                    warning.set_tooltip_text(Some(&err.message(host)));
+                    row_box.append(&warning);
+                }
+            }
+        }
 
         let header = gtk::ListBoxRow::builder()
             .child(&row_box)
@@ -3982,6 +4079,13 @@ impl App {
         let row = gtk::ListBoxRow::builder().child(&row_box).build();
         row.set_widget_name(&tab.id.to_string());
         row.add_css_class(group.css);
+        // Rows of a disconnected host stay selectable (their page explains
+        // and offers Reconnect) but read as unavailable.
+        if let Some(host) = &group.host
+            && matches!(self.host_state(host), HostState::Disconnected(_))
+        {
+            row.add_css_class("host-disconnected");
+        }
         if tab.crashed.is_some() {
             row.add_css_class("tab-crashed");
         }
@@ -4009,31 +4113,75 @@ impl App {
         row
     }
 
-    /// Per-group settings: its name, and the URL a freshly launched browser in
-    /// it opens on. Enter applies, Esc cancels, an empty name removes the
-    /// header and an empty URL clears the default.
+    /// The group settings dialog. `Edit`: the active group's name and browser
+    /// default URL, with its host shown read-only. `Create`: the same form
+    /// headed by a Host entry, creating a remote group. Enter applies, Esc
+    /// cancels, an empty name removes the header (or, in create mode,
+    /// defaults to the host) and an empty URL clears the default.
     ///
-    /// The URL is validated as it is typed and Apply is disabled while it is
-    /// unusable: `adw::AlertDialog` closes on any response, so an error raised
-    /// at submit time would have nowhere left to live.
-    fn show_group_settings_dialog(&self) {
-        let Some(group) = self
-            .active_group()
-            .and_then(|id| self.groups.iter().find(|g| g.id == id))
-        else {
-            return;
+    /// Host and URL are validated as they are typed and Apply is disabled
+    /// while either is unusable: `adw::AlertDialog` closes on any response,
+    /// so an error raised at submit time would have nowhere left to live.
+    fn show_group_settings(&self, mode: SettingsMode) {
+        let group = match mode {
+            SettingsMode::Create => None,
+            SettingsMode::Edit => {
+                let Some(group) = self
+                    .active_group()
+                    .and_then(|id| self.groups.iter().find(|g| g.id == id))
+                else {
+                    return;
+                };
+                Some(group)
+            }
         };
+        let remote = group.is_none_or(|g| g.host.is_some());
 
+        let rows = adw::PreferencesGroup::new();
+        // Host first. Read-only on an existing group: its tabs live on that
+        // host, and a group without tabs does not exist (it is pruned).
+        let host_entry = match group {
+            None => {
+                let entry = adw::EntryRow::builder()
+                    .title("Host")
+                    .activates_default(true)
+                    .build();
+                rows.add(&entry);
+                Some(entry)
+            }
+            Some(group) => {
+                // A subtitle is Pango markup by default, and a host may
+                // legally contain '&' or '<'.
+                let subtitle = match group.host.as_deref() {
+                    Some(host) => format!("{host}\nClose all tabs to change the host"),
+                    None => "This computer".to_string(),
+                };
+                rows.add(
+                    &adw::ActionRow::builder()
+                        .title("Host")
+                        .subtitle(subtitle)
+                        .use_markup(false)
+                        .build(),
+                );
+                None
+            }
+        };
         let name_row = adw::EntryRow::builder()
             .title("Name")
             .activates_default(true)
             .build();
-        name_row.set_text(&group.name);
+        name_row.set_text(group.map_or("", |g| g.name.as_str()));
         let url_row = adw::EntryRow::builder()
             .title("Browser default URL")
             .activates_default(true)
             .build();
-        url_row.set_text(group.default_url.as_deref().unwrap_or_default());
+        url_row.set_text(
+            group
+                .and_then(|g| g.default_url.as_deref())
+                .unwrap_or_default(),
+        );
+        rows.add(&name_row);
+        rows.add(&url_row);
 
         // Stock Adwaita style class, so the CSS provider needs nothing added.
         let error = gtk::Label::builder()
@@ -4043,63 +4191,111 @@ impl App {
             .build();
         error.add_css_class("error");
 
-        let rows = adw::PreferencesGroup::new();
-        rows.add(&name_row);
-        rows.add(&url_row);
-
         let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
         content.append(&rows);
+        if remote {
+            let note = gtk::Label::builder()
+                .label("The browser runs on this computer and isn't exposed to remote tabs.")
+                .xalign(0.0)
+                .wrap(true)
+                .build();
+            note.add_css_class("dim-label");
+            content.append(&note);
+        }
         content.append(&error);
 
-        let dialog = adw::AlertDialog::new(Some("Group Settings"), None);
+        let (title, apply) = match mode {
+            SettingsMode::Create => ("New Remote Group", "Create"),
+            SettingsMode::Edit => ("Group Settings", "Apply"),
+        };
+        let dialog = adw::AlertDialog::new(Some(title), None);
         dialog.set_extra_child(Some(&content));
         dialog.add_response("cancel", "Cancel");
-        dialog.add_response("apply", "Apply");
+        dialog.add_response("apply", apply);
         dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
         dialog.set_default_response(Some("apply"));
         dialog.set_close_response("cancel");
 
-        // Live validation: the only gate on Apply. Also runs once up front, so a
-        // hand-edited `state.json` opens the dialog already showing why.
-        // The dialog is held weakly: this closure lives on a widget *inside* it,
-        // so a strong reference would be a cycle the dialog never escapes.
-        let validate = {
+        // Live validation: the only gate on Apply. Also runs once up front, so
+        // a hand-edited `state.json` opens the dialog already showing why.
+        // Everything inside the dialog is held weakly: this closure lives on
+        // widgets *inside* it, so strong references would be a cycle.
+        let validate = Rc::new({
             let dialog = dialog.downgrade();
             let error = error.clone();
-            move |text: &str| {
-                let Some(dialog) = dialog.upgrade() else {
+            let url_row = url_row.downgrade();
+            let host_entry = host_entry.as_ref().map(|entry| entry.downgrade());
+            move || {
+                let (Some(dialog), Some(url_row)) = (dialog.upgrade(), url_row.upgrade()) else {
                     return;
                 };
-                match browser::normalize_default_url(text) {
-                    Ok(_) => {
-                        error.set_visible(false);
-                        dialog.set_response_enabled("apply", true);
-                    }
-                    Err(err) => {
-                        error.set_text(&err.to_string());
+                let host = host_entry
+                    .as_ref()
+                    .and_then(|weak| weak.upgrade())
+                    .map(|entry| entry.text().to_string());
+                // An empty host just keeps Create disabled: "enter a host"
+                // shouted at a fresh, empty form would be noise.
+                let host_blank = host.as_deref() == Some("");
+                let problem = host
+                    .as_deref()
+                    .filter(|host| !host.is_empty())
+                    .and_then(|host| state::validate_host(host).err())
+                    .map(|err| err.to_string())
+                    .or_else(|| {
+                        browser::normalize_default_url(&url_row.text())
+                            .err()
+                            .map(|err| err.to_string())
+                    });
+                match problem {
+                    Some(message) => {
+                        error.set_text(&message);
                         error.set_visible(true);
                         dialog.set_response_enabled("apply", false);
                     }
+                    None => {
+                        error.set_visible(false);
+                        dialog.set_response_enabled("apply", !host_blank);
+                    }
                 }
             }
-        };
-        validate(&url_row.text());
-        url_row.connect_changed(move |row| validate(&row.text()));
+        });
+        validate();
+        url_row.connect_changed({
+            let validate = validate.clone();
+            move |_| validate()
+        });
+        if let Some(entry) = &host_entry {
+            entry.connect_changed({
+                let validate = validate.clone();
+                move |_| validate()
+            });
+        }
 
-        let id = group.id;
+        let id = group.map(|g| g.id);
         let input = self.input.clone();
         dialog.connect_response(Some("apply"), move |_, _| {
-            // Apply is only pressable while this parses, and what it produces —
-            // scheme lowercased, implied `http://` filled in — is what gets
-            // stored. `None` covers both "cleared" and the unreachable error.
+            // Apply is only pressable while these parse, and what the URL
+            // normalizes to — scheme lowercased, implied `http://` filled in —
+            // is what gets stored. `None` covers both "cleared" and the
+            // unreachable error.
             let default_url = browser::normalize_default_url(&url_row.text())
                 .ok()
                 .flatten();
-            let _ = input.send(Msg::ApplyGroupSettings {
-                id,
-                name: name_row.text().to_string(),
-                default_url,
-            });
+            let name = name_row.text().to_string();
+            let msg = match (&host_entry, id) {
+                (Some(entry), _) => Msg::CreateRemoteGroup {
+                    host: entry.text().to_string(),
+                    name,
+                    default_url,
+                },
+                (None, Some(id)) => Msg::ApplyGroupSettings {
+                    id,
+                    name,
+                    default_url,
+                },
+                (None, None) => return,
+            };
+            let _ = input.send(msg);
         });
         dialog.present(Some(&self.window));
     }
