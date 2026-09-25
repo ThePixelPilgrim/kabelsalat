@@ -1374,6 +1374,9 @@ impl SimpleComponent for App {
                 cwd,
                 argv,
             } => {
+                // `--create` resolved the cwd against the caller's local
+                // directory; see `cli_spawn_cwd`.
+                let via_create = matches!(group, crate::cli::GroupTarget::Create { .. });
                 let group_id = match group {
                     // The snapshot the CLI validated against is a copy, so the
                     // group can in principle be gone by the time this arrives.
@@ -1417,20 +1420,12 @@ impl SimpleComponent for App {
                     }
                 };
                 let title = crate::cli::command_title(&argv);
-                // A remote group's directory is a path on its host (or None,
-                // the remote home): no local is_dir() check applies to it.
-                // Locally: without tmux, VTE's spawn just fails for a
-                // nonexistent directory and the callback only logs to stderr,
-                // leaving a permanently empty tab even though the CLI already
-                // printed a uuid and exited 0. Drop the cwd so the tab starts
-                // in the default location instead (tmux itself tolerates a
-                // missing -c directory, so this only matters for the no-tmux
-                // path).
-                let cwd = if self.group_host(group_id).is_some() {
-                    cwd
-                } else {
-                    cwd.filter(|dir| dir.is_dir())
-                };
+                let cwd = cli_spawn_cwd(
+                    self.group_host(group_id).is_some(),
+                    via_create,
+                    cwd,
+                    Path::is_dir,
+                );
                 let id = self.add_tab(
                     tab_uuid,
                     group_id,
@@ -4617,6 +4612,33 @@ fn session_definitively_gone(result: &Result<Vec<SessionInfo>, TmuxError>, uuid:
     matches!(result, Ok(sessions) if !sessions.iter().any(|si| si.uuid == uuid))
 }
 
+/// The directory a CLI-spawned tab starts in. Pure (`is_dir` is injected).
+///
+/// - A remote group's directory is a path on its host (or `None`, the remote
+///   home): no local `is_dir()` check applies to it. But a `--create` request
+///   carries the caller's *local* directory (the CLI only resolves it that way
+///   for local groups), and it can still land in a remote group when the
+///   live-model recheck finds one of that name. That path means nothing on
+///   the host, so the tab starts in the remote home instead.
+/// - Locally: without tmux, VTE's spawn just fails for a nonexistent
+///   directory and the callback only logs to stderr, leaving a permanently
+///   empty tab even though the CLI already printed a uuid and exited 0. Drop
+///   the cwd so the tab starts in the default location instead (tmux itself
+///   tolerates a missing -c directory, so this only matters for the no-tmux
+///   path).
+fn cli_spawn_cwd(
+    remote: bool,
+    via_create: bool,
+    cwd: Option<PathBuf>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    match (remote, via_create) {
+        (true, true) => None,
+        (true, false) => cwd,
+        (false, _) => cwd.filter(|dir| is_dir(dir)),
+    }
+}
+
 /// May a remote tab whose client just exited (while its session lives on)
 /// be reattached automatically? Not when the client barely ran: that is a
 /// client that cannot attach, and reattaching would loop. Pure.
@@ -5614,6 +5636,42 @@ mod tests {
         assert_eq!(decode_exit(255 << 8), remote::SSH_FAILED);
         assert_ne!(decode_exit(1 << 8), remote::SSH_FAILED);
         assert_ne!(decode_exit(9), remote::SSH_FAILED);
+    }
+
+    // --- CLI spawn directory ---------------------------------------------
+
+    #[test]
+    fn a_remote_cli_tab_keeps_its_cwd_unchecked() {
+        let never = |_: &Path| panic!("no local check for a remote path");
+        assert_eq!(
+            cli_spawn_cwd(true, false, Some(PathBuf::from("/srv/app")), never),
+            Some(PathBuf::from("/srv/app"))
+        );
+        assert_eq!(cli_spawn_cwd(true, false, None, never), None);
+    }
+
+    #[test]
+    fn a_create_request_landing_in_a_remote_group_drops_the_local_cwd() {
+        let never = |_: &Path| panic!("no local check for a remote path");
+        assert_eq!(
+            cli_spawn_cwd(true, true, Some(PathBuf::from("/home/u/proj")), never),
+            None
+        );
+    }
+
+    #[test]
+    fn a_local_cli_tab_keeps_only_an_existing_cwd() {
+        let exists = |dir: &Path| dir == Path::new("/w");
+        for via_create in [false, true] {
+            assert_eq!(
+                cli_spawn_cwd(false, via_create, Some(PathBuf::from("/w")), exists),
+                Some(PathBuf::from("/w"))
+            );
+            assert_eq!(
+                cli_spawn_cwd(false, via_create, Some(PathBuf::from("/gone")), exists),
+                None
+            );
+        }
     }
 
     // --- cross-host drag and drop ----------------------------------------
