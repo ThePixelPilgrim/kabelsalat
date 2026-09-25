@@ -139,6 +139,7 @@ pub fn run() {
          row.group-header label { font-size: 0.75em; font-weight: bold; opacity: 0.6; margin-left: 6px; }
          row.group-header-placeholder label { font-weight: normal; font-style: italic; opacity: 0.35; }
          row.host-disconnected { opacity: 0.55; }
+         row.drop-refused { background: alpha(#e01b24, 0.18); }
          .group-c0 { border-left: 4px solid #3584e4; }
          .group-c1 { border-left: 4px solid #33d17a; }
          .group-c2 { border-left: 4px solid #ff7800; }
