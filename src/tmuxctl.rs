@@ -210,10 +210,13 @@ const TMUX_CONF: &str = "\
 set -g status off
 set -g prefix None
 set -g prefix2 None
-unbind -a
-unbind -a -T root
-unbind -a -T copy-mode
-unbind -a -T copy-mode-vi
+# -q: tmux deletes a key table once it is empty, so on a server that was
+# already configured `prefix` and `copy-mode-vi` no longer exist and a
+# plain `unbind -a` fails, turning every re-source into an error.
+unbind -q -a
+unbind -q -a -T root
+unbind -q -a -T copy-mode
+unbind -q -a -T copy-mode-vi
 # Mouse must stay ON: tmux runs in VTE's alternate screen, where VTE's
 # fallback scrolling turns the wheel into cursor-up/down keypresses that
 # leak into the shell as history navigation or literal ^[[A. Requesting
@@ -1200,9 +1203,24 @@ mod tests {
         // The wheel bindings must come after the unbind -a lines that wipe
         // the tables they live in.
         assert!(
-            TMUX_CONF.find("unbind -a -T copy-mode").unwrap()
+            TMUX_CONF.find("unbind -q -a -T copy-mode").unwrap()
                 < TMUX_CONF.find("bind -n WheelUpPane").unwrap()
         );
+    }
+
+    #[test]
+    fn tmux_conf_unbinds_quietly() {
+        // Regression: re-sourcing the conf into a running server failed with
+        // "table prefix doesn't exist" because the first pass had emptied
+        // (and so deleted) the table; remote reconnects treated that as fatal.
+        let unbinds: Vec<&str> = TMUX_CONF
+            .lines()
+            .filter(|l| l.starts_with("unbind"))
+            .collect();
+        assert!(!unbinds.is_empty());
+        for line in unbinds {
+            assert!(line.starts_with("unbind -q "), "{line}");
+        }
     }
 
     #[test]
