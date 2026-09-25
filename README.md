@@ -15,6 +15,10 @@ colour-coded groups.
   its own profile and start page.
 - **Tabs live in groups.** Colour-coded, nameable, drag-and-drop; the
   sidebar collapses to a compact tab bar.
+- **Groups can live on another machine.** A remote group's tabs are tmux
+  sessions on that host, reached over one shared ssh connection — they
+  survive the GUI, the network dropping and the next login just like local
+  ones.
 - **Agent-friendly CLI.** `kabelsalat run -g web -- npm run dev` opens a
   command in a visible tab without stealing focus; a Claude Code plugin
   teaches agents the whole interface.
@@ -53,6 +57,7 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
 | --- | --- |
 | `Ctrl+Shift+T` | New tab in the active group |
 | `Ctrl+Shift+N` | New group |
+| `Ctrl+Shift+H` | New remote group |
 | `Ctrl+Shift+W` | Close the active tab |
 | `Ctrl+Shift+M` | Move the tab to another group |
 | `Ctrl+Shift+G` | Jump to a group |
@@ -74,9 +79,12 @@ second window:
     kabelsalat rename newproj proj2        # rename an existing group
 
 `--group` takes a group name or uuid; `--cwd` overrides the working directory,
-which defaults to the caller's. Everything after `--` is the command. The new
-tab does not steal focus. `run --create` reuses a unique existing match, or
-else creates a new group named exactly the given selector. `rename` refuses
+which defaults to the caller's. For a remote group the command runs on its
+host: `--cwd` is a path there (default: the remote home) and the caller's
+directory is ignored. `--create` always makes a local group. Everything
+after `--` is the command. The new tab does not steal focus. `run --create`
+reuses a unique existing match, or else creates a new group named exactly
+the given selector. `rename` refuses
 to create a duplicate name and is a no-op if the name is unchanged. Exit
 codes: 0 success, 1 not running, 2 usage, 3 no such group, ambiguous, or (for
 `rename`) name already in use.
@@ -100,11 +108,52 @@ For hacking on the skill itself, `scripts/install-skill.sh` symlinks
 `skills/kabelsalat` into `~/.claude/skills/` — a dev-mode shortcut, not the
 supported install path.
 
+## Remote groups
+
+`Ctrl+Shift+H` (or the server button above the tab list) creates a group on
+another machine. Enter any ssh destination — `user@host`, an alias from
+`~/.ssh/config`, or `ssh://user@host:port`. The group's tabs are tmux
+sessions on a kabelsalat-owned server on that host (`tmux -L kabelsalat`),
+reached over one ssh connection per host, so they survive the GUI exactly like
+local tabs. A group's host is fixed; tabs cannot be moved between hosts.
+
+- **Login:** key-based, or through a graphical askpass program if one is
+  installed (`$SSH_ASKPASS`, `gnome-ssh-askpass`/`ssh-askpass` from
+  `openssh-askpass` or `ssh-askpass-gnome`, `ksshaskpass`,
+  `lxqt-openssh-askpass`) — at most one prompt per host and start. kabelsalat
+  never prompts in a terminal; without askpass, a host that wants a password
+  or an unknown host key is refused with instructions (e.g. run `ssh <host>`
+  once to accept its key).
+- **Disconnects:** when the connection drops, every tab of that host shows a
+  page with the reason and a **Reconnect** button (within about 45 s of the
+  network going away). There are no automatic retries. Tabs closed while
+  disconnected are killed on the host after the next successful connect.
+- **Requirements:** OpenSSH 8.4 or newer here, tmux 3.2 or newer on the host.
+- **Local-only features:** the browser pane runs on this computer, and its
+  CDP variables (`KABELSALAT_CDP`, `PLAYWRIGHT_MCP_CDP_ENDPOINT`) and
+  `KABELSALAT_GROUP` are not exported into remote tabs.
+- **Sharing a host:** every kabelsalat installation and version shares the one
+  `tmux -L kabelsalat` server per remote user, but only ever attaches its own
+  sessions; unknown sessions there are ignored, never adopted.
+- **Logout survival on the host** depends on that host: if its logind kills a
+  user's processes when the last session ends (`KillUserProcesses=yes`), run
+  `loginctl enable-linger` there, as for local sessions.
+- **Downgrading** to a kabelsalat without remote groups turns them into local
+  groups (their tabs are respawned as local shells) and leaves the remote
+  sessions running on the host. Find them with
+  `ssh <host> tmux -L kabelsalat ls`; attach with `tmux -L kabelsalat attach
+  -t ks-<uuid>` or remove them with `tmux -L kabelsalat kill-server`.
+
+The ssh control sockets live in `$XDG_RUNTIME_DIR/kabelsalat/ssh/`; quitting
+kabelsalat closes the connections but leaves the remote sessions running.
+
 ## Requirements
 
 - Rust 1.85 or newer (edition 2024)
 - GTK 4.18, libadwaita 1.5 and VTE 0.82 or newer, including development headers
 - Optional: tmux 3.2 or newer for crash-safe sessions (fully usable without)
+- Optional: OpenSSH 8.4 or newer for remote groups (tmux 3.2 or newer on
+  each remote host)
 
 On Fedora:
 
