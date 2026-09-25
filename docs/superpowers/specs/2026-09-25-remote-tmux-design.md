@@ -391,3 +391,45 @@ inside tmux is stable, and a dropped network only drops the viewer.
   installation runs its own.
 - **Image clipboard over RDP:** whether it can carry the screenshot
   paste.
+
+## Amendments (2026-09-25)
+
+Recorded by the plan's pre-verification review; the plan
+(`docs/superpowers/plans/2026-09-25-remote-tmux.md`) is authoritative where
+the two differ.
+
+- **§2 "Tabs never authenticate".** `-o ControlMaster=no` alone does not
+  exit 255 without a master: ssh falls back to a direct connection
+  (ssh_config(5)). Tabs and the worker's tmux calls therefore run with
+  `-S <path> -o ControlMaster=no -o BatchMode=yes -o ConnectTimeout=10
+  -o ProxyCommand=false`. `BatchMode` stops any prompt; `ProxyCommand=false`
+  makes the fallback fail at once with 255 and no network, while a live
+  master is still reused (verified against a throwaway sshd).
+- **§1 pending kills** are kept per host at the top level of the state file
+  (`pending_kills: [{host, uuid}]`), not in the group: an empty group is
+  pruned, and its queue must outlive it. Closing a remote tab always enqueues
+  the kill; only the host's confirmation dequeues it.
+- **§2 remote tmux** is invoked as `tmux -L kabelsalat -f /dev/null …`, so a
+  server started by kabelsalat never reads the host user's `~/.tmux.conf`;
+  the remote config arrives through `source-file -` (tmux 3.1+, confirmed in
+  CHANGES; the upload fallback stays). The bootstrap works because the
+  config sets `exit-empty off` inside the same client connection — a bare
+  `start-server` on tmux ≥ 3.2 leaves no server behind.
+- **§2 `classify`** takes the auth mode: "Permission denied" is
+  `AuthNeedsAskpass` without askpass and `AuthFailed` with it.
+- **§3 remote tab without a command** passes no shell-command to
+  `new-session`; the remote user's default shell starts. Remote tabs get no
+  `-e` pairs (local-only variables).
+- **§3 quick-exit guard.** A remote client that exits within 2 s of its
+  spawn while its session lives is not reattached automatically; the tab
+  shows Reconnect instead of looping.
+- **§4 Host row** is read-only on every existing group (an empty group does
+  not exist); "Move to → New group" creates the new group on the tab's host.
+- **§1 downgrade.** No version field, so an older kabelsalat respawns remote
+  tabs as local shells and drops `host` on save; the remote sessions keep
+  running on the host. Documented in the README; the "Adopt sessions from
+  host…" follow-up is the real fix. A fail-safe schema (separate
+  `remote_tabs` list) is possible but is a decision for the user.
+- **`SSH_ASKPASS_REQUIRE=force`** is documented for passphrase input only;
+  host-key confirmation uses the same OpenSSH code path and reaches askpass
+  in practice, which manual tests 2 and 3 verify.

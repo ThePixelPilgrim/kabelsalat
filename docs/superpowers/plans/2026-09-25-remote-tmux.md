@@ -22,7 +22,7 @@
 - Exact values, from the spec:
   - control path `$XDG_RUNTIME_DIR/kabelsalat/ssh/%C`
   - master options `ControlMaster=auto`, `ControlPersist=yes`, `ConnectTimeout=10`, `ServerAliveInterval=15`, `ServerAliveCountMax=3`
-  - tab and worker ssh `-S <path> -o ControlMaster=no`
+  - tab and worker ssh `-S <path> -o ControlMaster=no -o BatchMode=yes -o ProxyCommand=false` (decision 2)
   - remote server `tmux -L kabelsalat`
   - remote cwd lookup waits 300 ms
   - on quit, `ssh -O exit` for each master
@@ -31,6 +31,7 @@
 - Before claiming any task done, run `cargo fmt`, `cargo clippy --all-targets` (no new warnings) and `cargo test` (all pass).
 - Commit messages are plain imperative sentences in the `git log` style (`Sort the sidebar by age bucket, not raw stamp`). No `feat:` prefixes and no attribution or `Co-Authored-By` trailers.
 - Tasks that touch `src/app.rs` run strictly one after another (see each task's **Depends on:** line).
+- Line numbers in the tasks refer to the files as they are on the branch **before any task** (commit `2cf1034`). Earlier tasks shift them (Task 1 adds ~73 lines to `state.rs` and 2 to `app.rs`, Tasks 7 and 8 a few more to `app.rs`), so locate code by the quoted text anchors and treat the numbers as a hint, not an address.
 
 ### Decisions this plan takes where the spec is silent or unworkable
 
@@ -39,9 +40,9 @@ These are deliberate. Reviewers should check them against the spec.
 1. **Pending kills are top-level, keyed by host** (`SavedState::pending_kills: Vec<PendingKill { host, uuid }>`), not a field of `SavedGroup`.
    - A group is pruned the moment its last tab closes (`prune_empty_groups`). A per-group queue would vanish together with the group it belongs to.
    - The spec itself calls it a "per-host pending-kill queue".
-2. **Every non-master ssh carries `-o BatchMode=yes -o ConnectTimeout=10`.**
-   - With `-o ControlMaster=no`, ssh whose control socket is missing does **not** exit 255. It falls back to a direct connection, which could prompt on the tab's pty.
-   - `BatchMode` makes that fallback non-interactive, so it either logs in silently with a key or fails.
+2. **Every non-master ssh carries `-o BatchMode=yes -o ConnectTimeout=10 -o ProxyCommand=false`.**
+   - With `-o ControlMaster=no`, ssh whose control socket is missing does **not** exit 255. It falls back to a direct connection (ssh_config(5), ControlMaster: "will fall back to connecting normally if the control socket does not exist, or is not listening"; verified with OpenSSH 10.2), which could prompt on the tab's pty.
+   - `BatchMode` makes that fallback non-interactive. `ProxyCommand=false` makes it fail outright: the mux client is tried before any connection is made, so a live master is reused as usual, and without one ssh runs `false` as its transport and exits 255 at once ("Connection closed by UNKNOWN port 65535"), never opening a stray direct connection of its own. That restores the spec's "exits 255 immediately". Verified against a throwaway sshd: remote exit statuses still pass through, `-t` still gets a pty.
 3. **Remote tmux runs as `tmux -L kabelsalat -f /dev/null …`.** Without `-f`, a server started by that command would read the user's `~/.tmux.conf` before our config is sourced.
 4. **A remote tab with no command passes no shell-command to `new-session`.** The local `$SHELL` means nothing on the host, so tmux starts the remote user's default shell.
 5. **`classify` takes the `AuthMode` as a third argument.**
@@ -58,6 +59,16 @@ These are deliberate. Reviewers should check them against the spec.
     - A remote tab's crash marker (`[exit N]`) comes from `pane_dead` in the connect and child-exit `list-sessions` replies (spec §3).
     - A pane that dies while attached keeps showing tmux's "Pane is dead" text. The sidebar marker appears at the next list-sessions, which is the next reconnect or client exit.
 12. **`Target::Local` also carries the config path and the events directory.** So `TmuxCtl::events_dir()` now returns `Option<&Path>`.
+13. **Downgrade is not guarded.** An older kabelsalat ignores `host` and `pending_kills` (serde keeps unknown fields silently; only a parse error moves the file aside), so it respawns every remote tab as a *local* shell under the same uuid and, on its next save, drops `host`: the group is local from then on, and the remote sessions keep running on the host with nothing pointing at them. The spec rules out a version field, and every cheap alternative (a second file, a deliberately unparsable field, a separate `remote_tabs` list) is a version field in disguise or a schema change of its own. So the plan only documents it (Task 16 README) and leaves the fix to the "Adopt sessions from host…" follow-up, which would let a re-upgraded kabelsalat find those sessions again. Recovery by hand: `ssh <host> tmux -L kabelsalat ls`, then `attach -t ks-<uuid>` or `kill-server`. If the user wants fail-safe downgrades in v1, the smallest schema change is to keep remote tabs in a separate top-level `remote_tabs` list (old versions then see no remote group at all, and create nothing), which touches Tasks 1, 2 and 10 — a decision for the user, not this plan.
+
+### Facts checked while writing and reviewing this plan (OpenSSH 10.2, tmux 3.7c)
+
+- `ssh_config(5)`: `ControlMaster=no` "will fall back to connecting normally if the control socket does not exist, or is not listening" — hence decision 2. `BatchMode=yes` disables "password prompts and host key confirmation requests". With `ServerAliveInterval=15` and `ServerAliveCountMax=3`, "ssh will disconnect after approximately 45 seconds". `%C` is the hash of `%l%h%p%r%j` and expands when given through `-S` on the command line too.
+- `ssh(1)`: exits "with the exit status of the remote command or with 255 if an error occurred"; `-O check` and `-O exit` need the destination argument and exit 255 with `Control socket connect(…): No such file or directory` when there is no master. `-O exit` ends the master, and with it every mux client that ran through it — on quit that is intended; remote sessions are tmux's and survive.
+- `SSH_ASKPASS_REQUIRE=force` is documented for "all passphrase input". Host-key confirmation goes through the same `read_passphrase` path in OpenSSH, so with askpass it is prompted graphically in practice, and a declined or failed confirmation ends in "Host key verification failed" (`classify` → `HostKeyUnknown`). Manual tests 2 and 3 of Task 17 cover both. `NumberOfPasswordPrompts=1` is accepted by 10.2; its effect on askpass prompts is not documented, so it is best-effort.
+- A `ControlPersist` master redirects its stdio to `/dev/null` when it detaches, so the worker's pipes close as soon as the foreground ssh exits (`DRAIN_GRACE` is a safety net only). `-t` with a non-tty stdin prints "Pseudo-terminal will not be allocated" and continues; tabs have VTE's pty, the worker never passes `-t`.
+- tmux: `source-file -` is listed under "CHANGES FROM 3.0a TO 3.1" (line 1435 of 3.7c's CHANGES, which lists newest first); `new-session -e` and `remain-on-exit failed` are under "3.1c TO 3.2"; `exit-empty` defaults to on since 3.2, so a bare `start-server` leaves no server behind — the bootstrap works only because `remote_conf()` turns `exit-empty` off inside the same client connection (verified with the real config: the server survives, `remain-on-exit failed` and the dead-pane formats work). `-f` only matters for the process that starts the server. `list-sessions` and `kill-session` exit 1 with `no server running on …` when there is no server, and `kill-session -t` exits 1 with `can't find session: …` when the server runs; `display-message -p -t <missing session>` exits 0 with empty output, which is why `pane_path` checks for an empty reply. `new-session -A -c <dir>` never changes the directory of an existing session.
+- On this machine `ssh localhost` fails with "Too many authentication failures" because the agent offers many keys: the manual harness needs a `Host localhost` entry with `IdentitiesOnly yes` and the right `IdentityFile`, or a throwaway `sshd -p <port>` with its own key.
 
 ### Manual test harness (used by the GUI tasks)
 
@@ -109,7 +120,7 @@ Clean up afterwards: `ssh localhost tmux -L kabelsalat kill-server; rm -rf /tmp/
   - `Default for SavedState` `168-179`
   - new free functions after `newest_first_index` (`321-326`)
   - tests: `sample_state` `427-477`, new tests appended to `mod tests`
-- Modify: `src/app.rs` `save_state` (`1523-1579`). This is a compile fix only: the struct literals gain the new fields.
+- Modify: `src/app.rs` `save_state` (`1516-1594`; the `SavedGroup` literal starts at `1523`, the `SavedState` literal ends at `1579`). This is a compile fix only: the struct literals gain the new fields.
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -343,7 +354,7 @@ git commit -m "Persist a group's host and the pending remote kills"
 **Depends on:** Task 1
 
 **Files:**
-- Modify: `src/state.rs`. Add new items after `reconcile` (`399-421`), and append tests to `mod tests`.
+- Modify: `src/state.rs`. Add new items after `reconcile` (`399-421` before Task 1; `470-494` after it, with `#[cfg(test)]` at `496`), and append tests to `mod tests`.
 
 **Interfaces:**
 - Consumes (Task 1): `SavedGroup::host`.
@@ -490,7 +501,7 @@ Expected: compile errors. `cannot find function reconcile_local`, `RemoteListing
 
 - [ ] **Step 3: Write the implementation**
 
-In `src/state.rs`, directly after `reconcile` (after line `421`), add:
+In `src/state.rs`, directly after `reconcile` (after its closing brace, line `421` before Task 1 / `494` after it), add:
 
 ```rust
 /// The host a saved group's tabs run on; `None` for a local group or an
@@ -629,7 +640,7 @@ git commit -m "Plan startup restore per host; remote hosts never adopt"
 
 **Files:**
 - Create: `src/remote.rs`
-- Modify: `src/lib.rs:9-12` (module list)
+- Modify: `src/lib.rs:7-12` (module list)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -715,7 +726,7 @@ mod tests {
 }
 ```
 
-In `src/lib.rs`, change the module list (`8-12`) to:
+In `src/lib.rs`, change the module list (`7-12`, starting at `mod app;`) to:
 
 ```rust
 mod app;
@@ -1432,6 +1443,8 @@ Append to `mod tests` in `src/remote.rs`:
                 "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "ProxyCommand=false",
                 "-t",
                 "me@box",
                 "--",
@@ -1553,11 +1566,13 @@ pub fn remote_tmux_prefix() -> Vec<String> {
 }
 
 /// ssh through the host's master for tabs and the worker's tmux calls. They
-/// never authenticate: `ControlMaster=no` uses the master, and because ssh
-/// falls back to a direct connection when the master's socket is gone,
-/// `BatchMode=yes` keeps that fallback from ever prompting (and
-/// `ConnectTimeout` from hanging). `remote_argv` is quoted once more into the
-/// single string the remote login shell parses.
+/// never authenticate: `ControlMaster=no` uses the master. ssh would fall
+/// back to a direct connection when the master's socket is gone, so
+/// `BatchMode=yes` keeps that fallback from ever prompting, and
+/// `ProxyCommand=false` makes it fail at once (exit 255, no network): the
+/// mux client is tried before any connection, so a live master is reused as
+/// usual. `remote_argv` is quoted once more into the single string the
+/// remote login shell parses.
 pub fn mux_argv(dest: &str, control_path: &Path, tty: bool, remote_argv: &[String]) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "ssh".into(),
@@ -1569,6 +1584,8 @@ pub fn mux_argv(dest: &str, control_path: &Path, tty: bool, remote_argv: &[Strin
         "BatchMode=yes".into(),
         "-o".into(),
         format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"),
+        "-o".into(),
+        "ProxyCommand=false".into(),
     ];
     if tty {
         argv.push("-t".into());
@@ -1682,7 +1699,6 @@ git commit -m "Build the ssh argv for masters, tabs and control requests"
   - imports (`7-9`)
   - `TMUX_CONF` users
   - `TmuxCtl` struct and impl (`249-524`)
-  - `is_no_server_stderr` callers (`549-553`)
   - tests: `writes_config_with_events_dir` (`990-1000`), plus new tests at the end of `mod tests`
 - Modify `src/app.rs` `init`, the events-dir watch (`847-881`, first two lines).
 
@@ -1701,7 +1717,7 @@ git commit -m "Build the ssh argv for masters, tabs and control requests"
     - `pub fn respawn_pane_args(uuid: &str) -> Vec<String>`
     - `pub fn pane_current_path_args(uuid: &str) -> Vec<String>`
     - `pub fn list_sessions_from_output(&self, code: Option<i32>, stdout: &str, stderr: &str) -> Result<Vec<SessionInfo>, TmuxError>`
-  - `spawn_argv` for a `Remote` target returns `ssh -S <cp> -o ControlMaster=no -o BatchMode=yes -o ConnectTimeout=10 -t <dest> -- '<tmux -L kabelsalat -f /dev/null new-session -A … -s ks-<uuid> [cmd]>'` (no `$SHELL`).
+  - `spawn_argv` for a `Remote` target returns `ssh -S <cp> -o ControlMaster=no -o BatchMode=yes -o ConnectTimeout=10 -o ProxyCommand=false -t <dest> -- '<tmux -L kabelsalat -f /dev/null new-session -A … -s ks-<uuid> [cmd]>'` (no `$SHELL`).
   - `pub fn remote_conf() -> String`: `TMUX_CONF` without the `pane-died` hook line.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2074,7 +2090,7 @@ In `impl TmuxCtl`:
     }
 ```
 
-3. Replace `spawn_argv`'s body (`313-343`, keep its doc comment and add the last paragraph below to it) with:
+3. Replace `spawn_argv` (`307-343`: signature and body; keep its existing doc comment and append the paragraph below to it, after a blank `///` line) with:
 
 ```rust
     /// On a remote target the argv is `ssh … -t <dest> -- '<tmux words>'`,
@@ -2393,7 +2409,7 @@ git commit -m "Give TmuxCtl a local or remote target sharing one set of argv bui
 - Modify `src/app.rs`:
   - `Msg::SpawnCommand` (`438-443`)
   - its handler's `let cwd = cwd.is_dir().then_some(cwd);` (`1216`)
-  - `save_state`'s `GroupInfo` literal (`1587-1591`)
+  - `save_state`'s `GroupInfo` literal (`1587-1591`; `1589-1593` after Task 1)
 
 **Interfaces:**
 - Consumes (Task 1): `SavedGroup::host`.
@@ -2617,8 +2633,8 @@ In `src/app.rs`:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib cli::tests control::tests`
-Expected: all pass (5 new).
+Run: `cargo test --lib cli::tests && cargo test --lib control::tests` (cargo takes one filter per run)
+Expected: all pass (42 in `cli::tests`, 5 of them new; 3 in `control::tests`).
 
 Run: `cargo fmt && cargo clippy --all-targets && cargo test`
 Expected: clean.
@@ -2643,6 +2659,7 @@ git commit -m "Let kabelsalat run target remote groups without a local cwd"
 - Consumes:
   - Tasks 3–6: `remote::{SshAvailability, ssh_availability, AuthMode, askpass_env, classify, RemoteError, master_argv, mux_argv, control_argv, ControlOp, start_server_argv, upload_conf_argv, SSH_FAILED}`
   - Task 7: `tmuxctl::{TmuxCtl, SessionInfo, TmuxVersion, remote_conf}`
+  - existing: `state::state_dir() -> PathBuf` (`src/state.rs`)
 - Produces (used by Tasks 11, 12):
   - `pub fn detect_ssh() -> SshAvailability`
   - `pub fn is_executable(path: &Path) -> bool`
@@ -2663,8 +2680,8 @@ git commit -m "Let kabelsalat run target remote groups without a local cwd"
 
 - [ ] **Step 1: Verify `source-file -` on tmux 3.2 (spec's open check)**
 
-Run: `grep -n 'support "-" for standard input' /usr/share/doc/tmux/CHANGES && grep -n '^CHANGES FROM 3.0a TO 3.1\|^CHANGES FROM 3.1 TO 3.1a' /usr/share/doc/tmux/CHANGES`
-Expected: the "modify source-file to support "-" for standard input" line number falls between the two `CHANGES FROM` headers, so the feature shipped in **tmux 3.1**. It is in every tmux ≥ 3.2. (Checked while writing this plan against tmux 3.7c's CHANGES: line 1434–1435, inside "3.0a to 3.1", which spans lines 1380–1513.)
+Run: `grep -n 'support "-" for standard input' /usr/share/doc/tmux/CHANGES && grep -n '^CHANGES FROM 3.0a TO 3.1\|^CHANGES FROM 3.0 TO 3.0a' /usr/share/doc/tmux/CHANGES`
+Expected: the file lists releases newest first, so the "support "-" for standard input" line number falls between the `3.0a TO 3.1` header and the `3.0 TO 3.0a` header below it: the feature shipped in **tmux 3.1**. It is in every tmux ≥ 3.2. (Checked while writing this plan against tmux 3.7c's CHANGES: line 1434–1435, inside "3.0a to 3.1", which spans lines 1380–1513.)
 
 Optional live check against a real 3.2 (Ubuntu 22.04 ships 3.2a):
 
@@ -3057,8 +3074,10 @@ use crate::remote::{self, AuthMode, ControlOp, RemoteError, SshAvailability};
 use crate::tmuxctl::{self, SessionInfo, TmuxCtl, TmuxVersion};
 
 /// How long to wait for a pipe's end after the process exited. A master
-/// forked by `ControlPersist` could in principle keep an inherited pipe open
-/// forever; the output read so far is used then.
+/// forked by `ControlPersist` redirects its stdio to /dev/null when it
+/// detaches (verified with OpenSSH 10.2), so this is only a safety net for
+/// a client that keeps an inherited pipe open; the output read so far is
+/// used then.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// Run `ssh -V` once (stdin from /dev/null) and classify the client.
@@ -3429,6 +3448,8 @@ impl<R: Runner> HostSession<R> {
         }
     }
 
+    /// The empty check is load-bearing: on tmux 3.7c `display-message -p -t
+    /// <missing session>` exits 0 with empty output rather than failing.
     fn pane_path(&mut self, uuid: &str) -> Option<String> {
         let argv = self.ctl.command_argv(&TmuxCtl::pane_current_path_args(uuid));
         let out = self.run(&argv, &[], None);
@@ -3617,7 +3638,7 @@ with:
 
 In the `self.groups.push(Group { … })` of the saved-groups loop, add `host: group.host.clone(),` after `default_url: group.default_url.clone(),`.
 
-In `save_state`, replace the `host: None,` added in Task 1 with `host: g.host.clone(),`. Replace `pending_kills: Vec::new(),` with `pending_kills: self.pending_kills.clone(),`.
+In `save_state` only (both strings also occur in `init` and `create_group`, which stay as they are): replace the `host: None,` that follows `default_url: g.default_url.clone(),` with `host: g.host.clone(),`, and the `pending_kills: Vec::new(),` that follows `sidebar_order: self.sidebar_order,` with `pending_kills: self.pending_kills.clone(),`.
 
 - [ ] **Step 3: Add `group_host` and keep the CDP/group variables local**
 
@@ -3691,7 +3712,7 @@ git commit -m "Keep each group's host and the pending remote kills in the model"
   - `add_tab` (`2422-2544`)
   - `activate` (`2625`)
   - `close_tab` (`2654`)
-  - `spawn_backing` (`3943-3972`)
+  - `spawn_backing` (`3940-3972`, with its doc comment)
   - new `impl App` section "remote hosts"
 
 **Interfaces:**
@@ -3892,7 +3913,7 @@ In `shutdown`, directly after the `for id in browser_group_ids { self.cdp_env_un
         }
 ```
 
-In `restore_or_fresh`, directly before the final `self.start_browser_maintenance();` (`1511`), add:
+In `restore_or_fresh`, directly before the comment `// Before the save, not after: this fills `pending_browser_restore`…` that precedes the final `self.start_browser_maintenance();` (`1506-1511`), so the comment stays attached to that call, add:
 
 ```rust
         // Remote tabs came back detached, behind their host page. Each host
@@ -3978,7 +3999,7 @@ In `activate`, replace `self.stack.set_visible_child(&tab.terminal);` with `self
 
 In `close_tab`, replace `self.stack.remove(&tab.terminal);` with `self.stack.remove(&tab.view);`.
 
-Replace `spawn_backing` (`3940-3972`) with:
+Replace `spawn_backing` (`3940-3972`, doc comment included; the `fn` line is `3943`) with:
 
 ```rust
 /// Spawn a tab's backing process: the tmux client for its session when tmux is
@@ -4406,6 +4427,8 @@ In `Tab`, after `pending` (Task 11), add:
 In `add_tab`'s `Tab { … }` literal, add `spawned_at: None,` after `pending,`.
 
 In `spawn_remote_tab`, after `tab.attached = true;`, add `tab.spawned_at = Some(Instant::now());`.
+
+In `decode_exit`'s doc comment, replace the sentence that says it is used only in the no-tmux fallback with: `/// Used in the no-tmux fallback, and by remote tabs to tell ssh's own 255 from the remote side's status.`
 
 Next to `session_definitively_gone` (`3631-3633`), add:
 
@@ -4849,11 +4872,17 @@ Replace the whole `show_group_settings_dialog` (doc comment included, `3382-3475
                 Some(entry)
             }
             Some(group) => {
-                let host = group.host.as_deref().unwrap_or("This computer");
+                // A subtitle is Pango markup by default, and a host may
+                // legally contain '&' or '<'.
+                let subtitle = match group.host.as_deref() {
+                    Some(host) => format!("{host}\nClose all tabs to change the host"),
+                    None => "This computer".to_string(),
+                };
                 rows.add(
                     &adw::ActionRow::builder()
                         .title("Host")
-                        .subtitle(format!("{host}\nClose all tabs to change the host"))
+                        .subtitle(subtitle)
+                        .use_markup(false)
                         .build(),
                 );
                 None
@@ -5020,7 +5049,7 @@ In `make_group_header`, directly after the title label is appended to `row_box` 
         }
 ```
 
-In `make_row`, after `row.add_css_class(group.css);` (`3354`), add:
+In `make_row` (not the picker, which has the same line), after `row.add_css_class(group.css);` (`3354`), add:
 
 ```rust
         // Rows of a disconnected host stay selectable (their page explains
@@ -5385,6 +5414,8 @@ In `drop_tab_on_group`, directly after `if !self.groups.iter().any(|g| g.id == g
 
 (`si` comes from the `position` lookup just above, so the index is valid.)
 
+Two things to know, not to change: because `enter`/`motion` answer no action for a cross-host tab, GTK never emits `drop` for it, so the toast in the three handlers above is only reached through a stale payload (a `rebuild_list` renumbering `host_keys` mid-drag) or the picker — the drop-time check is the authority, the cursor is the feedback. And if a compositor does not emit `leave` after a refused hover, the `drop-refused` tint lasts until the next `rebuild_list`; manual check 1 covers this.
+
 In `move_active_tab`, replace:
 
 ```rust
@@ -5646,6 +5677,11 @@ local tabs. A group's host is fixed; tabs cannot be moved between hosts.
 - **Logout survival on the host** depends on that host: if its logind kills a
   user's processes when the last session ends (`KillUserProcesses=yes`), run
   `loginctl enable-linger` there, as for local sessions.
+- **Downgrading** to a kabelsalat without remote groups turns them into local
+  groups (their tabs are respawned as local shells) and leaves the remote
+  sessions running on the host. Find them with
+  `ssh <host> tmux -L kabelsalat ls`; attach with `tmux -L kabelsalat attach
+  -t ks-<uuid>` or remove them with `tmux -L kabelsalat kill-server`.
 
 The ssh control sockets live in `$XDG_RUNTIME_DIR/kabelsalat/ssh/`; quitting
 kabelsalat closes the connections but leaves the remote sessions running.
