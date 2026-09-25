@@ -1541,6 +1541,7 @@ impl App {
                     g.browser_split
                 },
                 default_url: g.default_url.clone(),
+                host: None,
             })
             .collect();
         let tabs = self
@@ -1576,6 +1577,7 @@ impl App {
             sidebar_visible: self.sidebar_visible,
             linger_warning_dismissed: self.linger_dismissed,
             sidebar_order: self.sidebar_order,
+            pending_kills: Vec::new(),
         };
         self.persist(&state);
         // Same choke point as the save, so the CLI always sees what was last
