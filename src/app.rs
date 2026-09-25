@@ -1904,6 +1904,13 @@ impl App {
         let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
             return;
         };
+        // Attached again since the exit asked for this listing (a Reconnect
+        // or a host connect ran `attach_host_tabs` in the meantime): the
+        // listing is stale. Acting on it would spawn a second client into
+        // the terminal, or close the tab and kill the session `-A` just made.
+        if tab.attached {
+            return;
+        }
         let uuid = tab.uuid.clone();
         let since_spawn = tab.spawned_at.map(|at| at.elapsed());
         let Some(host) = self.group_host(tab.group) else {
