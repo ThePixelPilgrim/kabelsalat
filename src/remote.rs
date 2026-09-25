@@ -5,6 +5,8 @@
 //! GTK; `remote_worker.rs` does the I/O. That split is what keeps it
 //! unit-testable.
 
+use std::path::{Path, PathBuf};
+
 /// Oldest OpenSSH that honours `SSH_ASKPASS_REQUIRE`, without which a login
 /// could end up prompting on a terminal.
 pub const MIN_SSH: (u32, u32) = (8, 4);
@@ -65,6 +67,76 @@ pub fn ssh_availability(version_output: Option<&str>) -> SshAvailability {
         Some(version) if version >= MIN_SSH => SshAvailability::Available(version),
         Some(version) => SshAvailability::TooOld(version),
         None => SshAvailability::Missing,
+    }
+}
+
+/// Askpass programs at fixed paths, in priority order: Fedora's two, then
+/// Debian's and Arch's.
+pub const ASKPASS_PATHS: [&str; 3] = [
+    "/usr/libexec/openssh/gnome-ssh-askpass",
+    "/usr/libexec/openssh/ssh-askpass",
+    "/usr/lib/ssh/ssh-askpass",
+];
+
+/// Askpass programs looked up on `PATH`, in priority order.
+pub const ASKPASS_NAMES: [&str; 3] = ["ksshaskpass", "lxqt-openssh-askpass", "ssh-askpass"];
+
+/// How a host's master logs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthMode {
+    /// One attempt with `SSH_ASKPASS=<path>` and `SSH_ASKPASS_REQUIRE=force`:
+    /// key logins stay silent; passwords, passphrases and host-key
+    /// confirmations go to the graphical program.
+    Askpass(PathBuf),
+    /// `BatchMode=yes`: anything interactive fails, and the host is refused.
+    BatchOnly,
+}
+
+/// Pick the login mode. Candidates, first executable wins:
+/// `$SSH_ASKPASS`, then [`ASKPASS_PATHS`], then [`ASKPASS_NAMES`] on `PATH`
+/// (by name first, then by directory). `env` and `is_executable` are
+/// injected so the choice is testable without touching the system.
+pub fn auth_mode(
+    env: impl Fn(&str) -> Option<String>,
+    is_executable: impl Fn(&Path) -> bool,
+) -> AuthMode {
+    if let Some(path) = env("SSH_ASKPASS").filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(path);
+        if is_executable(&path) {
+            return AuthMode::Askpass(path);
+        }
+    }
+    for path in ASKPASS_PATHS {
+        let path = Path::new(path);
+        if is_executable(path) {
+            return AuthMode::Askpass(path.to_path_buf());
+        }
+    }
+    if let Some(search) = env("PATH") {
+        for name in ASKPASS_NAMES {
+            for dir in search.split(':').filter(|dir| !dir.is_empty()) {
+                let candidate = Path::new(dir).join(name);
+                if is_executable(&candidate) {
+                    return AuthMode::Askpass(candidate);
+                }
+            }
+        }
+    }
+    AuthMode::BatchOnly
+}
+
+/// Environment for the master's ssh: the askpass pair in askpass mode,
+/// nothing in batch mode (`BatchMode=yes` goes on the command line).
+pub fn askpass_env(mode: &AuthMode) -> Vec<(String, String)> {
+    match mode {
+        AuthMode::Askpass(path) => vec![
+            (
+                "SSH_ASKPASS".to_string(),
+                path.to_string_lossy().into_owned(),
+            ),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+        ],
+        AuthMode::BatchOnly => Vec::new(),
     }
 }
 
@@ -142,5 +214,113 @@ mod tests {
         );
         assert!(!SshAvailability::Missing.is_available());
         assert!(SshAvailability::Missing.reason().unwrap().contains("8.4"));
+    }
+
+    // --- auth mode ---
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    fn executables(paths: &[&str]) -> impl Fn(&Path) -> bool {
+        let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        move |path| paths.iter().any(|p| p == path)
+    }
+
+    fn askpass(path: &str) -> AuthMode {
+        AuthMode::Askpass(PathBuf::from(path))
+    }
+
+    #[test]
+    fn ssh_askpass_wins_when_executable() {
+        let mode = auth_mode(
+            env_of(&[("SSH_ASKPASS", "/opt/my-askpass"), ("PATH", "/usr/bin")]),
+            executables(&["/opt/my-askpass", "/usr/libexec/openssh/gnome-ssh-askpass"]),
+        );
+        assert_eq!(mode, askpass("/opt/my-askpass"));
+    }
+
+    #[test]
+    fn a_non_executable_ssh_askpass_is_skipped() {
+        let mode = auth_mode(
+            env_of(&[("SSH_ASKPASS", "/opt/broken")]),
+            executables(&["/usr/libexec/openssh/gnome-ssh-askpass"]),
+        );
+        assert_eq!(mode, askpass("/usr/libexec/openssh/gnome-ssh-askpass"));
+    }
+
+    #[test]
+    fn fixed_paths_are_tried_in_order() {
+        let all = [
+            "/usr/libexec/openssh/gnome-ssh-askpass",
+            "/usr/libexec/openssh/ssh-askpass",
+            "/usr/lib/ssh/ssh-askpass",
+        ];
+        for skip in 0..all.len() {
+            let mode = auth_mode(env_of(&[]), executables(&all[skip..]));
+            assert_eq!(mode, askpass(all[skip]), "with {:?}", &all[skip..]);
+        }
+    }
+
+    #[test]
+    fn fixed_paths_beat_path_lookups() {
+        let mode = auth_mode(
+            env_of(&[("PATH", "/usr/bin")]),
+            executables(&["/usr/bin/ksshaskpass", "/usr/lib/ssh/ssh-askpass"]),
+        );
+        assert_eq!(mode, askpass("/usr/lib/ssh/ssh-askpass"));
+    }
+
+    #[test]
+    fn path_names_are_tried_in_order_whatever_the_directory_order() {
+        let mode = auth_mode(
+            env_of(&[("PATH", "/a:/b")]),
+            executables(&[
+                "/a/ssh-askpass",
+                "/b/lxqt-openssh-askpass",
+                "/b/ksshaskpass",
+            ]),
+        );
+        assert_eq!(mode, askpass("/b/ksshaskpass"));
+        let mode = auth_mode(
+            env_of(&[("PATH", "/a:/b")]),
+            executables(&["/a/ssh-askpass", "/b/lxqt-openssh-askpass"]),
+        );
+        assert_eq!(mode, askpass("/b/lxqt-openssh-askpass"));
+    }
+
+    #[test]
+    fn empty_path_entries_are_ignored() {
+        // An empty PATH entry means "the current directory" to a shell; a
+        // relative askpass is never what we want.
+        let mode = auth_mode(env_of(&[("PATH", "::/x")]), executables(&["ssh-askpass"]));
+        assert_eq!(mode, AuthMode::BatchOnly);
+    }
+
+    #[test]
+    fn nothing_found_means_batch_only() {
+        assert_eq!(
+            auth_mode(env_of(&[]), executables(&[])),
+            AuthMode::BatchOnly
+        );
+    }
+
+    #[test]
+    fn askpass_env_forces_askpass_and_batch_sets_nothing() {
+        assert_eq!(
+            askpass_env(&askpass("/usr/bin/ksshaskpass")),
+            vec![
+                (
+                    "SSH_ASKPASS".to_string(),
+                    "/usr/bin/ksshaskpass".to_string()
+                ),
+                ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+            ]
+        );
+        assert!(askpass_env(&AuthMode::BatchOnly).is_empty());
     }
 }
