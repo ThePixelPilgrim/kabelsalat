@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use relm4::adw;
 use relm4::adw::prelude::{AdwDialogExt, AlertDialogExt, PreferencesGroupExt};
@@ -158,6 +158,14 @@ const ACTIVE_TAB_MIN_CHARS: i32 = 8;
 /// tab bar starts scrolling instead.
 const TAB_MIN_CHARS: i32 = 3;
 
+/// How long a new remote tab waits for the active tab's remote directory
+/// before starting in the remote home instead.
+const REMOTE_CWD_WAIT: Duration = Duration::from_millis(300);
+
+/// A remote client that exits sooner than this after its spawn, while its
+/// session lives on, is not reattached automatically — that would loop.
+const REATTACH_GUARD: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PickerMode {
     Move,
@@ -277,6 +285,9 @@ pub struct Tab {
     /// Remote tabs only: the first spawn's directory and command, kept until
     /// the host is live.
     pending: Option<PendingSpawn>,
+    /// When a remote tab's client was last spawned; the reattach guard
+    /// compares against it. `None` for local tabs.
+    spawned_at: Option<Instant>,
 }
 
 pub struct Group {
@@ -1043,7 +1054,10 @@ impl SimpleComponent for App {
                 }
             }
             Msg::ChildExited(id, status) => {
-                if let Some(tmux) = &self.tmux {
+                if self.tab_host(id).is_some() {
+                    // Remote: the worker asks the host, never this thread.
+                    self.remote_child_exited(id, status);
+                } else if let Some(tmux) = &self.tmux {
                     // The child VTE saw is the tmux *client*, not the shell. If
                     // the session still lives (external detach), reattach;
                     // otherwise the session is gone (clean exit) → close.
@@ -1772,6 +1786,107 @@ impl App {
 
     // ---- remote hosts ---------------------------------------------------
 
+    fn host_tab_ids(&self, host: &str) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .filter(|t| self.group_host(t.group).as_deref() == Some(host))
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// A remote tab's ssh client exited. Status 255 is ssh itself failing:
+    /// the worker checks the master (`ssh -O check`), and a dead master takes
+    /// the whole host to Disconnected. Any other status: the worker lists the
+    /// host's sessions — asynchronously, never on this thread — and
+    /// `on_tab_sessions` closes or reattaches.
+    fn remote_child_exited(&mut self, id: usize, status: i32) {
+        let Some(host) = self.tab_host(id) else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        tab.attached = false;
+        if self.host_state(&host) != HostState::Live {
+            // Already down or reconnecting; the next connect reattaches.
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                self.refresh_tab_page(tab);
+            }
+            return;
+        }
+        let ssh_failed = decode_exit(status) == remote::SSH_FAILED;
+        if let Some(worker) = self.worker(&host) {
+            worker.child_exited(id, ssh_failed);
+        }
+    }
+
+    /// The listing a remote child exit asked for. Only a successful listing
+    /// without the session closes the tab (`session_definitively_gone`); an
+    /// error means liveness is unknown and the tab stays. A dead pane marks
+    /// the tab crashed (remote servers have no pane-died file hook).
+    fn on_tab_sessions(&mut self, id: usize, result: Result<Vec<SessionInfo>, String>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
+            return;
+        };
+        let uuid = tab.uuid.clone();
+        let since_spawn = tab.spawned_at.map(|at| at.elapsed());
+        let Some(host) = self.group_host(tab.group) else {
+            return;
+        };
+        let result = result.map_err(TmuxError::Command);
+        if session_definitively_gone(&result, &uuid) {
+            self.close_tab(id);
+            return;
+        }
+        let dead_exit = result
+            .ok()
+            .and_then(|sessions| sessions.into_iter().find(|s| s.uuid == uuid))
+            .filter(|s| s.pane_dead)
+            .map(|s| s.dead_status.unwrap_or(-1));
+        if let Some(code) = dead_exit
+            && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
+        {
+            tab.crashed = Some(code);
+        }
+        if self.host_state(&host) == HostState::Live && reattach_allowed(since_spawn) {
+            self.spawn_remote_tab(id);
+        } else if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+            if self.host_state(&host) == HostState::Live {
+                eprintln!(
+                    "kabelsalat: {uuid} on {host} exited right after attaching; \
+                     not reattaching automatically"
+                );
+            }
+            // Shows the Reconnect page; its button reattaches this tab.
+            self.refresh_tab_page(tab);
+        }
+        self.rebuild_list();
+    }
+
+    /// Directory for a new tab in `group`, taken from the active tab when
+    /// both run on the same machine. Local: `active_tab_cwd` as before.
+    /// Remote: the host's `pane_current_path`, waited on for at most
+    /// `REMOTE_CWD_WAIT` and never checked against the local filesystem;
+    /// `None` starts the shell in the remote home.
+    fn new_tab_cwd(&self, group: usize) -> Option<PathBuf> {
+        let tab = self.active_tab()?;
+        let host = self.group_host(group);
+        if self.group_host(tab.group) != host {
+            return None;
+        }
+        match host {
+            None => self.active_tab_cwd(),
+            Some(host) => {
+                if self.host_state(&host) != HostState::Live {
+                    return None;
+                }
+                self.worker(&host)?
+                    .pane_current_path(&tab.uuid, REMOTE_CWD_WAIT)
+                    .map(PathBuf::from)
+            }
+        }
+    }
+
     fn tab_host(&self, id: usize) -> Option<String> {
         self.tabs
             .iter()
@@ -1889,9 +2004,23 @@ impl App {
             RemoteEvent::Killed(uuids) => self
                 .pending_kills
                 .retain(|kill| kill.host != host || !uuids.contains(&kill.uuid)),
-            // Nothing asks the worker about a tab's child exit yet, so
-            // neither of these can arrive.
-            RemoteEvent::MasterDead | RemoteEvent::TabSessions { .. } => {}
+            RemoteEvent::MasterDead => {
+                // Only a live host can die; a Reconnect already underway
+                // (Connecting) must not be overridden by a stale report.
+                if self.host_state(&host) != HostState::Live {
+                    return;
+                }
+                eprintln!("kabelsalat: lost the connection to {host}");
+                // Every client of the master went down with it. No automatic
+                // reattach: Reconnect reruns the login, then attaches them.
+                for id in self.host_tab_ids(&host) {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        tab.attached = false;
+                    }
+                }
+                self.set_host_state(&host, HostState::Disconnected(RemoteError::Unreachable));
+            }
+            RemoteEvent::TabSessions { tab, result } => self.on_tab_sessions(tab, result),
         }
     }
 
@@ -1989,6 +2118,7 @@ impl App {
         );
         spawn_client(&tab.terminal, &argv);
         tab.attached = true;
+        tab.spawned_at = Some(Instant::now());
         tab.view.set_visible_child_name("terminal");
         if active {
             tab.terminal.grab_focus();
@@ -2808,7 +2938,7 @@ impl App {
     /// The new shell inherits the working directory of the tab that is active
     /// right now — captured before `activate` moves focus to the new tab.
     fn open_tab(&mut self, group: usize, sender: &ComponentSender<Self>) {
-        let cwd = self.active_tab_cwd();
+        let cwd = self.new_tab_cwd(group);
         let uuid = gtk::glib::uuid_string_random().to_string();
         let id = self.add_tab(uuid, group, None, None, cwd.as_deref(), None, sender);
         self.move_tab_to_group_front(id);
@@ -2999,6 +3129,7 @@ impl App {
             status,
             attached: host.is_none(),
             pending,
+            spawned_at: None,
         });
         if let Some(host) = &host {
             if let Some(tab) = self.tabs.last() {
@@ -3012,22 +3143,32 @@ impl App {
     }
 
     /// Rerun the shell in a crashed tab, clearing its crashed marker. With
-    /// tmux the dead pane is respawned in place (client stays attached); in
-    /// the fallback path a fresh $SHELL is spawned into the same terminal.
+    /// tmux the dead pane is respawned in place (client stays attached) —
+    /// through the host's worker for a remote tab; in the fallback path a
+    /// fresh $SHELL is spawned into the same terminal.
     fn restart_tab(&mut self, id: usize) {
         let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
             return;
         };
         let uuid = tab.uuid.clone();
         let terminal = tab.terminal.clone();
-        match &self.tmux {
-            Some(tmux) => {
+        match (self.group_host(tab.group), &self.tmux) {
+            (Some(host), _) => {
+                // A host that is not live has nothing to respawn into.
+                if self.host_state(&host) != HostState::Live {
+                    return;
+                }
+                if let Some(worker) = self.worker(&host) {
+                    worker.respawn(uuid);
+                }
+            }
+            (None, Some(tmux)) => {
                 if let Err(err) = tmux.respawn_pane(&uuid) {
                     eprintln!("failed to respawn pane: {err}");
                     return;
                 }
             }
-            None => spawn_shell(&terminal, None, None),
+            (None, None) => spawn_shell(&terminal, None, None),
         }
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.crashed = None;
@@ -3114,10 +3255,31 @@ impl App {
         let order = self.nav_order();
         let tab = self.tabs.remove(index);
         // Explicit close is the only thing that kills the backing session.
-        if let Some(tmux) = &self.tmux
-            && let Err(err) = tmux.kill_session(&tab.uuid)
-        {
-            eprintln!("failed to kill session {}: {err}", tab.uuid);
+        match self.group_host(tab.group) {
+            None => {
+                if let Some(tmux) = &self.tmux
+                    && let Err(err) = tmux.kill_session(&tab.uuid)
+                {
+                    eprintln!("failed to kill session {}: {err}", tab.uuid);
+                }
+            }
+            // Remote: the queue is an outbox. The entry leaves it only when
+            // the host confirms the kill (RemoteEvent::Killed), so a kill
+            // lost to a dropped connection — or to quitting right after
+            // closing the last tab — is retried after the next successful
+            // connect instead of leaking the session. A live host gets the
+            // kill at once, fire-and-forget.
+            Some(host) => {
+                self.pending_kills.push(state::PendingKill {
+                    host: host.clone(),
+                    uuid: tab.uuid.clone(),
+                });
+                if self.host_state(&host) == HostState::Live
+                    && let Some(worker) = self.worker(&host)
+                {
+                    worker.kill(vec![tab.uuid.clone()]);
+                }
+            }
         }
         self.stack.remove(&tab.view);
         self.prune_empty_groups();
@@ -4100,6 +4262,13 @@ fn session_definitively_gone(result: &Result<Vec<SessionInfo>, TmuxError>, uuid:
     matches!(result, Ok(sessions) if !sessions.iter().any(|si| si.uuid == uuid))
 }
 
+/// May a remote tab whose client just exited (while its session lives on)
+/// be reattached automatically? Not when the client barely ran: that is a
+/// client that cannot attach, and reattaching would loop. Pure.
+fn reattach_allowed(since_spawn: Option<Duration>) -> bool {
+    since_spawn.is_none_or(|elapsed| elapsed >= REATTACH_GUARD)
+}
+
 /// Sidebar/tab-bar label for a (possibly crashed) tab. A negative exit code is
 /// the "unknown exit" sentinel (a dead pane whose status tmux never recorded);
 /// since no shell returns a negative code, render "?" rather than a fake -1
@@ -4395,8 +4564,8 @@ fn apply_scheme(terminal: &Terminal, dark: bool) {
     terminal.set_colors(Some(&fg), Some(&bg), &[]);
 }
 
-/// Decode a raw waitpid-style status into a user-facing exit code. Used only
-/// in the no-tmux fallback, where the shell's own status reaches `ChildExited`.
+/// Decode a raw waitpid-style status into a user-facing exit code.
+/// Used in the no-tmux fallback, and by remote tabs to tell ssh's own 255 from the remote side's status.
 fn decode_exit(status: i32) -> i32 {
     if status & 0x7f == 0 {
         (status >> 8) & 0xff // WIFEXITED: WEXITSTATUS
@@ -5063,5 +5232,32 @@ mod tests {
         assert_eq!(again.state.groups[0].uuid, loaded.state.groups[0].uuid);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- remote reattach guard -------------------------------------------
+
+    #[test]
+    fn a_client_that_exits_right_after_attaching_is_not_reattached() {
+        // Some clients exit immediately while their session lives on
+        // ("open terminal failed"); reattaching those would loop.
+        assert!(!reattach_allowed(Some(Duration::from_millis(300))));
+        assert!(!reattach_allowed(Some(Duration::from_millis(1999))));
+    }
+
+    #[test]
+    fn a_client_that_ran_for_a_while_is_reattached() {
+        assert!(reattach_allowed(Some(Duration::from_secs(2))));
+        assert!(reattach_allowed(Some(Duration::from_secs(3600))));
+        // Never spawned: nothing to guard against.
+        assert!(reattach_allowed(None));
+    }
+
+    #[test]
+    fn only_ssh_s_own_status_counts_as_an_ssh_failure() {
+        // Raw wait statuses: exit(255) is ssh failing; a signal or another
+        // code is the remote side's business.
+        assert_eq!(decode_exit(255 << 8), remote::SSH_FAILED);
+        assert_ne!(decode_exit(1 << 8), remote::SSH_FAILED);
+        assert_ne!(decode_exit(9), remote::SSH_FAILED);
     }
 }
