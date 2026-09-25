@@ -5,6 +5,7 @@
 //! between saved state and live tmux sessions as plain data — no GUI, no tmux
 //! calls here.
 
+use std::fmt;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,13 @@ pub struct SavedGroup {
     /// instead, so a crash or a restart never stacks another copy of this tab.
     #[serde(default)]
     pub default_url: Option<String>,
+    /// The ssh destination this group's tabs run on, handed to ssh verbatim
+    /// (`user@host`, a `~/.ssh/config` alias, `ssh://user@host:port`). `None`
+    /// is this computer. `serde(default)` so older state files load every
+    /// group as local. Every tab of the group runs on this host; a tab's own
+    /// host is always its group's.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 fn default_browser_split() -> f64 {
@@ -64,6 +72,7 @@ impl SavedGroup {
             browser_open: false,
             browser_split: DEFAULT_BROWSER_SPLIT,
             default_url: None,
+            host: None,
         }
     }
 }
@@ -132,6 +141,17 @@ pub struct SavedTab {
     pub last_title: Option<String>,
 }
 
+/// A remote session still to be killed: its tab was closed, and its host has
+/// not confirmed the kill yet — because it was unreachable, or because the app
+/// quit first. Remote hosts never adopt sessions, so without this entry the
+/// session would run forever. Flushed after the next successful connect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingKill {
+    pub host: String,
+    /// The closed tab's uuid; its session is `ks-<uuid>`.
+    pub uuid: String,
+}
+
 /// The whole persisted presentation model.
 ///
 /// `PartialEq` only, not `Eq`: `SavedGroup::browser_split` is a float.
@@ -150,6 +170,10 @@ pub struct SavedState {
     /// state files load with the activity ordering.
     #[serde(default)]
     pub sidebar_order: SidebarOrder,
+    /// Remote sessions whose tabs are closed but whose kill the host has not
+    /// confirmed yet. `serde(default)` so older state files load with none.
+    #[serde(default)]
+    pub pending_kills: Vec<PendingKill>,
 }
 
 /// Sidebar ordering of a group's tabs.
@@ -174,6 +198,7 @@ impl Default for SavedState {
             sidebar_visible: true,
             linger_warning_dismissed: false,
             sidebar_order: SidebarOrder::default(),
+            pending_kills: Vec::new(),
         }
     }
 }
@@ -325,6 +350,54 @@ pub fn newest_first_index(tab_groups: &[usize], group: usize) -> usize {
         .unwrap_or(tab_groups.len())
 }
 
+/// Why a string cannot be used as an ssh destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostError {
+    Empty,
+    /// Whitespace or a control character.
+    BadCharacter,
+    /// A leading `-`, which ssh would parse as an option.
+    LeadingDash,
+}
+
+impl fmt::Display for HostError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            HostError::Empty => {
+                "Enter a host, e.g. user@example.com or an alias from ~/.ssh/config."
+            }
+            HostError::BadCharacter => "A host can't contain spaces or control characters.",
+            HostError::LeadingDash => {
+                "A host can't start with '-': ssh would read it as an option."
+            }
+        })
+    }
+}
+
+/// Check a group's host before it is stored. The destination is otherwise
+/// passed to ssh verbatim, so this only rejects what cannot be one argument:
+/// nothing, whitespace or control characters, and a leading `-`.
+pub fn validate_host(host: &str) -> Result<(), HostError> {
+    if host.is_empty() {
+        return Err(HostError::Empty);
+    }
+    if host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(HostError::BadCharacter);
+    }
+    if host.starts_with('-') {
+        return Err(HostError::LeadingDash);
+    }
+    Ok(())
+}
+
+/// May a tab move from a group on `src_host` into one on `dest_host`? Tabs
+/// cannot change hosts — their session lives on one tmux server — so only a
+/// move within one host (or within this computer, `None`) is allowed. Gates
+/// the move picker, both sidebar drops, and their drag feedback.
+pub fn drop_allowed(src_host: Option<&str>, dest_host: Option<&str>) -> bool {
+    src_host == dest_host
+}
+
 /// The age bucket an elapsed time (seconds) falls in, as the bucket's lower
 /// bound: `0` for anything under a minute, then whole minutes, hours and
 /// days — exactly the granularity the age prefix labels show. Both the
@@ -435,6 +508,7 @@ mod tests {
                     browser_open: false,
                     browser_split: DEFAULT_BROWSER_SPLIT,
                     default_url: None,
+                    host: None,
                 },
                 SavedGroup {
                     uuid: "g-bbb".into(),
@@ -444,6 +518,7 @@ mod tests {
                     browser_open: true,
                     browser_split: 640.0,
                     default_url: Some("http://localhost:3000".into()),
+                    host: None,
                 },
             ],
             tabs: vec![
@@ -473,6 +548,7 @@ mod tests {
             sidebar_visible: false,
             linger_warning_dismissed: true,
             sidebar_order: SidebarOrder::default(),
+            pending_kills: Vec::new(),
         }
     }
 
@@ -1003,5 +1079,83 @@ mod tests {
         assert!(json.contains(r#""sidebar_order":"manual""#));
         let back: SavedState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.sidebar_order, SidebarOrder::Manual);
+    }
+
+    // --- remote groups ---
+
+    #[test]
+    fn old_group_without_host_loads_as_local() {
+        let json = r#"{
+            "groups": [{"id": 1, "name": "w", "palette": 0}],
+            "tabs": [], "active": null, "sidebar_visible": true
+        }"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.groups[0].host, None);
+        assert!(state.pending_kills.is_empty());
+    }
+
+    #[test]
+    fn host_and_pending_kills_survive_save_and_load() {
+        let dir = tmp_dir("remote-fields");
+        let path = dir.join("state.json");
+        let mut state = sample_state();
+        state.groups[1].host = Some("me@build-box".into());
+        state.pending_kills = vec![PendingKill {
+            host: "me@build-box".into(),
+            uuid: "dead-beef".into(),
+        }];
+        save(&state, &path).unwrap();
+        let back = load(&path);
+        assert_eq!(back.groups[1].host.as_deref(), Some("me@build-box"));
+        assert_eq!(back.pending_kills, state.pending_kills);
+        assert_eq!(back, state);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_group_new_is_local() {
+        assert_eq!(SavedGroup::new(1, "x".into(), 0).host, None);
+    }
+
+    #[test]
+    fn validate_host_accepts_ssh_destinations_verbatim() {
+        for host in [
+            "build-box",
+            "me@build-box",
+            "ssh://me@build-box:2222",
+            "me@[::1]",
+            "10.0.0.7",
+        ] {
+            assert_eq!(validate_host(host), Ok(()), "{host}");
+        }
+    }
+
+    #[test]
+    fn validate_host_rejects_empty_whitespace_control_and_dash() {
+        assert_eq!(validate_host(""), Err(HostError::Empty));
+        assert_eq!(validate_host("me@build box"), Err(HostError::BadCharacter));
+        assert_eq!(validate_host(" build-box"), Err(HostError::BadCharacter));
+        assert_eq!(validate_host("build-box\n"), Err(HostError::BadCharacter));
+        assert_eq!(validate_host("build\u{7}box"), Err(HostError::BadCharacter));
+        assert_eq!(
+            validate_host("-oProxyCommand=evil"),
+            Err(HostError::LeadingDash)
+        );
+    }
+
+    #[test]
+    fn host_errors_read_as_sentences() {
+        assert!(HostError::LeadingDash.to_string().contains("'-'"));
+        assert!(!HostError::Empty.to_string().is_empty());
+    }
+
+    #[test]
+    fn drop_allowed_only_within_one_host() {
+        assert!(drop_allowed(None, None));
+        assert!(drop_allowed(Some("a"), Some("a")));
+        assert!(!drop_allowed(None, Some("a")));
+        assert!(!drop_allowed(Some("a"), None));
+        // Destinations are compared verbatim: two spellings are two hosts.
+        assert!(!drop_allowed(Some("a"), Some("me@a")));
     }
 }
