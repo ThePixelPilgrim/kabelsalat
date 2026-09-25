@@ -268,6 +268,137 @@ pub enum HostState {
     Disconnected(RemoteError),
 }
 
+/// Socket name of the shared kabelsalat tmux server on every remote host
+/// (`tmux -L kabelsalat`), used by every installation and version. The last
+/// one to connect applies its config to the whole server, so `TMUX_CONF`
+/// changes must stay backward compatible.
+pub const REMOTE_SERVER: &str = "kabelsalat";
+
+/// ssh's own exit status for "ssh failed" (as opposed to the remote
+/// command's status, which ssh passes through).
+pub const SSH_FAILED: i32 = 255;
+
+/// `ConnectTimeout` for every ssh this app runs.
+pub const CONNECT_TIMEOUT_SECS: u32 = 10;
+
+/// `tmux -L kabelsalat -f /dev/null`: our server, and — should this command
+/// be the one that starts it — none of the user's own `~/.tmux.conf`. Our
+/// config arrives through `source-file -` right after the start.
+pub fn remote_tmux_prefix() -> Vec<String> {
+    ["tmux", "-L", REMOTE_SERVER, "-f", "/dev/null"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// ssh through the host's master for tabs and the worker's tmux calls. They
+/// never authenticate: `ControlMaster=no` uses the master. ssh would fall
+/// back to a direct connection when the master's socket is gone, so
+/// `BatchMode=yes` keeps that fallback from ever prompting, and
+/// `ProxyCommand=false` makes it fail at once (exit 255, no network): the
+/// mux client is tried before any connection, so a live master is reused as
+/// usual. `remote_argv` is quoted once more into the single string the
+/// remote login shell parses.
+pub fn mux_argv(dest: &str, control_path: &Path, tty: bool, remote_argv: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "ssh".into(),
+        "-S".into(),
+        control_path.to_string_lossy().into_owned(),
+        "-o".into(),
+        "ControlMaster=no".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"),
+        "-o".into(),
+        "ProxyCommand=false".into(),
+    ];
+    if tty {
+        argv.push("-t".into());
+    }
+    argv.push(dest.into());
+    argv.push("--".into());
+    argv.push(crate::tmuxctl::shell_quote_argv(remote_argv));
+    argv
+}
+
+/// The worker's login: becomes (or reuses) the host's master and runs
+/// `remote_argv` over it. Only this command ever authenticates.
+pub fn master_argv(
+    dest: &str,
+    control_path: &Path,
+    mode: &AuthMode,
+    remote_argv: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "ssh".into(),
+        "-S".into(),
+        control_path.to_string_lossy().into_owned(),
+        "-o".into(),
+        "ControlMaster=auto".into(),
+        "-o".into(),
+        "ControlPersist=yes".into(),
+        "-o".into(),
+        format!("ConnectTimeout={CONNECT_TIMEOUT_SECS}"),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+        "-o".into(),
+    ];
+    argv.push(match mode {
+        AuthMode::BatchOnly => "BatchMode=yes".into(),
+        // One attempt: a wrong password is reported, not re-asked.
+        AuthMode::Askpass(_) => "NumberOfPasswordPrompts=1".into(),
+    });
+    argv.push(dest.into());
+    argv.push("--".into());
+    argv.push(crate::tmuxctl::shell_quote_argv(remote_argv));
+    argv
+}
+
+/// A control request to the host's master (`ssh -O …`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlOp {
+    /// Is the master alive? Exit 0 when it is.
+    Check,
+    /// Stop the master. Remote sessions survive.
+    Exit,
+}
+
+pub fn control_argv(dest: &str, control_path: &Path, op: ControlOp) -> Vec<String> {
+    let op = match op {
+        ControlOp::Check => "check",
+        ControlOp::Exit => "exit",
+    };
+    vec![
+        "ssh".into(),
+        "-S".into(),
+        control_path.to_string_lossy().into_owned(),
+        "-O".into(),
+        op.into(),
+        dest.into(),
+    ]
+}
+
+/// `tmux -L kabelsalat -f /dev/null start-server ; source-file -`, with the
+/// remote config on stdin: nothing is written to the remote disk. tmux reads
+/// `source-file -` from stdin since 3.1 (CHANGES, "3.0a to 3.1").
+pub fn start_server_argv() -> Vec<String> {
+    let mut argv = remote_tmux_prefix();
+    argv.extend(["start-server", ";", "source-file", "-"].map(String::from));
+    argv
+}
+
+/// Fallback for a tmux that refuses `source-file -`: store the config (from
+/// stdin) at `${XDG_STATE_HOME:-$HOME/.local/state}/kabelsalat/tmux.conf` on
+/// the host and source it from there. Runs under `sh -c` so the remote login
+/// shell's syntax does not matter.
+pub fn upload_conf_argv() -> Vec<String> {
+    const SCRIPT: &str = r#"d="${XDG_STATE_HOME:-$HOME/.local/state}/kabelsalat" && mkdir -p "$d" && cat > "$d/tmux.conf" && exec tmux -L kabelsalat -f /dev/null start-server \; source-file "$d/tmux.conf""#;
+    vec!["sh".into(), "-c".into(), SCRIPT.into()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,5 +737,186 @@ mod tests {
         ] {
             assert!(err.message(host).contains(host), "{err:?}");
         }
+    }
+
+    // --- argv and quoting ---
+
+    /// Run `script` with the local `sh -c` and return its stdout. Stands in
+    /// for the remote login shell, which only has to parse POSIX quotes.
+    fn run_sh(script: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The words `sh` makes of `command` (a string of shell words), each
+    /// printed with a 0x1f terminator so empty words and newlines survive.
+    fn sh_words(command: &str) -> Vec<String> {
+        let out = run_sh(&format!("printf '%s\\037' {command}"));
+        let mut words: Vec<String> = out.split('\u{1f}').map(String::from).collect();
+        words.pop(); // after the last terminator
+        words
+    }
+
+    fn nasty() -> Vec<String> {
+        [
+            "it's",
+            "$HOME",
+            "#not a comment",
+            "two  spaces",
+            "line1\nline2",
+            "",
+            "a;b|c&d",
+            "*",
+            "~",
+            "back\\slash",
+            "\"dq\"",
+            "$(touch /tmp/ks-pwned)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    #[test]
+    fn remote_quoting_round_trips_through_sh() {
+        let argv = nasty();
+        let ssh = mux_argv("me@box", Path::new("/run/ks/ssh/%C"), false, &argv);
+        // What ssh hands the remote login shell is exactly the last word.
+        assert_eq!(sh_words(ssh.last().unwrap()), argv);
+    }
+
+    #[test]
+    fn nested_quoting_survives_two_shells() {
+        // A tab command is quoted once for tmux's `sh -c` and once more for
+        // the login shell; both layers must give back the original argv.
+        let inner = crate::tmuxctl::shell_quote_argv(&nasty());
+        let outer = crate::tmuxctl::shell_quote_argv(&[
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("printf '%s\\037' {inner}"),
+        ]);
+        let mut words: Vec<String> = run_sh(&outer).split('\u{1f}').map(String::from).collect();
+        words.pop();
+        assert_eq!(words, nasty());
+    }
+
+    #[test]
+    fn mux_argv_never_authenticates_or_prompts() {
+        let argv = mux_argv(
+            "me@box",
+            Path::new("/run/ks/ssh/%C"),
+            true,
+            &["tmux".to_string(), "-V".to_string()],
+        );
+        assert_eq!(
+            argv,
+            [
+                "ssh",
+                "-S",
+                "/run/ks/ssh/%C",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ProxyCommand=false",
+                "-t",
+                "me@box",
+                "--",
+                "tmux -V",
+            ]
+        );
+        let no_tty = mux_argv("me@box", Path::new("/c"), false, &["true".to_string()]);
+        assert!(!no_tty.contains(&"-t".to_string()));
+    }
+
+    #[test]
+    fn master_argv_carries_the_spec_options() {
+        let argv = master_argv(
+            "me@box",
+            Path::new("/run/ks/ssh/%C"),
+            &AuthMode::BatchOnly,
+            &["tmux".to_string(), "-V".to_string()],
+        );
+        for option in [
+            "ControlMaster=auto",
+            "ControlPersist=yes",
+            "ConnectTimeout=10",
+            "ServerAliveInterval=15",
+            "ServerAliveCountMax=3",
+            "BatchMode=yes",
+        ] {
+            let at = argv
+                .iter()
+                .position(|a| a == option)
+                .unwrap_or_else(|| panic!("{option}"));
+            assert_eq!(argv[at - 1], "-o");
+        }
+        assert_eq!(&argv[..3], ["ssh", "-S", "/run/ks/ssh/%C"]);
+        assert_eq!(&argv[argv.len() - 3..], ["me@box", "--", "tmux -V"]);
+
+        let askpass = master_argv(
+            "me@box",
+            Path::new("/c"),
+            &AuthMode::Askpass(PathBuf::from("/usr/bin/ksshaskpass")),
+            &["true".to_string()],
+        );
+        assert!(!askpass.contains(&"BatchMode=yes".to_string()));
+        // A single attempt, as the spec asks.
+        assert!(askpass.contains(&"NumberOfPasswordPrompts=1".to_string()));
+    }
+
+    #[test]
+    fn control_argv_targets_the_master() {
+        assert_eq!(
+            control_argv("me@box", Path::new("/c/%C"), ControlOp::Check),
+            ["ssh", "-S", "/c/%C", "-O", "check", "me@box"]
+        );
+        assert_eq!(
+            control_argv("me@box", Path::new("/c/%C"), ControlOp::Exit),
+            ["ssh", "-S", "/c/%C", "-O", "exit", "me@box"]
+        );
+    }
+
+    #[test]
+    fn the_server_is_started_and_configured_in_one_command() {
+        assert_eq!(
+            start_server_argv(),
+            [
+                "tmux",
+                "-L",
+                "kabelsalat",
+                "-f",
+                "/dev/null",
+                "start-server",
+                ";",
+                "source-file",
+                "-"
+            ]
+        );
+        // The `;` must reach tmux as its own word.
+        let quoted = crate::tmuxctl::shell_quote_argv(&start_server_argv());
+        assert!(sh_words(&quoted).contains(&";".to_string()));
+    }
+
+    #[test]
+    fn the_upload_fallback_writes_under_the_remote_state_dir() {
+        let argv = upload_conf_argv();
+        assert_eq!(&argv[..2], ["sh", "-c"]);
+        assert!(argv[2].contains("${XDG_STATE_HOME:-$HOME/.local/state}/kabelsalat"));
+        assert!(argv[2].contains("cat >"));
+        assert!(argv[2].contains("source-file"));
+        assert!(argv[2].contains("-L kabelsalat -f /dev/null"));
     }
 }
