@@ -15,6 +15,8 @@ use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
 use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::control;
+use crate::remote::{self, HostState, RemoteError};
+use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
 use crate::state::{self, SavedGroup, SavedState, SavedTab, SidebarOrder};
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
 
@@ -162,6 +164,82 @@ enum PickerMode {
     Jump,
 }
 
+/// What a remote tab spawns once its host is live: the directory and command
+/// it was created with. Consumed by the first spawn; a later reattach needs
+/// neither (`new-session -A` ignores `-c` for an existing session).
+#[derive(Debug, Default)]
+struct PendingSpawn {
+    cwd: Option<PathBuf>,
+    command: Option<Vec<String>>,
+}
+
+/// The page a remote tab shows instead of its terminal while its host is
+/// connecting or disconnected, or while the tab itself is detached.
+struct HostPage {
+    page: adw::StatusPage,
+    spinner: gtk::Spinner,
+    reconnect: gtk::Button,
+}
+
+impl HostPage {
+    fn new(host: &str, input: &relm4::Sender<Msg>) -> Self {
+        let spinner = gtk::Spinner::builder()
+            .width_request(32)
+            .height_request(32)
+            .halign(gtk::Align::Center)
+            .build();
+        let reconnect = gtk::Button::builder()
+            .label("Reconnect")
+            .halign(gtk::Align::Center)
+            .build();
+        reconnect.add_css_class("pill");
+        reconnect.add_css_class("suggested-action");
+        reconnect.connect_clicked({
+            let input = input.clone();
+            let host = host.to_string();
+            move |_| {
+                let _ = input.send(Msg::Reconnect(host.clone()));
+            }
+        });
+        let child = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        child.append(&spinner);
+        child.append(&reconnect);
+        let page = adw::StatusPage::builder()
+            .icon_name("network-server-symbolic")
+            .child(&child)
+            .build();
+        Self {
+            page,
+            spinner,
+            reconnect,
+        }
+    }
+
+    fn show(&self, title: &str, description: &str, connecting: bool, reconnect: bool) {
+        self.page.set_title(title);
+        // The description is Pango markup, and ssh's stderr can hold '<'/'&'.
+        let markup = gtk::glib::markup_escape_text(description);
+        self.page
+            .set_description(Some(markup.as_str()).filter(|text| !text.is_empty()));
+        self.spinner.set_visible(connecting);
+        self.spinner.set_spinning(connecting);
+        self.reconnect.set_visible(reconnect);
+    }
+}
+
+/// One remote host as the app sees it.
+struct RemoteHost {
+    state: HostState,
+    /// Present once a connect was attempted with a usable ssh.
+    link: Option<HostLink>,
+}
+
+struct HostLink {
+    /// Builds the tabs' `ssh … tmux new-session -A …` argv.
+    ctl: TmuxCtl,
+    worker: RemoteWorker,
+}
+
 pub struct Tab {
     id: usize,
     uuid: String, // stable across restarts; names the backing tmux session
@@ -186,6 +264,19 @@ pub struct Tab {
     /// Age prefix currently rendered in the labels; the tick only touches a
     /// label when this changes.
     age_shown: String,
+    /// What the stack shows for this tab: its terminal ("terminal") or —
+    /// remote tabs only — the host page ("status").
+    view: gtk::Stack,
+    /// Remote tabs only; `None` for local tabs, which always show the
+    /// terminal.
+    status: Option<HostPage>,
+    /// Whether the terminal runs this tab's tmux client. Always true for a
+    /// local tab. A remote tab is detached until its host is live, and again
+    /// after its ssh client exits.
+    attached: bool,
+    /// Remote tabs only: the first spawn's directory and command, kept until
+    /// the host is live.
+    pending: Option<PendingSpawn>,
 }
 
 pub struct Group {
@@ -281,6 +372,13 @@ pub struct App {
     linger: LingerStatus,
     /// Whether the linger warning was permanently dismissed (persisted).
     linger_dismissed: bool,
+    /// Startup check of the local ssh client: remote groups need OpenSSH
+    /// >= 8.4, and are disabled (never dropped) otherwise.
+    ssh: remote::SshAvailability,
+    /// How the workers log in: through an askpass program, or keys only.
+    auth: remote::AuthMode,
+    /// Remote hosts by their destination string, as the groups name them.
+    hosts: HashMap<String, RemoteHost>,
     /// Whether the "hold Shift to select" hint icon is currently showing.
     /// Transient: never persisted, re-armed on every bare drag.
     select_hint_visible: bool,
@@ -454,6 +552,14 @@ pub enum Msg {
         group_uuid: String,
         name: String,
     },
+    /// A remote host's worker reported back.
+    Remote {
+        host: String,
+        event: RemoteEvent,
+    },
+    /// Rerun the connect sequence for a host — or, when it is live, reattach
+    /// its detached tabs.
+    Reconnect(String),
 }
 
 #[relm4::component(pub)]
@@ -768,6 +874,11 @@ impl SimpleComponent for App {
             _ => "open-menu-symbolic",
         };
 
+        // Checked once, like tmux. Remote groups need OpenSSH >= 8.4 for
+        // SSH_ASKPASS_REQUIRE; anything else disables them.
+        let ssh = remote_worker::detect_ssh();
+        let auth = remote::auth_mode(|key| std::env::var(key).ok(), remote_worker::is_executable);
+
         let mut model = App {
             tabs: Vec::new(),
             groups: Vec::new(),
@@ -808,6 +919,9 @@ impl SimpleComponent for App {
             availability,
             linger,
             linger_dismissed,
+            ssh,
+            auth,
+            hosts: HashMap::new(),
             select_hint_visible: false,
             select_hint_gen: 0,
             monitor: None,
@@ -1268,6 +1382,8 @@ impl SimpleComponent for App {
                 // snapshot the CLI reads; rebuild_list() redraws the header.
                 self.rebuild_list();
             }
+            Msg::Remote { host, event } => self.on_remote_event(host, event),
+            Msg::Reconnect(host) => self.connect_host(&host),
         }
         // Every layout mutation persists; writes are atomic and human-paced.
         self.save_state();
@@ -1295,6 +1411,13 @@ impl SimpleComponent for App {
             .collect();
         for id in browser_group_ids {
             self.cdp_env_unset(id);
+        }
+        // Remote sessions outlive the app like local ones; only the ssh
+        // masters go. The next start logs in again.
+        for host in self.hosts.values() {
+            if let Some(link) = &host.link {
+                link.worker.exit_master();
+            }
         }
         // One shared SIGTERM deadline for all of them: serial teardown cost
         // `n * TERM_GRACE` of frozen UI, this costs at most TERM_GRACE however
@@ -1527,6 +1650,12 @@ impl App {
         if let Some(id) = active_id {
             self.activate(id);
         }
+        // Remote tabs came back detached, behind their host page. Each host
+        // logs in once now; its tabs spawn only after its list-sessions
+        // succeeded (on_host_connected).
+        for host in state::remote_hosts(&saved) {
+            self.connect_host(&host);
+        }
         // Before the save, not after: this fills `pending_browser_restore`, so
         // the state written below already records every restored group as
         // browser_open (see `browser_open_desired`). Reversing the order would
@@ -1639,6 +1768,272 @@ impl App {
                 }
             }
         }
+    }
+
+    // ---- remote hosts ---------------------------------------------------
+
+    fn tab_host(&self, id: usize) -> Option<String> {
+        self.tabs
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| self.group_host(t.group))
+    }
+
+    /// A host nobody has connected yet reads as connecting: its tabs are
+    /// about to be, and must not look broken in the meantime.
+    fn host_state(&self, host: &str) -> HostState {
+        self.hosts
+            .get(host)
+            .map_or(HostState::Connecting, |h| h.state.clone())
+    }
+
+    fn worker(&self, host: &str) -> Option<&RemoteWorker> {
+        self.hosts
+            .get(host)
+            .and_then(|h| h.link.as_ref())
+            .map(|link| &link.worker)
+    }
+
+    fn set_host_state(&mut self, host: &str, state: HostState) {
+        self.hosts
+            .entry(host.to_string())
+            .or_insert_with(|| RemoteHost {
+                state: HostState::Connecting,
+                link: None,
+            })
+            .state = state;
+        self.refresh_host_pages(host);
+        self.rebuild_list();
+    }
+
+    /// Log in to `host` (once; the worker runs the host check and lists the
+    /// sessions), or, when it is already live, reattach its detached tabs.
+    /// Never retried automatically, so askpass never pops up unasked.
+    fn connect_host(&mut self, host: &str) {
+        match self.hosts.get(host).map(|h| h.state.clone()) {
+            // One login at a time; the running attempt reports back.
+            Some(HostState::Connecting) if self.worker(host).is_some() => return,
+            Some(HostState::Live) => {
+                self.attach_host_tabs(host);
+                return;
+            }
+            _ => {}
+        }
+        if !self.ssh.is_available() {
+            self.set_host_state(host, HostState::Disconnected(RemoteError::SshUnsupported));
+            return;
+        }
+        // The dialog validates, but a hand-edited state file does not: a
+        // destination starting with '-' would reach ssh as an option.
+        if let Err(err) = state::validate_host(host) {
+            self.set_host_state(
+                host,
+                HostState::Disconnected(RemoteError::Other(err.to_string())),
+            );
+            return;
+        }
+        if self.worker(host).is_none() {
+            match self.spawn_worker(host) {
+                Ok(link) => {
+                    self.hosts
+                        .entry(host.to_string())
+                        .or_insert_with(|| RemoteHost {
+                            state: HostState::Connecting,
+                            link: None,
+                        })
+                        .link = Some(link);
+                }
+                Err(detail) => {
+                    self.set_host_state(host, HostState::Disconnected(RemoteError::Other(detail)));
+                    return;
+                }
+            }
+        }
+        self.set_host_state(host, HostState::Connecting);
+        if let Some(worker) = self.worker(host) {
+            worker.connect();
+        }
+    }
+
+    fn spawn_worker(&self, host: &str) -> Result<HostLink, String> {
+        let control_path = remote_worker::control_path()
+            .map_err(|err| format!("no directory for the ssh control socket: {err}"))?;
+        let input = self.input.clone();
+        let reply_host = host.to_string();
+        let worker = RemoteWorker::spawn(
+            host.to_string(),
+            control_path.clone(),
+            self.auth.clone(),
+            SshRunner,
+            move |event| {
+                let _ = input.send(Msg::Remote {
+                    host: reply_host.clone(),
+                    event,
+                });
+            },
+        )
+        .map_err(|err| format!("could not start the connection thread: {err}"))?;
+        Ok(HostLink {
+            ctl: TmuxCtl::remote(host, &control_path),
+            worker,
+        })
+    }
+
+    fn on_remote_event(&mut self, host: String, event: RemoteEvent) {
+        match event {
+            RemoteEvent::Connected(sessions) => self.on_host_connected(&host, &sessions),
+            RemoteEvent::ConnectFailed(err) => {
+                eprintln!("kabelsalat: {}", err.message(&host));
+                self.set_host_state(&host, HostState::Disconnected(err));
+            }
+            RemoteEvent::Killed(uuids) => self
+                .pending_kills
+                .retain(|kill| kill.host != host || !uuids.contains(&kill.uuid)),
+            // Nothing asks the worker about a tab's child exit yet, so
+            // neither of these can arrive.
+            RemoteEvent::MasterDead | RemoteEvent::TabSessions { .. } => {}
+        }
+    }
+
+    /// The host passed its check and listed its sessions: plan its tabs
+    /// (state::reconcile_remote), flush the queued kills, mark crashed panes,
+    /// and only now spawn its tabs.
+    fn on_host_connected(&mut self, host: &str, sessions: &[SessionInfo]) {
+        let listing = state::RemoteListing {
+            live: sessions.iter().map(|s| s.uuid.clone()).collect(),
+            dead: sessions
+                .iter()
+                .filter(|s| s.pane_dead)
+                .map(|s| state::DeadPane {
+                    uuid: s.uuid.clone(),
+                    exit_code: s.dead_status.unwrap_or(-1),
+                })
+                .collect(),
+        };
+        let tabs: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|t| self.group_host(t.group).as_deref() == Some(host))
+            .map(|t| t.uuid.clone())
+            .collect();
+        let queued: Vec<String> = self
+            .pending_kills
+            .iter()
+            .filter(|kill| kill.host == host)
+            .map(|kill| kill.uuid.clone())
+            .collect();
+        let plan = state::reconcile_remote(&tabs, Some(&listing), &queued);
+        // A queued kill whose session is already gone is done; the live ones
+        // leave the queue when the host confirms them (RemoteEvent::Killed).
+        self.pending_kills
+            .retain(|kill| kill.host != host || plan.kill.contains(&kill.uuid));
+        if !plan.kill.is_empty()
+            && let Some(worker) = self.worker(host)
+        {
+            worker.kill(plan.kill.clone());
+        }
+        for attach in &plan.attach {
+            if let Some(code) = attach.dead_exit
+                && let Some(tab) = self.tabs.iter_mut().find(|t| t.uuid == attach.uuid)
+            {
+                tab.crashed = Some(code);
+            }
+        }
+        if let Some(entry) = self.hosts.get_mut(host) {
+            entry.state = HostState::Live;
+        }
+        self.attach_host_tabs(host);
+        self.refresh_host_pages(host);
+        self.rebuild_list();
+    }
+
+    /// Spawn the client of every detached tab on a live host: restored and
+    /// fresh tabs alike (`new-session -A` attaches or creates).
+    fn attach_host_tabs(&mut self, host: &str) {
+        let detached: Vec<usize> = self
+            .tabs
+            .iter()
+            .filter(|t| !t.attached && self.group_host(t.group).as_deref() == Some(host))
+            .map(|t| t.id)
+            .collect();
+        for id in detached {
+            self.spawn_remote_tab(id);
+        }
+    }
+
+    /// Run a remote tab's `ssh -S … -t <dest> -- tmux … new-session -A …`.
+    /// Only ever called while its host is live. KABELSALAT_* stay local, so
+    /// no `-e` pairs.
+    fn spawn_remote_tab(&mut self, id: usize) {
+        let Some(host) = self.tab_host(id) else {
+            return;
+        };
+        let Some(ctl) = self
+            .hosts
+            .get(&host)
+            .and_then(|h| h.link.as_ref())
+            .map(|link| link.ctl.clone())
+        else {
+            return;
+        };
+        let active = self.active == Some(id);
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        let pending = tab.pending.take().unwrap_or_default();
+        let argv = ctl.spawn_argv(
+            &tab.uuid,
+            pending.cwd.as_deref(),
+            pending.command.as_deref(),
+            &[],
+        );
+        spawn_client(&tab.terminal, &argv);
+        tab.attached = true;
+        tab.view.set_visible_child_name("terminal");
+        if active {
+            tab.terminal.grab_focus();
+        }
+    }
+
+    fn refresh_host_pages(&self, host: &str) {
+        for tab in self
+            .tabs
+            .iter()
+            .filter(|t| self.group_host(t.group).as_deref() == Some(host))
+        {
+            self.refresh_tab_page(tab);
+        }
+    }
+
+    /// Show a remote tab's terminal or its host page, whichever its host's
+    /// state and its own attachment call for. Local tabs: no-op.
+    fn refresh_tab_page(&self, tab: &Tab) {
+        let Some(page) = &tab.status else {
+            return;
+        };
+        let Some(host) = self.group_host(tab.group) else {
+            return;
+        };
+        match self.host_state(&host) {
+            HostState::Live if tab.attached => {
+                tab.view.set_visible_child_name("terminal");
+                return;
+            }
+            HostState::Live => page.show(
+                &host,
+                "This tab is not attached to its session. Reconnect to attach it again.",
+                false,
+                true,
+            ),
+            HostState::Connecting => page.show(&format!("Connecting to {host}…"), "", true, false),
+            HostState::Disconnected(err) => page.show(
+                &format!("{host} is disconnected"),
+                &err.message(&host),
+                false,
+                true,
+            ),
+        }
+        tab.view.set_visible_child_name("status");
     }
 
     // ---- browser pane ---------------------------------------------------
@@ -2480,21 +2875,34 @@ impl App {
             .enable_fallback_scrolling(false)
             .build();
         apply_scheme(&terminal, self.style.is_dark());
-        // Stamped at session creation via new-session -e: the group identity
-        // always, the endpoint pair when the group's browser already has one.
-        // A -A reattach ignores -e; reattached sessions are refreshed
-        // explicitly in restore_or_fresh instead.
-        let group_info = self.group_env_pairs(group);
-        let mut env: Vec<(&str, &str)> = Vec::new();
-        if let Some((group_uuid, cdp_url)) = &group_info {
-            env.push((ENV_GROUP, group_uuid.as_str()));
-            if let Some(url) = cdp_url {
-                for key in CDP_ENV_KEYS {
-                    env.push((key, url.as_str()));
+        let host = self.group_host(group);
+        let pending = match &host {
+            // Never spawned here: a remote shell may only be created after a
+            // successful list-sessions from its host, and a host that is
+            // already live gets the spawn right below, once the tab exists.
+            Some(_) => Some(PendingSpawn {
+                cwd: cwd.map(Path::to_path_buf),
+                command: command.map(<[String]>::to_vec),
+            }),
+            None => {
+                // Stamped at session creation via new-session -e: the group
+                // identity always, the endpoint pair when the group's browser
+                // already has one. A -A reattach ignores -e; reattached
+                // sessions are refreshed explicitly in restore_or_fresh.
+                let group_info = self.group_env_pairs(group);
+                let mut env: Vec<(&str, &str)> = Vec::new();
+                if let Some((group_uuid, cdp_url)) = &group_info {
+                    env.push((ENV_GROUP, group_uuid.as_str()));
+                    if let Some(url) = cdp_url {
+                        for key in CDP_ENV_KEYS {
+                            env.push((key, url.as_str()));
+                        }
+                    }
                 }
+                spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd, command, &env);
+                None
             }
-        }
-        spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd, command, &env);
+        };
 
         attach_drag_hint(&terminal, sender);
 
@@ -2569,7 +2977,14 @@ impl App {
             }
         });
 
-        self.stack.add_child(&terminal);
+        let view = gtk::Stack::new();
+        view.add_named(&terminal, Some("terminal"));
+        let status = host.as_deref().map(|host| {
+            let page = HostPage::new(host, &self.input);
+            view.add_named(&page.page, Some("status"));
+            page
+        });
+        self.stack.add_child(&view);
         self.tabs.push(Tab {
             id,
             uuid,
@@ -2580,7 +2995,19 @@ impl App {
             last_activity,
             armed,
             age_shown: age_prefix(Duration::ZERO),
+            view,
+            status,
+            attached: host.is_none(),
+            pending,
         });
+        if let Some(host) = &host {
+            if let Some(tab) = self.tabs.last() {
+                self.refresh_tab_page(tab);
+            }
+            if self.host_state(host) == HostState::Live {
+                self.spawn_remote_tab(id);
+            }
+        }
         id
     }
 
@@ -2663,7 +3090,7 @@ impl App {
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == tab.group) {
             group.last_active = id;
         }
-        self.stack.set_visible_child(&tab.terminal);
+        self.stack.set_visible_child(&tab.view);
         tab.terminal.grab_focus();
         // A switch must never reorder the sidebar: the focus change can make
         // the program in the pane repaint (tmux focus-events, TUI redraw on
@@ -2692,7 +3119,7 @@ impl App {
         {
             eprintln!("failed to kill session {}: {err}", tab.uuid);
         }
-        self.stack.remove(&tab.terminal);
+        self.stack.remove(&tab.view);
         self.prune_empty_groups();
 
         if self.tabs.is_empty() {
@@ -3993,7 +4420,12 @@ fn spawn_backing(
         spawn_shell(terminal, cwd, command);
         return;
     };
-    let argv = ctl.spawn_argv(uuid, cwd, command, env);
+    spawn_client(terminal, &ctl.spawn_argv(uuid, cwd, command, env));
+}
+
+/// Run a tmux client argv in the terminal: `tmux …` locally, or a remote
+/// tab's `ssh … -- 'tmux …'`.
+fn spawn_client(terminal: &Terminal, argv: &[String]) {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     terminal.spawn_async(
         PtyFlags::DEFAULT,
