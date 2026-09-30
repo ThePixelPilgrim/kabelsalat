@@ -2675,19 +2675,20 @@ impl App {
         self.rebuild_list();
     }
 
-    /// Ctrl-Page_Up/Down, following the sidebar: a step inside the expanded
-    /// active group moves one row; a step past either end lands on the
-    /// neighbouring group's collapsed row, i.e. its representative tab
-    /// (`state::nav_target`). The order may reshuffle at any moment (an idle
-    /// tab receives an update and, in Activity sort, jumps to the front), and
-    /// recomputing the position on every press would make the walk jump with
-    /// it. So a burst of navigation freezes the order it started with: the
-    /// first press snapshots the groups and their member order, later presses
-    /// keep stepping through that snapshot until `NAV_BURST_MS` passes
-    /// without navigation — or the user lands elsewhere (a click, a jump, a
-    /// close), which shows up as the active tab no longer being in the
-    /// snapshot or a snapshotted tab being gone. The sidebar defers its own
-    /// re-sort for the length of the burst, so the two stay in step.
+    /// Ctrl-Page_Up/Down, walking all tabs in sidebar order as one list: a
+    /// step inside the active group moves one row; a step past its last tab
+    /// lands on the next group's first tab, a step back past its first tab
+    /// on the previous group's last tab (`state::nav_target`). The order may
+    /// reshuffle at any moment (an idle tab receives an update and, in
+    /// Activity sort, jumps to the front), and recomputing the position on
+    /// every press would make the walk jump with it. So a burst of
+    /// navigation freezes the order it started with: the first press
+    /// snapshots the groups and their member order, later presses keep
+    /// stepping through that snapshot until `NAV_BURST_MS` passes without
+    /// navigation — or the user lands elsewhere (a click, a jump, a close),
+    /// which shows up as the active tab no longer being in the snapshot or a
+    /// snapshotted tab being gone. The sidebar defers its own re-sort for the
+    /// length of the burst, so the two stay in step.
     fn navigate(&mut self, step: isize) {
         let Some(active) = self.active else { return };
         let taken = self.nav_burst.borrow_mut().take();
@@ -2707,14 +2708,9 @@ impl App {
             }
             None => self.snapshot_nav_order(),
         };
-        // Representatives are read live, not frozen: leaving a group updates
-        // its `last_active`, and stepping back into it must land there.
         let groups: Vec<state::NavGroup> = order
             .iter()
-            .map(|(group, tabs)| state::NavGroup {
-                tabs: tabs.clone(),
-                representative: self.representative_of(*group, tabs),
-            })
+            .map(|(_, tabs)| state::NavGroup { tabs: tabs.clone() })
             .collect();
         // Reopen (and thereby extend) the burst window around the order just
         // used, so a reshuffle between presses cannot redirect the walk. When
@@ -3134,20 +3130,18 @@ impl App {
                 members
             }
             SidebarOrder::Activity => {
-                // Sort by the age *bucket* the label shows, not the raw
-                // stamp: two tabs that both read "now" keep their vec order
-                // instead of swapping on every chunk of output.
+                // `activity_order` keeps two tabs that both read "now" in
+                // vec order instead of swapping on every chunk of output.
                 let now = SystemTime::now();
-                let ages: Vec<u64> = members
+                let elapsed: Vec<u64> = members
                     .iter()
                     .map(|t| {
-                        let elapsed = now
-                            .duration_since(t.last_activity.get())
-                            .unwrap_or(Duration::ZERO);
-                        state::age_bucket(elapsed.as_secs())
+                        now.duration_since(t.last_activity.get())
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs()
                     })
                     .collect();
-                state::activity_order(&ages)
+                state::activity_order(&elapsed)
                     .into_iter()
                     .map(|i| members[i])
                     .collect()

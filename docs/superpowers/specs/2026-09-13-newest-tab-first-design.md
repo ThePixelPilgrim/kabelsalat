@@ -18,8 +18,9 @@ as an age prefix that a 30-second tick repaints in place.
 - `state::SidebarOrder { Activity (default), Manual }`, persisted as
   `SavedState.sidebar_order` with `serde(default)` so older files load as
   Activity.
-- `state::activity_order(stamps)` is the pure, tested sort: indices by stamp
-  descending, stable.
+- `state::activity_order(elapsed_secs)` is the pure, tested sort: youngest
+  age bucket first; tabs that both read "now" keep their vec order, older
+  ties go by raw elapsed time, so idle tabs never swap as they age.
 - `App::group_members(group)` is the single source of a group's display
   order for both the sidebar and the tab bar. Manual returns vec order;
   Activity applies `activity_order` and leaves the vec untouched, so

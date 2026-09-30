@@ -328,8 +328,8 @@ pub fn newest_first_index(tab_groups: &[usize], group: usize) -> usize {
 /// The age bucket an elapsed time (seconds) falls in, as the bucket's lower
 /// bound: `0` for anything under a minute, then whole minutes, hours and
 /// days — exactly the granularity the age prefix labels show. Both the
-/// labels and the activity sort derive from this, so two tabs that read the
-/// same age never swap places.
+/// labels and the activity sort derive from this, so the sort never puts a
+/// tab above one whose label reads younger.
 pub fn age_bucket(elapsed_secs: u64) -> u64 {
     let unit = match elapsed_secs {
         0..60 => return 0,
@@ -340,31 +340,38 @@ pub fn age_bucket(elapsed_secs: u64) -> u64 {
     elapsed_secs / unit * unit
 }
 
-/// Display order for the activity sort: indices into `ages` (each tab's age
-/// bucket, `age_bucket`, in vec order), youngest first. Stable, so tabs of
-/// equal age keep their vec order — a burst of output in two "now" tabs
-/// must not make them flap.
-pub fn activity_order(ages: &[u64]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..ages.len()).collect();
-    order.sort_by_key(|&i| ages[i]);
+/// Display order for the activity sort: indices into `elapsed_secs` (each
+/// tab's time since its last activity, in vec order), youngest first by age
+/// bucket (`age_bucket`). Tabs that both read "now" keep their vec order — a
+/// burst of output in two busy tabs must not make them flap. Older ties are
+/// broken by the raw elapsed time, so two idle tabs keep one order for good
+/// instead of swapping each time one of them crosses a bucket boundary.
+pub fn activity_order(elapsed_secs: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..elapsed_secs.len()).collect();
+    order.sort_by_key(|&i| {
+        let secs = elapsed_secs[i];
+        match age_bucket(secs) {
+            0 => (0, 0),
+            bucket => (bucket, secs),
+        }
+    });
     order
 }
 
 /// One sidebar group as keyboard navigation sees it: its tabs in display
-/// order plus the tab its collapsed row shows (`Group::last_active`, falling
-/// back to the first tab).
+/// order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavGroup {
     pub tabs: Vec<usize>,
-    pub representative: usize,
 }
 
-/// The tab Ctrl-Page_Up/Down (`step` = ±1) lands on from `active`, following
-/// what the sidebar shows: the active group is expanded, so a step inside it
-/// moves one row; every other group is a single row showing its
-/// representative, so a step past either end of the active group lands on
-/// the neighbouring group's representative, wrapping around at both ends.
-/// A lone group wraps within itself. `None` when `active` is in no group.
+/// The tab Ctrl-Page_Up/Down (`step` = ±1) lands on from `active`, walking
+/// the tabs as one list from the first tab of the first group down to the
+/// last tab of the last group: a step inside the active group moves one
+/// row; a step past its last tab lands on the next non-empty group's first
+/// tab, a step back past its first tab on the previous group's last tab,
+/// wrapping around at both ends. A lone group wraps within itself. `None`
+/// when `active` is in no group.
 pub fn nav_target(groups: &[NavGroup], active: usize, step: isize) -> Option<usize> {
     let (g, pos) = groups.iter().enumerate().find_map(|(g, group)| {
         group
@@ -386,8 +393,9 @@ pub fn nav_target(groups: &[NavGroup], active: usize, step: isize) -> Option<usi
             // Every other group is empty (or there is only one): wrap inside.
             return Some(groups[g].tabs[next.rem_euclid(len) as usize]);
         }
-        if !groups[h as usize].tabs.is_empty() {
-            return Some(groups[h as usize].representative);
+        let tabs = &groups[h as usize].tabs;
+        if let Some(&tab) = if step > 0 { tabs.first() } else { tabs.last() } {
+            return Some(tab);
         }
     }
     None
@@ -919,6 +927,31 @@ mod tests {
     }
 
     #[test]
+    fn activity_order_keeps_now_tabs_in_vec_order() {
+        // Both read "now": the raw seconds must not reorder them, or two
+        // busy tabs would swap on every chunk of output.
+        assert_eq!(activity_order(&[40, 5]), vec![0, 1]);
+        assert_eq!(activity_order(&[5, 40]), vec![0, 1]);
+        assert_eq!(activity_order(&[59, 0, 30]), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn activity_order_of_idle_tabs_does_not_flap_over_time() {
+        // Tab 1 was active 30 s after tab 0. Re-sorted every 30 s with no
+        // new activity, once tab 1 leads it must stay ahead, even as the
+        // two cross minute boundaries at different moments.
+        let mut younger_leads = false;
+        for older in (30..=300).step_by(30) {
+            let order = activity_order(&[older, older - 30]);
+            if younger_leads {
+                assert_eq!(order, vec![1, 0], "reverted at {older} s");
+            }
+            younger_leads = order == vec![1, 0];
+        }
+        assert!(younger_leads);
+    }
+
+    #[test]
     fn age_bucket_matches_the_label_granularity() {
         // Everything under a minute is one bucket, so two tabs that both
         // read "now" compare equal however their seconds differ.
@@ -942,50 +975,48 @@ mod tests {
         );
     }
 
-    fn nav(tabs: &[usize], representative: usize) -> NavGroup {
+    fn nav(tabs: &[usize]) -> NavGroup {
         NavGroup {
             tabs: tabs.to_vec(),
-            representative,
         }
     }
 
     #[test]
     fn nav_target_steps_inside_the_active_group() {
-        let groups = [nav(&[1, 2, 3], 2), nav(&[4, 5], 5)];
+        let groups = [nav(&[1, 2, 3]), nav(&[4, 5])];
         assert_eq!(nav_target(&groups, 1, 1), Some(2));
         assert_eq!(nav_target(&groups, 2, 1), Some(3));
         assert_eq!(nav_target(&groups, 3, -1), Some(2));
     }
 
     #[test]
-    fn nav_target_enters_the_neighbouring_group_on_its_representative() {
-        // Group 1's collapsed row shows tab 5, so that is where a step past
-        // the end of group 0 lands — in either direction, not on the
-        // neighbouring group's first or last tab.
-        let groups = [nav(&[1, 2, 3], 2), nav(&[4, 5, 6], 5)];
-        assert_eq!(nav_target(&groups, 3, 1), Some(5));
-        assert_eq!(nav_target(&groups, 4, -1), Some(2));
+    fn nav_target_steps_into_the_neighbouring_group_at_its_near_end() {
+        // The tabs form one list: past the end of a group comes the next
+        // group's first tab, before its start the previous group's last.
+        let groups = [nav(&[1, 2, 3]), nav(&[4, 5, 6])];
+        assert_eq!(nav_target(&groups, 3, 1), Some(4));
+        assert_eq!(nav_target(&groups, 4, -1), Some(3));
         // Wraps around at both ends.
-        assert_eq!(nav_target(&groups, 6, 1), Some(2));
-        assert_eq!(nav_target(&groups, 1, -1), Some(5));
+        assert_eq!(nav_target(&groups, 6, 1), Some(1));
+        assert_eq!(nav_target(&groups, 1, -1), Some(6));
     }
 
     #[test]
     fn nav_target_skips_empty_groups_and_wraps_a_lone_group() {
-        let groups = [nav(&[], 0), nav(&[1, 2], 1), nav(&[], 0), nav(&[3], 3)];
+        let groups = [nav(&[]), nav(&[1, 2]), nav(&[]), nav(&[3])];
         assert_eq!(nav_target(&groups, 2, 1), Some(3));
         assert_eq!(nav_target(&groups, 1, -1), Some(3));
         assert_eq!(nav_target(&groups, 3, 1), Some(1));
 
-        let lone = [nav(&[1, 2, 3], 1)];
+        let lone = [nav(&[1, 2, 3])];
         assert_eq!(nav_target(&lone, 3, 1), Some(1));
         assert_eq!(nav_target(&lone, 1, -1), Some(3));
-        assert_eq!(nav_target(&[nav(&[7], 7)], 7, 1), Some(7));
+        assert_eq!(nav_target(&[nav(&[7])], 7, 1), Some(7));
     }
 
     #[test]
     fn nav_target_is_none_for_an_unknown_tab() {
-        assert_eq!(nav_target(&[nav(&[1, 2], 1)], 9, 1), None);
+        assert_eq!(nav_target(&[nav(&[1, 2])], 9, 1), None);
         assert_eq!(nav_target(&[], 1, 1), None);
     }
 
