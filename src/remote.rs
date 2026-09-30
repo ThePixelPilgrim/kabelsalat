@@ -158,6 +158,9 @@ pub enum RemoteError {
     TmuxMissing,
     /// The host's tmux is older than 3.2; carries its version.
     TmuxTooOld(String),
+    /// A background retry reached the host, but logging in needs a prompt,
+    /// which only an explicit Reconnect may show.
+    LoginNeeded,
     /// The local ssh client fails the version check.
     SshUnsupported,
     /// Anything else; carries the trimmed stderr.
@@ -182,6 +185,10 @@ impl RemoteError {
                 "{host} asks for a password or passphrase, and no graphical askpass \
                  program is installed. Add your key to ssh-agent, or install one \
                  (Fedora: openssh-askpass, Debian: ssh-askpass-gnome), then Reconnect."
+            ),
+            RemoteError::LoginNeeded => format!(
+                "{host} is reachable again and asks for a password or passphrase. \
+                 Reconnect to log in."
             ),
             RemoteError::HostKeyUnknown => format!(
                 "The host key of {host} is not known yet. Run `ssh {host}` once in a \
@@ -255,6 +262,40 @@ pub fn classify(exit_code: Option<i32>, stderr: &str, mode: &AuthMode) -> Remote
     RemoteError::Other(stderr.trim().to_string())
 }
 
+/// [`classify`] for a background retry, which always runs with
+/// `BatchMode=yes` whatever `mode` is: a login that would have prompted is
+/// [`RemoteError::LoginNeeded`] when an askpass could show that prompt.
+pub fn classify_background(exit_code: Option<i32>, stderr: &str, mode: &AuthMode) -> RemoteError {
+    match (classify(exit_code, stderr, &AuthMode::BatchOnly), mode) {
+        (RemoteError::AuthNeedsAskpass, AuthMode::Askpass(_)) => RemoteError::LoginNeeded,
+        (err, _) => err,
+    }
+}
+
+impl RemoteError {
+    /// Whether a background retry may try again: only while the host may
+    /// simply be away. Anything a person has to fix or answer stops retries
+    /// until the next explicit Reconnect.
+    pub fn retry_allowed(&self) -> bool {
+        matches!(self, RemoteError::Unreachable | RemoteError::Other(_))
+    }
+}
+
+/// How often the GUI checks whether a disconnected host is due for a retry.
+pub const RETRY_TICK_SECS: u32 = 5;
+/// Delay before the first background retry; doubles per failure.
+pub const RETRY_BASE_SECS: u64 = 5;
+/// Longest delay between two background retries.
+pub const RETRY_MAX_SECS: u64 = 60;
+
+/// Wait before the next background retry after `failures` failed ones.
+pub fn retry_delay(failures: u32) -> std::time::Duration {
+    let secs = RETRY_BASE_SECS
+        .saturating_mul(1u64.checked_shl(failures).unwrap_or(u64::MAX))
+        .min(RETRY_MAX_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// A remote host's state. It lives on the host, so all of a host's tabs
 /// change state together.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,8 +304,9 @@ pub enum HostState {
     Connecting,
     /// The master is up and the host listed its sessions.
     Live,
-    /// Not usable; the error says why. Only an explicit Reconnect leaves this
-    /// state — there are no automatic retries, so askpass never pops up unasked.
+    /// Not usable; the error says why. Reconnect leaves this state, and so
+    /// does a background retry while [`RemoteError::retry_allowed`] — which
+    /// runs with `BatchMode=yes`, so askpass never pops up unasked.
     Disconnected(RemoteError),
 }
 
@@ -678,6 +720,52 @@ mod tests {
     }
 
     #[test]
+    fn a_background_retry_never_blames_the_password() {
+        let denied = "me@localhost: Permission denied (publickey,password).\r\n";
+        assert_eq!(
+            classify_background(Some(255), denied, &with_askpass()),
+            RemoteError::LoginNeeded
+        );
+        assert_eq!(
+            classify_background(Some(255), denied, &BATCH),
+            RemoteError::AuthNeedsAskpass
+        );
+        assert_eq!(
+            classify_background(
+                Some(255),
+                "ssh: connect to host box port 22: Connection refused",
+                &with_askpass()
+            ),
+            RemoteError::Unreachable
+        );
+    }
+
+    #[test]
+    fn only_a_host_that_may_simply_be_away_is_retried() {
+        assert!(RemoteError::Unreachable.retry_allowed());
+        assert!(RemoteError::Other("boom".into()).retry_allowed());
+        for err in [
+            RemoteError::AuthFailed,
+            RemoteError::AuthNeedsAskpass,
+            RemoteError::LoginNeeded,
+            RemoteError::HostKeyUnknown,
+            RemoteError::HostKeyChanged,
+            RemoteError::TmuxMissing,
+            RemoteError::TmuxTooOld("3.1".into()),
+            RemoteError::SshUnsupported,
+        ] {
+            assert!(!err.retry_allowed(), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn retries_back_off_to_a_cap() {
+        let secs: Vec<u64> = (0..6).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [5, 10, 20, 40, 60, 60]);
+        assert_eq!(retry_delay(u32::MAX).as_secs(), RETRY_MAX_SECS);
+    }
+
+    #[test]
     fn a_missing_remote_tmux_is_tmux_missing() {
         for stderr in [
             "bash: line 1: tmux: command not found\n",
@@ -739,6 +827,7 @@ mod tests {
                 .contains("3.2")
         );
         assert!(RemoteError::TmuxMissing.message(host).contains("3.2"));
+        assert!(RemoteError::LoginNeeded.message(host).contains("Reconnect"));
         assert!(RemoteError::SshUnsupported.message(host).contains("8.4"));
         assert!(
             RemoteError::Other("boom".into())

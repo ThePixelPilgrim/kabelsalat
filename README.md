@@ -126,7 +126,9 @@ local tabs. A group's host is fixed; tabs cannot be moved between hosts.
   once to accept its key).
 - **Disconnects:** when the connection drops, every tab of that host shows a
   page with the reason and a **Reconnect** button (within about 45 s of the
-  network going away). There are no automatic retries. Tabs closed while
+  network going away). kabelsalat retries in the background and reconnects
+  on its own once the host is back, as long as logging in needs no password
+  or passphrase — it never pops up a prompt unasked. Tabs closed while
   disconnected are killed on the host after the next successful connect.
 - **Requirements:** OpenSSH 8.4 or newer here, tmux 3.2 or newer on the host.
 - **Local-only features:** the browser pane runs on this computer, and its

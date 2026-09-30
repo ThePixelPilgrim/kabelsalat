@@ -256,6 +256,19 @@ struct RemoteHost {
     state: HostState,
     /// Present once a connect was attempted with a usable ssh.
     link: Option<HostLink>,
+    /// Background retries of a disconnected host; runtime only.
+    retry: Retry,
+}
+
+/// Where a disconnected host stands with its background retries.
+#[derive(Default)]
+struct Retry {
+    /// Failed retries since the host was last live or Reconnect was clicked.
+    failures: u32,
+    /// When the next one is due; set by the first tick that finds it unset.
+    due: Option<Instant>,
+    /// One is running on the worker.
+    running: bool,
 }
 
 struct HostLink {
@@ -468,6 +481,8 @@ pub enum Msg {
     TitleChanged(usize, String),
     /// Periodic recomputation of the tab age prefixes.
     AgeTick,
+    /// Periodic check for disconnected hosts due for a background retry.
+    RetryTick,
     /// Coalesced follow-up to an activity stamp: re-sort the sidebar if the
     /// stamp changed the display order. See `request_resort`.
     Resort,
@@ -1069,6 +1084,15 @@ impl SimpleComponent for App {
                 Err(_) => gtk::glib::ControlFlow::Break,
             }
         });
+        // Always on too: a host can drop at any time. A tick with nothing
+        // disconnected only walks the host map.
+        let input = sender.input_sender().clone();
+        gtk::glib::timeout_add_seconds_local(remote::RETRY_TICK_SECS, move || {
+            match input.send(Msg::RetryTick) {
+                Ok(()) => gtk::glib::ControlFlow::Continue,
+                Err(_) => gtk::glib::ControlFlow::Break,
+            }
+        });
         ComponentParts { model, widgets }
     }
 
@@ -1286,6 +1310,12 @@ impl SimpleComponent for App {
             Msg::AgeTick => {
                 self.refresh_ages();
                 self.resort_if_stale();
+                return;
+            }
+            // Like the age tick: starting a retry writes nothing; its result
+            // arrives as Msg::Remote, which persists as usual.
+            Msg::RetryTick => {
+                self.retry_hosts();
                 return;
             }
             // Like the tick: a re-sort is a paint, never a disk write.
@@ -1998,6 +2028,7 @@ impl App {
             .or_insert_with(|| RemoteHost {
                 state: HostState::Connecting,
                 link: None,
+                retry: Retry::default(),
             })
             .state = state;
         self.refresh_host_pages(host);
@@ -2006,8 +2037,13 @@ impl App {
 
     /// Log in to `host` (once; the worker runs the host check and lists the
     /// sessions), or, when it is already live, reattach its detached tabs.
-    /// Never retried automatically, so askpass never pops up unasked.
+    /// This login may prompt; background retries (`retry_hosts`) never do.
     fn connect_host(&mut self, host: &str) {
+        // Asked for explicitly (or at startup): retries start over.
+        if let Some(entry) = self.hosts.get_mut(host) {
+            entry.retry.failures = 0;
+            entry.retry.due = None;
+        }
         match self.hosts.get(host).map(|h| h.state.clone()) {
             // One login at a time; the running attempt reports back.
             Some(HostState::Connecting) if self.worker(host).is_some() => return,
@@ -2038,6 +2074,7 @@ impl App {
                         .or_insert_with(|| RemoteHost {
                             state: HostState::Connecting,
                             link: None,
+                            retry: Retry::default(),
                         })
                         .link = Some(link);
                 }
@@ -2084,6 +2121,7 @@ impl App {
                 eprintln!("kabelsalat: {}", err.message(&host));
                 self.set_host_state(&host, HostState::Disconnected(err));
             }
+            RemoteEvent::RetryFailed(err) => self.on_retry_failed(&host, err),
             RemoteEvent::Killed(uuids) => self
                 .pending_kills
                 .retain(|kill| kill.host != host || !uuids.contains(&kill.uuid)),
@@ -2153,10 +2191,67 @@ impl App {
         }
         if let Some(entry) = self.hosts.get_mut(host) {
             entry.state = HostState::Live;
+            // A retry may still be queued behind this connect; it reports
+            // Connected too, which is harmless.
+            entry.retry.failures = 0;
+            entry.retry.due = None;
         }
         self.attach_host_tabs(host);
         self.refresh_host_pages(host);
         self.rebuild_list();
+    }
+
+    /// Start a background retry for every disconnected host that is due. It
+    /// logs in with `BatchMode=yes`, so it reconnects only where no prompt is
+    /// needed (a key or an agent) and never pops up askpass; success goes
+    /// through `on_host_connected` exactly like Reconnect.
+    fn retry_hosts(&mut self) {
+        let now = Instant::now();
+        for entry in self.hosts.values_mut() {
+            let HostState::Disconnected(err) = &entry.state else {
+                continue;
+            };
+            let Some(link) = &entry.link else {
+                continue;
+            };
+            if entry.retry.running || !err.retry_allowed() {
+                continue;
+            }
+            let failures = entry.retry.failures;
+            let due = *entry
+                .retry
+                .due
+                .get_or_insert_with(|| now + remote::retry_delay(failures));
+            if now < due {
+                continue;
+            }
+            entry.retry.due = None;
+            entry.retry.running = true;
+            link.worker.retry();
+        }
+    }
+
+    /// A background retry failed. The host may have moved on meanwhile (a
+    /// Reconnect is underway, or it came back): then only the bookkeeping
+    /// changes. Otherwise the page shows the latest reason, and a reason a
+    /// person must deal with ends the retries (`retry_allowed`).
+    fn on_retry_failed(&mut self, host: &str, err: RemoteError) {
+        let Some(entry) = self.hosts.get_mut(host) else {
+            return;
+        };
+        entry.retry.running = false;
+        entry.retry.failures = entry.retry.failures.saturating_add(1);
+        if matches!(&entry.state, HostState::Disconnected(current) if *current != err) {
+            self.set_host_state(host, HostState::Disconnected(err));
+        }
+    }
+
+    /// Whether `host` waits for a background retry to bring it back.
+    fn retries_on_its_own(&self, host: &str) -> bool {
+        self.hosts.get(host).is_some_and(|entry| {
+            entry.link.is_some()
+                && matches!(&entry.state, HostState::Disconnected(err) if err.retry_allowed())
+        })
     }
 
     /// Spawn the client of every detached tab on a live host: restored and
@@ -2239,12 +2334,20 @@ impl App {
                 true,
             ),
             HostState::Connecting => page.show(&format!("Connecting to {host}…"), "", true, false),
-            HostState::Disconnected(err) => page.show(
-                &format!("{host} is disconnected"),
-                &err.message(&host),
-                false,
-                true,
-            ),
+            HostState::Disconnected(err) => {
+                let mut description = err.message(&host);
+                if self.retries_on_its_own(&host) {
+                    description.push_str(
+                        "\n\nkabelsalat reconnects on its own as soon as the host is reachable again.",
+                    );
+                }
+                page.show(
+                    &format!("{host} is disconnected"),
+                    &description,
+                    false,
+                    true,
+                );
+            }
         }
         tab.view.set_visible_child_name("status");
     }

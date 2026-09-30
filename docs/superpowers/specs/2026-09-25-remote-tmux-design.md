@@ -21,8 +21,9 @@ installed; otherwise the connection is refused.
   scope.
 - **Host is a group property.** All tabs of a group run on the group's
   host. Tabs cannot move between hosts.
-- **Unreachable host → Disconnected, manual Reconnect.** No automatic
-  retries, so askpass never pops up unasked.
+- **Unreachable host → Disconnected, Reconnect or background retry.**
+  Background retries log in with `BatchMode=yes`, so askpass never pops
+  up unasked (see "Background retries").
 - **Remote tmux missing or < 3.2 → refuse.** No plain-ssh-shell fallback.
 - **ssh must be OpenSSH ≥ 8.4** (needed for `SSH_ASKPASS_REQUIRE`).
   Otherwise the feature is disabled.
@@ -235,6 +236,27 @@ shows:
 - the classified error message
 - a **Reconnect** button, which reruns §2 for the host and then
   reattaches all of its tabs
+- while background retries are on: a line saying kabelsalat reconnects
+  on its own as soon as the host is reachable again
+
+**Background retries.** Every `RETRY_TICK_SECS` (5 s) the GUI looks for
+Disconnected hosts whose error may just mean "away" (`Unreachable`,
+`Other`) and whose retry is due. The worker then reruns §2 with
+`BatchMode=yes` and no askpass environment, whatever the auth mode:
+- **Key or agent login works:** the master comes up and the host goes
+  Live through the same path as Reconnect, reattaching every tab.
+- **The login would prompt:** it fails instead. With an askpass
+  available this reads as `LoginNeeded` ("reachable again … Reconnect to
+  log in"); without one, as `AuthNeedsAskpass`.
+- **Failure:** reported as `RetryFailed`, which only updates the page
+  while the host is still Disconnected — never over a Reconnect the user
+  started meanwhile.
+
+Delays double from 5 s up to 60 s per failed retry; Reconnect and every
+successful connect start them over. Errors a person has to deal with
+(auth, host keys, tmux missing or too old, unsupported ssh) stop the
+retries until the next Reconnect. A Live host with a tab held back by
+the quick-exit guard is never retried, so the guard still breaks loops.
 
 **Close.**
 - **Live host:** the tab is removed immediately, and `kill-session`
@@ -325,6 +347,9 @@ remote paths.
 3. No askpass available: refused, with the message.
 4. Stop `sshd` or drop the network: every tab of the host goes
    Disconnected within about 45 s with no loop, then Reconnect works.
+   Restore it instead of clicking: a key-login host reconnects and
+   reattaches on its own within a minute; a password host shows
+   "Reconnect to log in" and no prompt.
 5. Remote tmux < 3.2 or missing: refused.
 6. Drag a tab onto a group on another host: no-drop cursor and tint.
 7. kabelsalat started from a terminal: no prompt ever appears in that
@@ -340,7 +365,6 @@ Finally, `cargo fmt`, `cargo clippy` and `cargo test` must pass.
   as an explicit "Adopt sessions from host…" action, which also enables
   continuing work across machines)
 - tmux control mode (`-C`)
-- automatic reconnect
 - creating remote groups from the CLI
 - logout survival on the remote host, which depends on that host's
   linger or `KillUserProcesses` setting (to be documented in the README)

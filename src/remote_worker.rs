@@ -199,6 +199,9 @@ pub enum RemoteEvent {
     /// Logged in, tmux checked and configured; these are the live sessions.
     Connected(Vec<SessionInfo>),
     ConnectFailed(RemoteError),
+    /// A background retry failed; unlike `ConnectFailed` it never overrides a
+    /// connect the user started meanwhile.
+    RetryFailed(RemoteError),
     /// A tab's ssh exited 255 and `ssh -O check` found the master gone.
     MasterDead,
     /// The listing a tab's client exit asked for (`tab` is the tab id).
@@ -214,7 +217,10 @@ pub enum RemoteEvent {
 /// One unit of work, run in arrival order.
 #[derive(Debug)]
 enum Job {
-    Connect,
+    /// `background`: a retry nobody asked for, so it must never prompt.
+    Connect {
+        background: bool,
+    },
     ChildExited {
         tab: usize,
         ssh_failed: bool,
@@ -250,7 +256,10 @@ impl<R: Runner> HostSession<R> {
 
     fn run_job(&mut self, job: Job) -> Option<RemoteEvent> {
         match job {
-            Job::Connect => Some(self.connect()),
+            Job::Connect { background } => Some(match self.connect(background) {
+                RemoteEvent::ConnectFailed(err) if background => RemoteEvent::RetryFailed(err),
+                event => event,
+            }),
             Job::ChildExited { tab, ssh_failed } => Some(self.child_exited(tab, ssh_failed)),
             Job::Kill(uuids) => Some(self.kill(uuids)),
             Job::Respawn(uuid) => {
@@ -278,18 +287,29 @@ impl<R: Runner> HostSession<R> {
     }
 
     /// The host check over a fresh (or reused) master: `tmux -V`, then start
-    /// and configure the server, then list its sessions.
-    fn connect(&mut self) -> RemoteEvent {
+    /// and configure the server, then list its sessions. A `background` login
+    /// runs with `BatchMode=yes` and no askpass: it succeeds with a key or an
+    /// agent, and fails rather than prompts otherwise.
+    fn connect(&mut self, background: bool) -> RemoteEvent {
+        let auth = if background {
+            AuthMode::BatchOnly
+        } else {
+            self.auth.clone()
+        };
         let argv = remote::master_argv(
             &self.dest,
             &self.control_path,
-            &self.auth,
+            &auth,
             &["tmux".to_string(), "-V".to_string()],
         );
-        let env = remote::askpass_env(&self.auth);
+        let env = remote::askpass_env(&auth);
         let version = self.run(&argv, &env, None);
         if version.code != Some(0) {
-            let err = remote::classify(version.code, &version.stderr, &self.auth);
+            let err = if background {
+                remote::classify_background(version.code, &version.stderr, &self.auth)
+            } else {
+                remote::classify(version.code, &version.stderr, &self.auth)
+            };
             if err == RemoteError::TmuxMissing {
                 self.exit_master();
             }
@@ -459,7 +479,13 @@ impl RemoteWorker {
     /// Log in (once per host: this is the only authenticating command),
     /// check tmux, configure the server and list its sessions.
     pub fn connect(&self) {
-        let _ = self.jobs.send(Job::Connect);
+        let _ = self.jobs.send(Job::Connect { background: false });
+    }
+
+    /// [`connect`](Self::connect) for a background retry: never prompts, and
+    /// a failure comes back as `RetryFailed`.
+    pub fn retry(&self) {
+        let _ = self.jobs.send(Job::Connect { background: true });
     }
 
     /// A tab's client exited; `ssh_failed` when its status was ssh's 255.
@@ -595,7 +621,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            host.run_job(Job::Connect),
+            host.run_job(Job::Connect { background: false }),
             Some(RemoteEvent::Connected(sessions()))
         );
         let calls = calls.lock().unwrap();
@@ -628,7 +654,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            host.run_job(Job::Connect),
+            host.run_job(Job::Connect { background: false }),
             Some(RemoteEvent::Connected(Vec::new()))
         );
         let calls = calls.lock().unwrap();
@@ -642,10 +668,59 @@ mod tests {
     }
 
     #[test]
+    fn a_background_retry_never_prompts_even_with_askpass() {
+        let askpass = AuthMode::Askpass("/usr/bin/ksshaskpass".into());
+        let (mut host, calls) = host(
+            askpass,
+            vec![
+                reply(0, "tmux 3.4\n", ""),
+                reply(0, "", ""),
+                reply(0, "ks-a\t0\t\nks-b\t1\t2\n", ""),
+            ],
+        );
+        assert_eq!(
+            host.run_job(Job::Connect { background: true }),
+            Some(RemoteEvent::Connected(sessions()))
+        );
+        let calls = calls.lock().unwrap();
+        assert!(calls[0].argv.contains(&"BatchMode=yes".to_string()));
+        assert!(calls[0].env.is_empty());
+    }
+
+    #[test]
+    fn a_failed_background_retry_reports_retry_failed() {
+        let askpass = AuthMode::Askpass("/usr/bin/ksshaskpass".into());
+        let (mut host, _) = host(
+            askpass.clone(),
+            vec![reply(
+                255,
+                "",
+                "me@box: Permission denied (publickey,password).\r\n",
+            )],
+        );
+        assert_eq!(
+            host.run_job(Job::Connect { background: true }),
+            Some(RemoteEvent::RetryFailed(RemoteError::LoginNeeded))
+        );
+        let (mut host, _) = self::host(
+            askpass,
+            vec![reply(
+                255,
+                "",
+                "ssh: connect to host box port 22: No route to host\r\n",
+            )],
+        );
+        assert_eq!(
+            host.run_job(Job::Connect { background: true }),
+            Some(RemoteEvent::RetryFailed(RemoteError::Unreachable))
+        );
+    }
+
+    #[test]
     fn connect_refuses_tmux_older_than_3_2_and_drops_the_master() {
         let (mut host, calls) = host(AuthMode::BatchOnly, vec![reply(0, "tmux 3.1c\n", "")]);
         assert_eq!(
-            host.run_job(Job::Connect),
+            host.run_job(Job::Connect { background: false }),
             Some(RemoteEvent::ConnectFailed(RemoteError::TmuxTooOld(
                 "3.1c".into()
             )))
@@ -662,7 +737,7 @@ mod tests {
             vec![reply(127, "", "bash: line 1: tmux: command not found\n")],
         );
         assert_eq!(
-            host.run_job(Job::Connect),
+            host.run_job(Job::Connect { background: false }),
             Some(RemoteEvent::ConnectFailed(RemoteError::TmuxMissing))
         );
         assert_eq!(&calls.lock().unwrap()[1].argv[3..5], ["-O", "exit"]);
@@ -679,7 +754,7 @@ mod tests {
             )],
         );
         assert_eq!(
-            host.run_job(Job::Connect),
+            host.run_job(Job::Connect { background: false }),
             Some(RemoteEvent::ConnectFailed(RemoteError::AuthNeedsAskpass))
         );
         assert_eq!(calls.lock().unwrap().len(), 1);
@@ -701,7 +776,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            host.run_job(Job::Connect),
+            host.run_job(Job::Connect { background: false }),
             Some(RemoteEvent::Connected(Vec::new()))
         );
         let calls = calls.lock().unwrap();
@@ -727,7 +802,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            host.run_job(Job::Connect),
+            host.run_job(Job::Connect { background: false }),
             Some(RemoteEvent::ConnectFailed(RemoteError::Unreachable))
         );
         assert_eq!(calls.lock().unwrap().len(), 2);
