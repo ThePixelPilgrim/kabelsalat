@@ -70,6 +70,7 @@ pub struct Captured {
 /// `/dev/null` (or a pipe carrying `stdin`), and the child calls `setsid()`
 /// before exec, so it has no controlling terminal and ssh can never prompt
 /// on the terminal kabelsalat was started from, whatever its version.
+#[allow(unsafe_code)]
 pub fn run_detached(
     argv: &[String],
     env: &[(String, String)],

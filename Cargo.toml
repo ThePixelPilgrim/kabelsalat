@@ -2,6 +2,9 @@
 name = "kabelsalat"
 version = "0.6.4"
 edition = "2024"
+license = "MIT"
+# Not a crates.io crate (git dependency); also tells cargo-deny it is private.
+publish = false
 
 [[bin]]
 name = "kabelsalat"
@@ -24,3 +27,11 @@ klamottenkiste = { git = "https://github.com/ThePixelPilgrim/klamottenkiste", ta
 [target.'cfg(unix)'.dependencies]
 # Only for `kill(pid, SIGTERM)`: std can send SIGKILL but not SIGTERM.
 libc = "0.2"
+
+# The unsafe half of the dependency policy in deny.toml: no `unsafe` without
+# an explicit `#[allow(unsafe_code)]` and a `// SAFETY:` comment.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

@@ -528,6 +528,7 @@ pub fn isolate_process_group(command: &mut Command) -> &mut Command {
 /// with `ESRCH`, and the fallback `kill` reaches it directly. Every error —
 /// `ESRCH` above all — is deliberately ignored: nothing to signal is success.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn signal_group(pid: libc::pid_t, signal: libc::c_int) {
     if pid <= 0 {
         return;
@@ -538,6 +539,7 @@ fn signal_group(pid: libc::pid_t, signal: libc::c_int) {
     // already gone, which is why the return value is discarded.
     let sent = unsafe { libc::killpg(pid, signal) };
     if sent != 0 {
+        // SAFETY: as above; the group is gone, so signal the child itself.
         unsafe {
             libc::kill(pid, signal);
         }
@@ -554,6 +556,7 @@ fn signal_group(pid: libc::pid_t, signal: libc::c_int) {
 /// process *group* with that id only exists while a member of the original
 /// group is still alive.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn kill_group_remnants(pid: libc::pid_t) {
     if pid <= 0 {
         return;
@@ -1326,6 +1329,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn a_profile_that_cannot_be_moved_aside_is_never_deleted() {
         use std::os::unix::fs::PermissionsExt as _;
         // SAFETY: `geteuid` is a pure read of the calling process's identity.
@@ -1466,6 +1470,7 @@ mod tests {
 
     /// Is `pid` still a signallable process?
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     fn alive(pid: libc::pid_t) -> bool {
         // SAFETY: `kill` with signal 0 only probes; it changes nothing.
         unsafe { libc::kill(pid, 0) == 0 }
@@ -1484,6 +1489,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn a_child_is_spawned_into_its_own_process_group() {
         let (mut child, _) = spawn_group_leader_printing_pid("echo $$; sleep 30");
         let pid = child.id() as libc::pid_t;
@@ -1539,6 +1545,7 @@ mod tests {
     /// A child reaped behind `Child`'s back: every later `try_wait` fails with
     /// `ECHILD`, which is the only way this error is reachable in practice.
     #[cfg(unix)]
+    #[allow(unsafe_code)]
     fn externally_reaped_child() -> Child {
         let mut child = Command::new("sh")
             .arg("-c")
@@ -1601,6 +1608,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn sweep_does_not_report_trash_it_lost_a_race_for() {
         use std::os::unix::fs::PermissionsExt as _;
         // SAFETY: `geteuid` is a pure read of the calling process's identity.

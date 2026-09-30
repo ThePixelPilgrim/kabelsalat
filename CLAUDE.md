@@ -11,6 +11,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 - `cargo build` needs system dev headers, not just Rust: GTK 4.18+, libadwaita 1.5+, VTE 0.82+ (Fedora: `gtk4-devel libadwaita-devel vte291-gtk4-devel`). A build failure in the `gtk4`/`vte4` sys crates usually means a missing header, not a code bug.
 - There is no CI. Run `cargo fmt`, `cargo clippy` and `cargo test` yourself before claiming work is done.
+- Dependency policy (vulnerabilities, unsound/unmaintained crates, licenses, sources, prebuilt binaries) is `deny.toml`; run `cargo deny check` after changing dependencies. Own `unsafe` is denied via `[lints]` in `Cargo.toml`: each use needs `#[allow(unsafe_code)]` and a `// SAFETY:` comment.
 - Tests are unit tests inside `src/state.rs` and `src/tmuxctl.rs`; single test: `cargo test <name>`.
 
 ## Architecture invariants

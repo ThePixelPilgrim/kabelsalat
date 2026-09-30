@@ -1,22 +1,43 @@
 # cargo-deny configuration. Run `cargo deny check` before a release.
 # Docs: https://embarkstudios.github.io/cargo-deny/
+#
+# cargo-deny cannot see `unsafe` code. That half lives in Cargo.toml's
+# `[lints]`: `unsafe_code` is denied crate-wide and every allowed block needs
+# a `// SAFETY:` comment. Dependencies' `unsafe` is covered here only through
+# RustSec "unsound" advisories and the build-time checks under [bans.build].
 
 [graph]
 all-features = false
+# Only what kabelsalat can be built for; keeps Windows/wasm-only crates out of
+# the license and advisory checks.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
+[output]
+feature-depth = 1
+
+# ---- vulnerabilities, unsoundness, unmaintained, yanked --------------------
 [advisories]
 db-path = "$CARGO_HOME/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
+# Vulnerability and unsound advisories are always errors. Unmaintained ones
+# are errors too, for direct and transitive dependencies alike.
+unmaintained = "all"
+unsound = "all"
 yanked = "deny"
 ignore = [
     # cgmath is unmaintained; pulled in via smithay -> nested-wayland-session
     # (klamottenkiste). No fix on our side until smithay drops it.
-    "RUSTSEC-2026-0196",
+    { id = "RUSTSEC-2026-0196", reason = "cgmath via smithay; no replacement upstream yet" },
+    # cgmath's Matrix{2,3,4}::swap_columns is UB for identical indices.
+    # Nothing in the tree calls it (checked against smithay 0.7.0).
+    { id = "RUSTSEC-2026-0197", reason = "swap_columns is never called" },
 ]
 
+# ---- licenses --------------------------------------------------------------
 [licenses]
-# The app itself is MIT; it links LGPL crates (klamottenkiste, GTK bindings),
-# which is fine for a dynamically-linked/attributed binary.
+# kabelsalat is MIT. Only permissive licenses are allowed everywhere; copyleft
+# ones (GPL, AGPL, LGPL, MPL, EUPL, SSPL, …) are refused unless a crate is
+# listed under `exceptions` below after a compatibility check.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -24,20 +45,61 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "0BSD",
     "Zlib",
     "Unlicense",
     "Unicode-3.0",
-    "LGPL-2.1-or-later",
-    "LGPL-3.0-or-later",
 ]
-confidence-threshold = 0.8
+confidence-threshold = 0.9
+# An allowed license no crate uses is fine: the list is policy, not inventory.
+unused-allowed-license = "allow"
 
+# LGPL-3.0-or-later, statically linked into the MIT binary. Compatible: the
+# LGPL's relinking requirement is met because this app's complete source is
+# published, so anyone can rebuild it against a modified library. (The GTK
+# stack's LGPL C libraries are linked dynamically and are not Rust crates.)
+exceptions = [
+    { crate = "klamottenkiste", allow = ["LGPL-3.0-or-later"] },
+    { crate = "monochromatic-nested-wayland-session", allow = ["LGPL-3.0-or-later"] },
+]
+
+[licenses.private]
+# The app itself is not published to crates.io.
+ignore = true
+
+# ---- banned crates, duplicates, supply chain ------------------------------
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
+# Path/git dependencies of this crate are not wildcards.
+allow-wildcard-paths = true
 highlight = "all"
+deny = [
+    # OpenSSL (C, unsafe FFI): kabelsalat shells out to ssh and needs no TLS.
+    { crate = "openssl", reason = "C library; no TLS needed" },
+    { crate = "openssl-sys", reason = "C library; no TLS needed" },
+]
 
+[bans.build]
+# Refuse dependencies that ship prebuilt executables or archives: code that
+# cannot be reviewed from source.
+executables = "deny"
+include-archives = true
+include-dependencies = true
+include-workspace = true
+# Crates' own CI/dev scripts are never run by a build (only build.rs and
+# proc-macros are, and those are Rust); flagging them is noise.
+interpreted = "allow"
+
+# libloading ships two tiny Windows test DLLs; pinned by checksum so any
+# change to them fails the check again.
+[[bans.build.bypass]]
+crate = "libloading@0.8.9"
+allow = [
+    { path = "tests/nagisa32.dll", checksum = "5c69b2bd9c8a6ad04165c221075fc9fade1dd66ca697399ace528a5a62328e36" },
+    { path = "tests/nagisa64.dll", checksum = "e20b95e3036f3289421abd100760874d4f455afd33c3b5b64fec56b191f7d477" },
+]
+
+# ---- where crates may come from -------------------------------------------
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
