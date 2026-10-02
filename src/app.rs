@@ -1578,6 +1578,7 @@ impl SimpleComponent for App {
                 if !self.on_claude_sessions(&host, found) {
                     return;
                 }
+                self.rebuild_list();
             }
             Msg::Remote { host, event } => self.on_remote_event(host, event),
             Msg::Reconnect(host) => self.connect_host(&host),
@@ -3405,6 +3406,8 @@ impl App {
             }
         }
         if changed {
+            // The tint comes and goes with the session.
+            self.rebuild_list();
             self.save_state();
         }
     }
@@ -4135,8 +4138,8 @@ impl App {
                 button.add_css_class("tab-active");
                 active_button = Some(button.clone());
             }
-            if tab.crashed.is_some() {
-                button.add_css_class("tab-crashed");
+            for class in tab_state_classes(tab.crashed, tab.claude.is_some()) {
+                button.add_css_class(class);
             }
             let id = tab.id;
             let input = self.input.clone();
@@ -4581,8 +4584,8 @@ impl App {
         {
             row.add_css_class("host-disconnected");
         }
-        if tab.crashed.is_some() {
-            row.add_css_class("tab-crashed");
+        for class in tab_state_classes(tab.crashed, tab.claude.is_some()) {
+            row.add_css_class(class);
         }
 
         // The host key rides along so every drop target can judge the drag
@@ -5171,6 +5174,20 @@ fn age_prefix(elapsed: Duration) -> String {
 /// of the expanded group, or "title (n)" when it stands in for a collapsed
 /// group of n tabs. Shared by row construction, tab-bar construction and the
 /// in-place refreshes so they can never drift apart.
+/// The CSS classes that say what state a tab is in: `tab-crashed` for a
+/// dead shell (red label), `tab-claude` for a tracked claude session (green
+/// tint). Shared by the sidebar row and the tab-bar button.
+fn tab_state_classes(crashed: Option<i32>, claude: bool) -> Vec<&'static str> {
+    let mut classes = Vec::new();
+    if crashed.is_some() {
+        classes.push("tab-crashed");
+    }
+    if claude {
+        classes.push("tab-claude");
+    }
+    classes
+}
+
 fn display_title(
     age: &str,
     title: &str,
