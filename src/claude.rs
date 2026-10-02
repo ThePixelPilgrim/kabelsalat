@@ -409,7 +409,7 @@ mod tests {
             ("c".to_string(), 40),
             ("d".to_string(), 60),
         ];
-        let found = sessions_by_pane(&records, &panes, &proc_root);
+        let found = sessions_by_pane(&records, &panes, &ProcFs(&proc_root));
         let mut pairs: Vec<(String, String)> = found.into_iter().map(|(u, s)| (u, s.id)).collect();
         pairs.sort();
         assert_eq!(
@@ -441,7 +441,7 @@ mod tests {
         let found = sessions_by_pane(
             &[record(22, "later", 9), record(21, "earlier", 1)],
             &panes,
-            &proc_root,
+            &ProcFs(&proc_root),
         );
         assert_eq!(found["a"].id, "later");
     }
@@ -451,10 +451,88 @@ mod tests {
         let proc_root = temp_dir("cycle").join("proc");
         write_stat(&proc_root, 2, 1, "1");
         write_stat(&proc_root, 3, 2, "1");
-        assert_eq!(ancestors(&proc_root, 3), [3, 2]);
+        let tree = ProcFs(&proc_root);
+        assert_eq!(ancestors(&tree, 3), [3, 2]);
         write_stat(&proc_root, 7, 8, "1");
         write_stat(&proc_root, 8, 7, "1");
-        assert_eq!(ancestors(&proc_root, 7), [7, 8]);
-        assert_eq!(ancestors(&proc_root, 99), [99]); // unknown pid: itself only
+        assert_eq!(ancestors(&tree, 7), [7, 8]);
+        assert_eq!(ancestors(&tree, 99), [99]); // unknown pid: itself only
+    }
+
+    #[test]
+    fn a_parent_map_is_a_process_tree_too() {
+        // What a remote host prints: pid → ppid pairs, no /proc in sight.
+        let tree: HashMap<u32, u32> = [(2, 1), (3, 2), (4, 3)].into_iter().collect();
+        assert_eq!(ancestors(&tree, 4), [4, 3, 2]);
+        assert_eq!(ancestors(&tree, 9), [9]);
+        let record = Record {
+            pid: 4,
+            session: ClaudeSession {
+                id: "s".into(),
+                cwd: PathBuf::from("/p"),
+            },
+            proc_start: None,
+            started_at: 0,
+        };
+        let found = sessions_by_pane(&[record], &[("t".to_string(), 2)], &tree);
+        assert_eq!(found["t"].id, "s");
+    }
+
+    // --- remote hosts ---
+
+    #[test]
+    fn host_script_lists_panes_processes_and_the_registry() {
+        let script = host_script();
+        assert!(script.contains("list-panes -a -F"));
+        assert!(script.contains("#{session_name}"));
+        assert!(script.contains("#{pane_pid}"));
+        assert!(script.contains("ps -eo pid=,ppid="));
+        assert!(script.contains("${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/*.json"));
+        // One line per record whatever the file's formatting.
+        assert!(script.contains("tr -d '\\n'"));
+    }
+
+    #[test]
+    fn sessions_from_host_listing_matches_like_the_local_path() {
+        // tmux server 10 → shells 20 (tab a) and 30 (tab b); claude 21 under
+        // a, claude 32 under a wrapper under b. 40 is a registered claude
+        // whose process is gone (not in the ps listing). Pretty-printed and
+        // compact records alike; unknown lines are ignored.
+        let listing = "\
+pane\tks-a\t20
+pane\tks-b\t30
+pane\tforeign\t99
+proc\t10\t1
+proc\t20\t10
+proc\t21\t20
+proc\t30\t10
+proc\t31\t30
+proc\t32\t31
+record\t{\"pid\":21,\"sessionId\":\"a-session\",\"cwd\":\"/home/me/a\",\"startedAt\":5}
+record\t{ \"pid\": 32, \"sessionId\": \"b-session\", \"cwd\": \"/home/me/b\" }
+record\t{\"pid\":40,\"sessionId\":\"gone\",\"cwd\":\"/x\"}
+record\tnot json
+warning: something ssh printed
+";
+        let found = sessions_from_host_listing(listing);
+        let mut pairs: Vec<(String, String, PathBuf)> =
+            found.into_iter().map(|(u, s)| (u, s.id, s.cwd)).collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [
+                (
+                    "a".to_string(),
+                    "a-session".to_string(),
+                    PathBuf::from("/home/me/a")
+                ),
+                (
+                    "b".to_string(),
+                    "b-session".to_string(),
+                    PathBuf::from("/home/me/b")
+                ),
+            ]
+        );
+        assert!(sessions_from_host_listing("").is_empty());
     }
 }

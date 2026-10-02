@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_on_restore_only_for_a_gone_local_tab_with_a_session() {
+    fn resume_on_restore_for_a_gone_tab_with_a_session_on_either_side() {
         let mut state = remote_state(); // group 1 is remote
         let session = ClaudeSession {
             id: "sid".into(),
@@ -1196,20 +1196,22 @@ mod tests {
         state.tabs[0].claude = Some(session.clone()); // aaa: local
         state.tabs[1].claude = Some(session.clone()); // bbb: remote
         let gone: Vec<String> = Vec::new();
-        // Local, session gone, claude known: resume.
-        assert_eq!(
-            resume_on_restore(&state, &state.tabs[0], &gone),
-            Some(&session)
-        );
+        // Session gone, claude known: resume.
+        assert_eq!(resume_on_restore(&state.tabs[0], &gone), Some(&session));
         // Session survived: -A attaches, nothing to resume.
         assert_eq!(
-            resume_on_restore(&state, &state.tabs[0], &["aaa".to_string()]),
+            resume_on_restore(&state.tabs[0], &["aaa".to_string()]),
             None
         );
-        // Remote group: the registry is not this machine's.
-        assert_eq!(resume_on_restore(&state, &state.tabs[1], &gone), None);
+        // A remote tab is the same decision: its host's worker found the
+        // session there, and its directory is a path on that host.
+        assert_eq!(resume_on_restore(&state.tabs[1], &gone), Some(&session));
+        assert_eq!(
+            resume_on_restore(&state.tabs[1], &["bbb".to_string()]),
+            None
+        );
         // Nothing known.
-        assert_eq!(resume_on_restore(&state, &state.tabs[2], &gone), None);
+        assert_eq!(resume_on_restore(&state.tabs[2], &gone), None);
     }
 
     #[test]
