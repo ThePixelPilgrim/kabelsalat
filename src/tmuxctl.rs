@@ -203,6 +203,50 @@ pub struct SessionInfo {
     pub dead_status: Option<i32>,
 }
 
+/// What [`TmuxCtl::create_detached_session`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Created {
+    /// The session did not exist and was created.
+    Created,
+    /// The session was already there; nothing was changed.
+    AlreadyExists,
+}
+
+/// Whether tmux refused a `new-session` because the name is taken.
+pub fn is_duplicate_session_stderr(stderr: &str) -> bool {
+    stderr.trim_start().starts_with("duplicate session")
+}
+
+/// Whether a variable of this process belongs in the server's global
+/// environment. What describes a process rather than the desktop — the tmux
+/// client markers, the working directory, the shell nesting depth, the
+/// last argument — is left out.
+pub fn exportable_env_key(key: &str) -> bool {
+    !key.is_empty() && !matches!(key, "TMUX" | "TMUX_PANE" | "PWD" | "OLDPWD" | "SHLVL" | "_")
+}
+
+/// Argv tail that sets every pair in the server's global environment, as
+/// one command sequence: `set-environment -g K V ; set-environment -g …`.
+/// tmux reads an argument ending in `;` as "argument, then a new command",
+/// so a value that ends in one is escaped to `\;`, which tmux reads back
+/// as the literal semicolon.
+pub fn global_environment_args(pairs: &[(String, String)]) -> Vec<String> {
+    let mut args = Vec::with_capacity(pairs.len() * 5);
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        if i > 0 {
+            args.push(";".into());
+        }
+        args.push("set-environment".into());
+        args.push("-g".into());
+        args.push(key.clone());
+        args.push(match value.strip_suffix(';') {
+            Some(head) => format!("{head}\\;"),
+            None => value.clone(),
+        });
+    }
+    args
+}
+
 /// Invisible-plumbing tmux configuration. `{events_dir}` is replaced with
 /// the runtime events directory before writing.
 const TMUX_CONF: &str = "\
@@ -460,6 +504,96 @@ impl TmuxCtl {
                 remote::mux_argv(dest, control_path, true, &remote_argv)
             }
         }
+    }
+
+    /// Argv that creates a tab's session detached, without a client: what
+    /// `kabelsalat resume` runs at boot, where there is no terminal to
+    /// attach. `new-session -d` rather than `-A`, so an existing session is
+    /// reported (`duplicate session`) instead of silently reused — see
+    /// [`TmuxCtl::create_detached_session`]. Local only: a remote tab's
+    /// session is created by its host's worker, so a remote target yields
+    /// an empty argv.
+    pub fn spawn_detached_argv(
+        &self,
+        uuid: &str,
+        cwd: Option<&Path>,
+        command: &[String],
+        env: &[(&str, &str)],
+    ) -> Vec<String> {
+        let Target::Local { socket, conf, .. } = &self.target else {
+            return Vec::new();
+        };
+        let mut argv = vec![
+            "tmux".to_string(),
+            "-S".into(),
+            socket.to_string_lossy().into_owned(),
+            "-f".into(),
+            conf.to_string_lossy().into_owned(),
+            "new-session".into(),
+            "-d".into(),
+        ];
+        for (key, value) in env {
+            argv.push("-e".into());
+            argv.push(format!("{key}={value}"));
+        }
+        if let Some(dir) = cwd {
+            argv.push("-c".into());
+            argv.push(escape_tmux_format(&dir.to_string_lossy()));
+        }
+        argv.push("-s".into());
+        argv.push(format!("{SESSION_PREFIX}{uuid}"));
+        argv.push(shell_quote_argv(command));
+        argv
+    }
+
+    /// Create a tab's session detached. A session that already exists is
+    /// `AlreadyExists`, not an error: the GUI may have come up meanwhile and
+    /// created it with `-A`, and either order of that race must be safe.
+    pub fn create_detached_session(
+        &self,
+        uuid: &str,
+        cwd: Option<&Path>,
+        command: &[String],
+        env: &[(&str, &str)],
+    ) -> Result<Created, TmuxError> {
+        let argv = self.spawn_detached_argv(uuid, cwd, command, env);
+        let (program, rest) = argv.split_first().ok_or_else(|| {
+            TmuxError::Command("a remote session is created by its host's worker".into())
+        })?;
+        let output = Command::new(program).args(rest).output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            Ok(Created::Created)
+        } else if is_duplicate_session_stderr(&stderr) {
+            Ok(Created::AlreadyExists)
+        } else {
+            Err(TmuxError::Command(stderr.trim().to_string()))
+        }
+    }
+
+    /// Copy the exportable variables of this process into the server's
+    /// global environment, in one tmux invocation. A server started at boot
+    /// (`kabelsalat resume`) carries the user manager's minimal environment,
+    /// and every session created later would inherit it — a `PATH` without
+    /// the desktop's additions, no `XDG_CURRENT_DESKTOP` — until the next
+    /// reboot. The GUI runs this after `ensure_server`, so the server
+    /// describes the desktop it is used from. Local only.
+    pub fn sync_global_environment<I>(&self, vars: I) -> Result<(), TmuxError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        if self.is_remote() {
+            return Ok(());
+        }
+        let pairs: Vec<(String, String)> = vars
+            .into_iter()
+            .filter(|(key, _)| exportable_env_key(key))
+            .collect();
+        let args = global_environment_args(&pairs);
+        if args.is_empty() {
+            return Ok(());
+        }
+        self.run(&args)
     }
 
     /// Argv tail of the `pane_current_path` query.

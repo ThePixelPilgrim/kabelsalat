@@ -563,6 +563,32 @@ pub fn reconcile_local(saved: &SavedState, live: &[String], dead: &[DeadPane]) -
     reconcile(&local, live, dead)
 }
 
+/// The tabs `kabelsalat resume` recreates right after boot: the local tabs
+/// [`reconcile_local`] would respawn that carry a claude session. Plain
+/// shells are left to the GUI — started at boot they would only lack the
+/// desktop's environment — and a tab whose session is live is already
+/// somebody's. Saved order, so the GUI attaches them in the order it shows.
+pub fn boot_resume_plan(saved: &SavedState, live: &[String]) -> Vec<SavedTab> {
+    reconcile_local(saved, live, &[])
+        .respawn
+        .into_iter()
+        .filter(|tab| tab.claude.is_some())
+        .collect()
+}
+
+/// The command a boot-time resume runs: the claude's [`ClaudeSession::resume_argv`]
+/// behind a login shell. The user manager's environment has no `~/.cargo/bin`
+/// and nothing from `.profile`; `$SHELL -l` brings that back without touching
+/// any rc file. The words of `resume_argv` are a program name, a flag and a
+/// session id — nothing a shell would reinterpret — so they are joined bare.
+pub fn boot_resume_argv(shell: &str, session: &ClaudeSession) -> Vec<String> {
+    vec![
+        shell.to_string(),
+        "-lc".into(),
+        format!("exec {}", session.resume_argv().join(" ")),
+    ]
+}
+
 /// Every remote host that has at least one saved tab, once, in group order:
 /// the hosts to connect at startup. A host known only from its pending kills
 /// is not connected unasked; its queue flushes on the next connect.
