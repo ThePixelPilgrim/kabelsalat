@@ -5774,6 +5774,22 @@ mod tests {
         assert!(!session_definitively_gone(&ok, "abc"));
     }
 
+    // --- tab state classes ------------------------------------------------
+
+    #[test]
+    fn tab_state_classes_mark_a_crash_and_a_tracked_claude() {
+        // Shared by the sidebar row and the tab-bar button, so the two can
+        // never disagree about what a tab looks like.
+        assert!(tab_state_classes(None, false).is_empty());
+        assert_eq!(tab_state_classes(Some(1), false), ["tab-crashed"]);
+        assert_eq!(tab_state_classes(None, true), ["tab-claude"]);
+        // A crashed claude tab is both: tinted, with the red label on top.
+        assert_eq!(
+            tab_state_classes(Some(-1), true),
+            ["tab-crashed", "tab-claude"]
+        );
+    }
+
     // --- finding 2: crashed-tab label -----------------------------------
 
     #[test]
