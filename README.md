@@ -52,8 +52,11 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
   `claude --resume <id>` in that directory instead of a plain shell, and so
   is a crashed tab on restart. This covers a tab opened with `Ctrl+Shift+C`,
   a `claude` typed into any shell, and `kabelsalat run -- claude` alike;
-  once claude exits the tab is a shell again and respawns as one. Local
-  groups only.
+  once claude exits the tab is a shell again and respawns as one. A remote
+  group's host is inspected the same way by its worker over ssh (a small
+  POSIX `sh` script: its panes, `ps`, and the registry under the host's
+  `~/.claude`), so a remote tab resumes its claude on that host. A tab with
+  a tracked session is tinted green in the tab list and the tab bar.
 - **Logout survival**: the tmux server is detached from the login session
   (`systemd-run --user --scope`). If lingering is disabled for your user, a
   header-bar icon explains what `loginctl enable-linger` adds and its

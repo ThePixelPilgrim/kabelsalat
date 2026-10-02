@@ -7,6 +7,7 @@
 //! `Msg`, like the linger and profile-sweep threads do. Nothing in here
 //! panics; failures become `RemoteEvent`s.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -16,7 +17,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::claude;
 use crate::remote::{self, AuthMode, ControlOp, RemoteError, SshAvailability};
+use crate::state::ClaudeSession;
 use crate::tmuxctl::{self, SessionInfo, TmuxCtl, TmuxVersion};
 
 /// How long to wait for a pipe's end after the process exited. A master
@@ -212,6 +215,10 @@ pub enum RemoteEvent {
     },
     /// These queued kills are done: killed, or already gone.
     Killed(Vec<String>),
+    /// The claude session found in each of the host's panes, by tab uuid
+    /// (see `claude::host_script`). Only ever a real answer: a discovery
+    /// that did not reach the host reports nothing at all.
+    ClaudeSessions(HashMap<String, ClaudeSession>),
 }
 
 /// One unit of work, run in arrival order.
@@ -226,7 +233,14 @@ enum Job {
         ssh_failed: bool,
     },
     Kill(Vec<String>),
-    Respawn(String),
+    /// Rerun a dead pane: its original command, or `command` in `cwd`.
+    Respawn {
+        uuid: String,
+        cwd: Option<PathBuf>,
+        command: Option<Vec<String>>,
+    },
+    /// Run the claude discovery script on the host.
+    Discover,
     PanePath {
         uuid: String,
         reply: mpsc::Sender<Option<String>>,
@@ -262,10 +276,11 @@ impl<R: Runner> HostSession<R> {
             }),
             Job::ChildExited { tab, ssh_failed } => Some(self.child_exited(tab, ssh_failed)),
             Job::Kill(uuids) => Some(self.kill(uuids)),
-            Job::Respawn(uuid) => {
-                self.respawn(&uuid);
+            Job::Respawn { uuid, cwd, command } => {
+                self.respawn(&uuid, cwd.as_deref(), command.as_deref());
                 None
             }
+            Job::Discover => self.discover().map(RemoteEvent::ClaudeSessions),
             Job::PanePath { uuid, reply } => {
                 // The asker may have stopped waiting; that is fine.
                 let _ = reply.send(self.pane_path(&uuid));
@@ -409,10 +424,10 @@ impl<R: Runner> HostSession<R> {
         RemoteEvent::Killed(done)
     }
 
-    fn respawn(&mut self, uuid: &str) {
+    fn respawn(&mut self, uuid: &str, cwd: Option<&Path>, command: Option<&[String]>) {
         let argv = self
             .ctl
-            .command_argv(&TmuxCtl::respawn_pane_args(uuid, None, None));
+            .command_argv(&TmuxCtl::respawn_pane_args(uuid, cwd, command));
         let out = self.run(&argv, &[], None);
         if out.code != Some(0) {
             eprintln!(
@@ -421,6 +436,16 @@ impl<R: Runner> HostSession<R> {
                 out.stderr.trim()
             );
         }
+    }
+
+    /// What claude runs in which pane, as the host sees it. The script ends
+    /// in `exit 0`, so any other status is the transport (or no `sh`): the
+    /// sessions are then unknown, which is not the same as none.
+    fn discover(&mut self) -> Option<HashMap<String, ClaudeSession>> {
+        let script = vec!["sh".to_string(), "-c".into(), claude::host_script()];
+        let argv = remote::mux_argv(&self.dest, &self.control_path, false, &script);
+        let out = self.run(&argv, &[], None);
+        (out.code == Some(0)).then(|| claude::sessions_from_host_listing(&out.stdout))
     }
 
     /// The empty check is load-bearing: on tmux 3.7c `display-message -p -t
@@ -499,8 +524,16 @@ impl RemoteWorker {
         let _ = self.jobs.send(Job::Kill(uuids));
     }
 
-    pub fn respawn(&self, uuid: String) {
-        let _ = self.jobs.send(Job::Respawn(uuid));
+    /// Rerun a dead pane: its original command, or `command` in `cwd`.
+    pub fn respawn(&self, uuid: String, cwd: Option<PathBuf>, command: Option<Vec<String>>) {
+        let _ = self.jobs.send(Job::Respawn { uuid, cwd, command });
+    }
+
+    /// Ask which claude runs in which pane; answered as
+    /// `RemoteEvent::ClaudeSessions`, or not at all if the host was not
+    /// reached.
+    pub fn discover_claude(&self) {
+        let _ = self.jobs.send(Job::Discover);
     }
 
     /// The pane's directory on the host, waiting at most `wait` (the queue
@@ -530,7 +563,8 @@ impl RemoteWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use crate::state::ClaudeSession;
+    use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -904,6 +938,85 @@ mod tests {
             Some(RemoteEvent::Killed(vec!["live".into(), "gone".into()]))
         );
         assert!(last_word(&calls.lock().unwrap()[0]).contains("kill-session -t ks-live"));
+    }
+
+    #[test]
+    fn a_restart_reruns_the_pane_or_the_command_it_is_given() {
+        let (mut host, calls) = host(AuthMode::BatchOnly, vec![]);
+        assert_eq!(
+            host.run_job(Job::Respawn {
+                uuid: "u".into(),
+                cwd: None,
+                command: None,
+            }),
+            None
+        );
+        assert_eq!(
+            host.run_job(Job::Respawn {
+                uuid: "u".into(),
+                cwd: Some(Path::new("/w").to_path_buf()),
+                command: Some(vec!["claude".into(), "--resume".into(), "sid".into()]),
+            }),
+            None
+        );
+        let calls = calls.lock().unwrap();
+        assert!(last_word(&calls[0]).ends_with("respawn-pane -t ks-u"));
+        assert!(last_word(&calls[1]).ends_with("respawn-pane -t ks-u -c /w 'claude --resume sid'"));
+    }
+
+    // --- claude discovery ---
+
+    #[test]
+    fn discovery_runs_the_host_script_and_reports_what_it_matched() {
+        let listing = "pane\tks-a\t20\nproc\t20\t1\nproc\t21\t20\n\
+                       record\t{\"pid\":21,\"sessionId\":\"sid\",\"cwd\":\"/home/me/p\"}\n";
+        let (mut host, calls) = host(AuthMode::BatchOnly, vec![reply(0, listing, "")]);
+        let expected: HashMap<String, ClaudeSession> = [(
+            "a".to_string(),
+            ClaudeSession {
+                id: "sid".into(),
+                cwd: Path::new("/home/me/p").to_path_buf(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            host.run_job(Job::Discover),
+            Some(RemoteEvent::ClaudeSessions(expected))
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].argv.contains(&"ControlMaster=no".to_string()));
+        assert!(!calls[0].argv.contains(&"-t".to_string()));
+        // `sh -c '<script>'`: the login shell's syntax does not matter.
+        let remote = last_word(&calls[0]);
+        assert!(remote.starts_with("sh -c '"), "{remote}");
+        assert!(remote.contains("list-panes -a"));
+        assert!(remote.contains("sessions/"));
+    }
+
+    #[test]
+    fn a_discovery_that_did_not_reach_the_host_reports_nothing() {
+        // The script itself always exits 0; any other status is the
+        // transport, which says nothing about the sessions. No event means
+        // the tabs keep what they knew.
+        let (mut lost, _) = host(
+            AuthMode::BatchOnly,
+            vec![reply(
+                255,
+                "",
+                "mux_client_request_session: read from master failed\r\n",
+            )],
+        );
+        assert_eq!(lost.run_job(Job::Discover), None);
+        let (mut no_sh, _) = host(AuthMode::BatchOnly, vec![reply(127, "", "sh: not found")]);
+        assert_eq!(no_sh.run_job(Job::Discover), None);
+        // An empty host is an empty, but real, answer.
+        let (mut empty, _) = host(AuthMode::BatchOnly, vec![reply(0, "", "")]);
+        assert_eq!(
+            empty.run_job(Job::Discover),
+            Some(RemoteEvent::ClaudeSessions(HashMap::new()))
+        );
     }
 
     #[test]

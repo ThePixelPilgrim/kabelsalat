@@ -15,7 +15,7 @@ use crate::remote;
 pub const MIN_VERSION: (u32, u32) = (3, 2);
 
 /// Session name prefix on our private server.
-const SESSION_PREFIX: &str = "ks-";
+pub(crate) const SESSION_PREFIX: &str = "ks-";
 
 /// A parsed tmux version, e.g. "3.3a" or "next-3.4".
 #[derive(Debug, Clone, PartialEq, Eq)]

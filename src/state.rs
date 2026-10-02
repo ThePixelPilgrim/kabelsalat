@@ -526,18 +526,16 @@ pub fn reconcile(saved: &SavedState, live: &[String], dead: &[DeadPane]) -> Reco
 
 /// The host a saved group's tabs run on; `None` for a local group or an
 /// unknown id.
-/// The claude session a saved tab is recreated with at startup, if any: only
-/// a local tab (the registry is this machine's) whose session is not among
-/// the `live` ones (`new-session -A` ignores a command for one that is).
+/// The claude session a saved tab is recreated with at startup, if any: one
+/// whose session is not among the `live` ones (`new-session -A` ignores a
+/// command for one that is). The same on either side: a remote tab's session
+/// was found by its host's worker, and its directory is a path there.
 pub fn resume_on_restore<'a>(
-    saved: &'a SavedState,
-    tab: &'a SavedTab,
+    claude: Option<&'a ClaudeSession>,
+    uuid: &str,
     live: &[String],
 ) -> Option<&'a ClaudeSession> {
-    let local = group_host(saved, tab.group).is_none();
-    tab.claude
-        .as_ref()
-        .filter(|_| local && !live.contains(&tab.uuid))
+    claude.filter(|_| !live.iter().any(|live| live == uuid))
 }
 
 pub fn group_host(saved: &SavedState, group: usize) -> Option<&str> {
@@ -1187,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_on_restore_only_for_a_gone_local_tab_with_a_session() {
+    fn resume_on_restore_for_a_gone_tab_with_a_session_on_either_side() {
         let mut state = remote_state(); // group 1 is remote
         let session = ClaudeSession {
             id: "sid".into(),
@@ -1196,20 +1194,20 @@ mod tests {
         state.tabs[0].claude = Some(session.clone()); // aaa: local
         state.tabs[1].claude = Some(session.clone()); // bbb: remote
         let gone: Vec<String> = Vec::new();
-        // Local, session gone, claude known: resume.
-        assert_eq!(
-            resume_on_restore(&state, &state.tabs[0], &gone),
-            Some(&session)
-        );
+        let resume = |tab: &SavedTab, live: &[String]| {
+            resume_on_restore(tab.claude.as_ref(), &tab.uuid, live).cloned()
+        };
+        // Session gone, claude known: resume.
+        assert_eq!(resume(&state.tabs[0], &gone), Some(session.clone()));
         // Session survived: -A attaches, nothing to resume.
-        assert_eq!(
-            resume_on_restore(&state, &state.tabs[0], &["aaa".to_string()]),
-            None
-        );
-        // Remote group: the registry is not this machine's.
-        assert_eq!(resume_on_restore(&state, &state.tabs[1], &gone), None);
+        assert_eq!(resume(&state.tabs[0], &["aaa".to_string()]), None);
+        // A remote tab is the same decision, taken once its host has listed
+        // its sessions: the worker found the claude there, and its directory
+        // is a path on that host.
+        assert_eq!(resume(&state.tabs[1], &gone), Some(session));
+        assert_eq!(resume(&state.tabs[1], &["bbb".to_string()]), None);
         // Nothing known.
-        assert_eq!(resume_on_restore(&state, &state.tabs[2], &gone), None);
+        assert_eq!(resume(&state.tabs[2], &gone), None);
     }
 
     #[test]
