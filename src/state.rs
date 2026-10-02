@@ -526,18 +526,12 @@ pub fn reconcile(saved: &SavedState, live: &[String], dead: &[DeadPane]) -> Reco
 
 /// The host a saved group's tabs run on; `None` for a local group or an
 /// unknown id.
-/// The claude session a saved tab is recreated with at startup, if any: only
-/// a local tab (the registry is this machine's) whose session is not among
-/// the `live` ones (`new-session -A` ignores a command for one that is).
-pub fn resume_on_restore<'a>(
-    saved: &'a SavedState,
-    tab: &'a SavedTab,
-    live: &[String],
-) -> Option<&'a ClaudeSession> {
-    let local = group_host(saved, tab.group).is_none();
-    tab.claude
-        .as_ref()
-        .filter(|_| local && !live.contains(&tab.uuid))
+/// The claude session a saved tab is recreated with at startup, if any: one
+/// whose session is not among the `live` ones (`new-session -A` ignores a
+/// command for one that is). The same on either side: a remote tab's session
+/// was found by its host's worker, and its directory is a path there.
+pub fn resume_on_restore<'a>(tab: &'a SavedTab, live: &[String]) -> Option<&'a ClaudeSession> {
+    tab.claude.as_ref().filter(|_| !live.contains(&tab.uuid))
 }
 
 pub fn group_host(saved: &SavedState, group: usize) -> Option<&str> {

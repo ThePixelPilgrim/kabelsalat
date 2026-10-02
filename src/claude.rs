@@ -8,7 +8,8 @@
 //! shell is found exactly like one opened with Ctrl+Shift+C, and a `/clear`
 //! (which starts a new session id) is picked up on the next tick.
 //!
-//! Pure logic over two directories, the registry and a `/proc` root, so the
+//! Pure logic over the registry and a process tree — `/proc` for the local
+//! machine, or the listing a remote host prints (`host_script`) — so the
 //! whole thing is testable with fabricated trees. No GTK, no tmux.
 
 use std::collections::HashMap;
@@ -137,17 +138,38 @@ fn is_live(record: &Record, proc_root: &Path) -> bool {
     }
 }
 
+/// Who is the parent of whom: `/proc` locally (`ProcFs`), or the pid → ppid
+/// map a remote host printed.
+pub trait ProcessTree {
+    fn parent(&self, pid: u32) -> Option<u32>;
+}
+
+/// The process tree under a `/proc` root.
+pub struct ProcFs<'a>(pub &'a Path);
+
+impl ProcessTree for ProcFs<'_> {
+    fn parent(&self, pid: u32) -> Option<u32> {
+        stat_fields(self.0, pid).map(|fields| fields.ppid)
+    }
+}
+
+impl ProcessTree for HashMap<u32, u32> {
+    fn parent(&self, pid: u32) -> Option<u32> {
+        self.get(&pid).copied()
+    }
+}
+
 /// The session running in each pane: `panes` maps a tab uuid to the pid of
 /// its pane's shell, and a record belongs to the pane whose shell is one of
 /// its ancestors (or the process itself, when claude *is* the pane command).
 pub fn sessions_by_pane(
     records: &[Record],
     panes: &[(String, u32)],
-    proc_root: &Path,
+    tree: &impl ProcessTree,
 ) -> HashMap<String, ClaudeSession> {
     let mut found: HashMap<String, (u64, ClaudeSession)> = HashMap::new();
     for record in records {
-        let chain = ancestors(proc_root, record.pid);
+        let chain = ancestors(tree, record.pid);
         let Some((uuid, _)) = panes.iter().find(|(_, pid)| chain.contains(pid)) else {
             continue;
         };
@@ -165,20 +187,72 @@ pub fn sessions_by_pane(
 }
 
 /// `pid` and its parents up to init, nearest first.
-fn ancestors(proc_root: &Path, pid: u32) -> Vec<u32> {
+fn ancestors(tree: &impl ProcessTree, pid: u32) -> Vec<u32> {
     let mut chain = vec![pid];
     let mut current = pid;
     while chain.len() < MAX_ANCESTORS {
-        let Some(fields) = stat_fields(proc_root, current) else {
+        let Some(parent) = tree.parent(current) else {
             break;
         };
-        if fields.ppid <= 1 || chain.contains(&fields.ppid) {
+        if parent <= 1 || chain.contains(&parent) {
             break;
         }
-        chain.push(fields.ppid);
-        current = fields.ppid;
+        chain.push(parent);
+        current = parent;
     }
     chain
+}
+
+/// The POSIX `sh` script a remote host runs to print what the local path
+/// reads itself: its kabelsalat panes, its process tree (`ps`, so it works
+/// beyond Linux), and its registry files, one per line. Each line is
+/// tagged, so `sessions_from_host_listing` can ignore anything else — a
+/// shell's banner, say.
+pub fn host_script() -> String {
+    let tmux = crate::tmuxctl::shell_quote_argv(&crate::remote::remote_tmux_prefix());
+    // The tmux format gets a real tab (tmux does not unescape); awk, printf
+    // and tr unescape their own `\t` and `\n`.
+    format!(
+        "{tmux} list-panes -a -F 'pane\t#{{session_name}}\t#{{pane_pid}}' 2>/dev/null; \
+         ps -eo pid=,ppid= | awk '{{print \"proc\\t\" $1 \"\\t\" $2}}'; \
+         for f in \"${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}\"/sessions/*.json; do \
+         [ -f \"$f\" ] || continue; printf 'record\\t'; tr -d '\\n' < \"$f\"; printf '\\n'; \
+         done; exit 0"
+    )
+}
+
+/// What `host_script` printed, matched like the local path. A record whose
+/// pid the host did not list is a claude that is gone.
+pub fn sessions_from_host_listing(listing: &str) -> HashMap<String, ClaudeSession> {
+    let mut panes = Vec::new();
+    let mut tree: HashMap<u32, u32> = HashMap::new();
+    let mut records = Vec::new();
+    for line in listing.lines() {
+        let Some((tag, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        match tag {
+            "pane" => {
+                if let Some((name, pid)) = rest.split_once('\t')
+                    && let Some(uuid) = name.strip_prefix(crate::tmuxctl::SESSION_PREFIX)
+                    && let Ok(pid) = pid.trim().parse()
+                {
+                    panes.push((uuid.to_string(), pid));
+                }
+            }
+            "proc" => {
+                if let Some((pid, ppid)) = rest.split_once('\t')
+                    && let (Ok(pid), Ok(ppid)) = (pid.trim().parse(), ppid.trim().parse())
+                {
+                    tree.insert(pid, ppid);
+                }
+            }
+            "record" => records.extend(parse_record(rest)),
+            _ => {}
+        }
+    }
+    records.retain(|record| tree.contains_key(&record.pid));
+    sessions_by_pane(&records, &panes, &tree)
 }
 
 struct StatFields {
@@ -487,7 +561,7 @@ mod tests {
         assert!(script.contains("#{session_name}"));
         assert!(script.contains("#{pane_pid}"));
         assert!(script.contains("ps -eo pid=,ppid="));
-        assert!(script.contains("${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions/*.json"));
+        assert!(script.contains("\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"/sessions/*.json"));
         // One line per record whatever the file's formatting.
         assert!(script.contains("tr -d '\\n'"));
     }
