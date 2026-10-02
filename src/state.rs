@@ -1190,22 +1190,20 @@ mod tests {
         state.tabs[0].claude = Some(session.clone()); // aaa: local
         state.tabs[1].claude = Some(session.clone()); // bbb: remote
         let gone: Vec<String> = Vec::new();
+        let resume = |tab: &SavedTab, live: &[String]| {
+            resume_on_restore(tab.claude.as_ref(), &tab.uuid, live).cloned()
+        };
         // Session gone, claude known: resume.
-        assert_eq!(resume_on_restore(&state.tabs[0], &gone), Some(&session));
+        assert_eq!(resume(&state.tabs[0], &gone), Some(session.clone()));
         // Session survived: -A attaches, nothing to resume.
-        assert_eq!(
-            resume_on_restore(&state.tabs[0], &["aaa".to_string()]),
-            None
-        );
-        // A remote tab is the same decision: its host's worker found the
-        // session there, and its directory is a path on that host.
-        assert_eq!(resume_on_restore(&state.tabs[1], &gone), Some(&session));
-        assert_eq!(
-            resume_on_restore(&state.tabs[1], &["bbb".to_string()]),
-            None
-        );
+        assert_eq!(resume(&state.tabs[0], &["aaa".to_string()]), None);
+        // A remote tab is the same decision, taken once its host has listed
+        // its sessions: the worker found the claude there, and its directory
+        // is a path on that host.
+        assert_eq!(resume(&state.tabs[1], &gone), Some(session));
+        assert_eq!(resume(&state.tabs[1], &["bbb".to_string()]), None);
         // Nothing known.
-        assert_eq!(resume_on_restore(&state.tabs[2], &gone), None);
+        assert_eq!(resume(&state.tabs[2], &gone), None);
     }
 
     #[test]

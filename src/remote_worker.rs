@@ -530,7 +530,8 @@ impl RemoteWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use crate::state::ClaudeSession;
+    use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -904,6 +905,85 @@ mod tests {
             Some(RemoteEvent::Killed(vec!["live".into(), "gone".into()]))
         );
         assert!(last_word(&calls.lock().unwrap()[0]).contains("kill-session -t ks-live"));
+    }
+
+    #[test]
+    fn a_restart_reruns_the_pane_or_the_command_it_is_given() {
+        let (mut host, calls) = host(AuthMode::BatchOnly, vec![]);
+        assert_eq!(
+            host.run_job(Job::Respawn {
+                uuid: "u".into(),
+                cwd: None,
+                command: None,
+            }),
+            None
+        );
+        assert_eq!(
+            host.run_job(Job::Respawn {
+                uuid: "u".into(),
+                cwd: Some(Path::new("/w").to_path_buf()),
+                command: Some(vec!["claude".into(), "--resume".into(), "sid".into()]),
+            }),
+            None
+        );
+        let calls = calls.lock().unwrap();
+        assert!(last_word(&calls[0]).ends_with("respawn-pane -t ks-u"));
+        assert!(last_word(&calls[1]).ends_with("respawn-pane -t ks-u -c /w 'claude --resume sid'"));
+    }
+
+    // --- claude discovery ---
+
+    #[test]
+    fn discovery_runs_the_host_script_and_reports_what_it_matched() {
+        let listing = "pane\tks-a\t20\nproc\t20\t1\nproc\t21\t20\n\
+                       record\t{\"pid\":21,\"sessionId\":\"sid\",\"cwd\":\"/home/me/p\"}\n";
+        let (mut host, calls) = host(AuthMode::BatchOnly, vec![reply(0, listing, "")]);
+        let expected: HashMap<String, ClaudeSession> = [(
+            "a".to_string(),
+            ClaudeSession {
+                id: "sid".into(),
+                cwd: Path::new("/home/me/p").to_path_buf(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            host.run_job(Job::Discover),
+            Some(RemoteEvent::ClaudeSessions(expected))
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].argv.contains(&"ControlMaster=no".to_string()));
+        assert!(!calls[0].argv.contains(&"-t".to_string()));
+        // `sh -c '<script>'`: the login shell's syntax does not matter.
+        let remote = last_word(&calls[0]);
+        assert!(remote.starts_with("sh -c '"), "{remote}");
+        assert!(remote.contains("list-panes -a"));
+        assert!(remote.contains("sessions/"));
+    }
+
+    #[test]
+    fn a_discovery_that_did_not_reach_the_host_reports_nothing() {
+        // The script itself always exits 0; any other status is the
+        // transport, which says nothing about the sessions. No event means
+        // the tabs keep what they knew.
+        let (mut lost, _) = host(
+            AuthMode::BatchOnly,
+            vec![reply(
+                255,
+                "",
+                "mux_client_request_session: read from master failed\r\n",
+            )],
+        );
+        assert_eq!(lost.run_job(Job::Discover), None);
+        let (mut no_sh, _) = host(AuthMode::BatchOnly, vec![reply(127, "", "sh: not found")]);
+        assert_eq!(no_sh.run_job(Job::Discover), None);
+        // An empty host is an empty, but real, answer.
+        let (mut empty, _) = host(AuthMode::BatchOnly, vec![reply(0, "", "")]);
+        assert_eq!(
+            empty.run_job(Job::Discover),
+            Some(RemoteEvent::ClaudeSessions(HashMap::new()))
+        );
     }
 
     #[test]
