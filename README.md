@@ -44,6 +44,16 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
   restart too.
 - Sessions found without a matching saved tab are adopted into a
   "Recovered" group rather than lost.
+- **Claude Code sessions come back too.** Every few seconds each tab is
+  matched against the `claude` processes running in it (Claude Code
+  registers them in `~/.claude/sessions/`), and the session id and
+  directory are saved with the tab. A tab whose tmux session did not
+  survive — a reboot, a killed server — is recreated as
+  `claude --resume <id>` in that directory instead of a plain shell, and so
+  is a crashed tab on restart. This covers a tab opened with `Ctrl+Shift+C`,
+  a `claude` typed into any shell, and `kabelsalat run -- claude` alike;
+  once claude exits the tab is a shell again and respawns as one. Local
+  groups only.
 - **Logout survival**: the tmux server is detached from the login session
   (`systemd-run --user --scope`). If lingering is disabled for your user, a
   header-bar icon explains what `loginctl enable-linger` adds and its
@@ -58,6 +68,8 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+Shift+T` | New tab in the active group |
+| `Ctrl+Shift+C` | Copy the selection — or, with nothing selected, open a `claude` tab |
+| `Ctrl+Shift+V` | Paste the clipboard |
 | `Ctrl+Shift+N` | New group |
 | `Ctrl+Shift+H` | New remote group |
 | `Ctrl+Shift+W` | Close the active tab |
