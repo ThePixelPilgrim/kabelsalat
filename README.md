@@ -24,6 +24,10 @@ colour-coded groups.
 - **Agent-friendly CLI.** `kabelsalat run -g web -- npm run dev` opens a
   command in a visible tab without stealing focus; a Claude Code plugin
   teaches agents the whole interface.
+- **Claude Code sessions are resumed.** A tab in which `claude` runs
+  records its session id; after a reboot the tab comes back as
+  `claude --resume` in the same directory rather than as a plain shell.
+  This applies to local and remote tabs.
 - **Failure is survivable.** Crashed shells keep their output and restart in
   one click; orphaned sessions land in a "Recovered" group. Works without
   tmux, minus the survival guarantees.
@@ -44,19 +48,9 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
   restart too.
 - Sessions found without a matching saved tab are adopted into a
   "Recovered" group rather than lost.
-- **Claude Code sessions come back too.** Every few seconds each tab is
-  matched against the `claude` processes running in it (Claude Code
-  registers them in `~/.claude/sessions/`), and the session id and
-  directory are saved with the tab. A tab whose tmux session did not
-  survive — a reboot, a killed server — is recreated as
-  `claude --resume <id>` in that directory instead of a plain shell, and so
-  is a crashed tab on restart. This covers a tab opened with `Ctrl+Shift+C`,
-  a `claude` typed into any shell, and `kabelsalat run -- claude` alike;
-  once claude exits the tab is a shell again and respawns as one. A remote
-  group's host is inspected the same way by its worker over ssh (a small
-  POSIX `sh` script: its panes, `ps`, and the registry under the host's
-  `~/.claude`), so a remote tab resumes its claude on that host. A tab with
-  a tracked session is tinted green in the tab list and the tab bar.
+- A tab in which Claude Code is running is recreated as
+  `claude --resume <id>` when its tmux session did not survive; see
+  "Claude Code sessions" below.
 - **Logout survival**: the tmux server is detached from the login session
   (`systemd-run --user --scope`). If lingering is disabled for your user, a
   header-bar icon explains what `loginctl enable-linger` adds and its
@@ -108,6 +102,47 @@ codes: 0 success, 1 not running, 2 usage, 3 no such group, ambiguous, or (for
 
 Claude Code learns this interface through the plugin below.
 
+## Claude Code sessions
+
+`Ctrl+Shift+C` opens a tab in the active group that runs `claude` instead of
+a shell, in the active tab's directory. The same tracking applies to a
+`claude` started by hand in any tab and to `kabelsalat run -- claude`.
+
+Every 5 seconds, each local tab is matched against the `claude` processes on
+this machine. Claude Code registers each interactive process in
+`~/.claude/sessions/<pid>.json` (under `$CLAUDE_CONFIG_DIR` if set) with its
+session id, working directory and process start time; kabelsalat reads that
+registry, checks that the pid still belongs to the registered process, and
+follows the process's parent chain up to a tab's pane shell. The session id
+and directory of the match are saved with the tab in `state.json`. A new
+session id after `/clear` is picked up the same way. A tab with a tracked
+session is shown with a green tint in the tab list and the tab bar.
+
+What the saved session is used for:
+
+- When kabelsalat starts and a tab's tmux session is gone (after a reboot,
+  or a killed server), the tab is recreated running
+  `claude --resume <id>` in the saved directory instead of the shell.
+- When a crashed tab is restarted, the same command is used.
+- When `claude` exits, the tab forgets the session and is restored as a
+  shell again. A crashed pane keeps it until it is restarted or closed.
+
+Remote groups are handled on their host. Every 15 seconds, each connected
+host runs a short POSIX `sh` script over the existing ssh connection: it
+lists the host's kabelsalat panes, its process tree (`ps -eo pid=,ppid=`),
+and the registry files under that host's `~/.claude`. The matching is done
+locally on that output. The saved directory is a path on the host, and the
+resume runs there. The script needs `sh`, `ps`, `awk`, `tr` and `printf` on
+the host.
+
+Limits:
+
+- The registry is Claude Code's own, undocumented format (observed with
+  Claude Code 2.1.x). A change to it would stop the tracking, not the app.
+- Without tmux there is no tracking; a tab is then a plain shell.
+- A session whose transcript no longer exists cannot be resumed; the tab
+  then shows claude's exit code and offers a restart like any crashed tab.
+
 ## Claude Code plugin
 
 The agent skill ships as a Claude Code plugin, and this repository is its own
@@ -150,7 +185,9 @@ local tabs. A group's host is fixed; tabs cannot be moved between hosts.
 - **Requirements:** OpenSSH 8.4 or newer here, tmux 3.2 or newer on the host.
 - **Local-only features:** the browser pane runs on this computer, and its
   CDP variables (`KABELSALAT_CDP`, `PLAYWRIGHT_MCP_CDP_ENDPOINT`) and
-  `KABELSALAT_GROUP` are not exported into remote tabs.
+  `KABELSALAT_GROUP` are not exported into remote tabs. Claude Code
+  sessions in remote tabs are tracked and resumed on the host (see "Claude
+  Code sessions").
 - **Sharing a host:** every kabelsalat installation and version shares the one
   `tmux -L kabelsalat` server per remote user, but only ever attaches its own
   sessions; unknown sessions there are ignored, never adopted.
