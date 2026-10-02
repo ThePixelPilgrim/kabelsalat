@@ -7,6 +7,20 @@ This file provides guidance to Claude Code when working with code in this reposi
 - Never expose the user's email address in User-Agent strings or other outgoing request headers; use a neutral identifier instead.
 - Investigations / codebase exploration must always be run in subagents using the `opus` or `sonnet` model (pass a `model` override to the Agent tool), never on the default/session model.
 
+## Methodology
+
+- Red-green TDD for every behaviour change: write the failing test first, run
+  it and watch it fail for the expected reason, then write the minimal code
+  that makes it pass, then refactor with the tests green. No implementation
+  before its failing test; a test that passes on first run proves nothing and
+  needs to be made to fail first.
+- Logic that is hard to test under this rule belongs in the pure modules
+  (`src/state.rs`, `src/cli.rs`, `src/claude.rs`, `src/tmuxctl.rs`) behind
+  parameters that tests can fabricate (a directory, an output string, a
+  `/proc` root), not in `src/app.rs`.
+- The GTK layer in `src/app.rs` is the one untested exception: keep it to
+  wiring, so the behaviour it wires is covered elsewhere.
+
 ## Build & verify
 
 - `cargo build` needs system dev headers, not just Rust: GTK 4.18+, libadwaita 1.5+, VTE 0.82+ (Fedora: `gtk4-devel libadwaita-devel vte291-gtk4-devel`). A build failure in the `gtk4`/`vte4` sys crates usually means a missing header, not a code bug.
