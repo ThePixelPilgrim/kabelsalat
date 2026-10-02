@@ -10,7 +10,7 @@ This file provides guidance to Claude Code when working with code in this reposi
 ## Build & verify
 
 - `cargo build` needs system dev headers, not just Rust: GTK 4.18+, libadwaita 1.5+, VTE 0.82+ (Fedora: `gtk4-devel libadwaita-devel vte291-gtk4-devel`). A build failure in the `gtk4`/`vte4` sys crates usually means a missing header, not a code bug.
-- There is no CI. Run `cargo fmt`, `cargo clippy` and `cargo test` yourself before claiming work is done.
+- CI (`.github/workflows/ci.yml`, Fedora container) runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on every push. Run them yourself before claiming work is done; where the GTK/VTE headers are missing locally, push and check the CI run instead.
 - Tests are unit tests inside `src/state.rs` and `src/tmuxctl.rs`; single test: `cargo test <name>`.
 
 ## Architecture invariants
