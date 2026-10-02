@@ -6,6 +6,7 @@ use relm4::gtk::prelude::*;
 
 mod app;
 pub mod browser;
+pub mod claude;
 mod cli;
 mod control;
 pub mod remote;

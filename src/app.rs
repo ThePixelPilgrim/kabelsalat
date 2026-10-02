@@ -14,10 +14,11 @@ use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
 use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
+use crate::claude;
 use crate::control;
 use crate::remote::{self, HostState, RemoteError};
 use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
-use crate::state::{self, SavedGroup, SavedState, SavedTab, SidebarOrder};
+use crate::state::{self, ClaudeSession, SavedGroup, SavedState, SavedTab, SidebarOrder};
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
 
 pub const GROUP_PALETTE: [&str; 6] = [
@@ -58,9 +59,11 @@ const SHORTCUTS: &[(&str, &str, Msg)] = &[
     // Shift is what keeps these off the pty: plain Ctrl-V still reaches the
     // child as 0x16, so `claude`, vim and readline keep their own handling.
     ("<Control><Shift>v", "Paste into the terminal", Msg::Paste),
+    // One key, two jobs that never overlap: with text selected it copies,
+    // otherwise it opens a claude tab.
     (
         "<Control><Shift>c",
-        "Copy the terminal selection",
+        "Copy the selection, or open a claude tab",
         Msg::Copy,
     ),
     ("F1", "Show this help", Msg::ShowHelp),
@@ -82,6 +85,11 @@ const BROWSER_POLL_SECS: u32 = 2;
 /// How often the tab age prefixes are recomputed. The display has minute
 /// granularity, so a 30 s tick shows a stale "now" for at most 89 s.
 const AGE_TICK_SECS: u32 = 30;
+
+/// How often the tabs are matched against the claude processes running in
+/// them. Cheap (a few small files, one `list-panes`), so often enough that a
+/// crash shortly after a claude starts still knows what to resume.
+const CLAUDE_TICK_SECS: u32 = 5;
 /// How long after a tab's first output — and after every tab activation —
 /// the activity sources (`contents-changed`, title writes) stay ignored.
 /// Attaching a tmux session repaints the whole screen; without this window
@@ -317,6 +325,9 @@ pub struct Tab {
     /// When a remote tab's client was last spawned; the reattach guard
     /// compares against it. `None` for local tabs.
     spawned_at: Option<Instant>,
+    /// The claude session last seen in this tab (see `claude.rs`): what a
+    /// respawn of the tab brings back instead of a shell.
+    claude: Option<ClaudeSession>,
 }
 
 pub struct Group {
@@ -483,6 +494,8 @@ pub enum Msg {
     AgeTick,
     /// Periodic check for disconnected hosts due for a background retry.
     RetryTick,
+    /// Periodic discovery of the claude session running in each tab.
+    ClaudeTick,
     /// Coalesced follow-up to an activity stamp: re-sort the sidebar if the
     /// stamp changed the display order. See `request_resort`.
     Resort,
@@ -568,7 +581,8 @@ pub enum Msg {
     CopyCdpEndpoint,
     /// Paste the clipboard into the focused terminal.
     Paste,
-    /// Copy the focused terminal's selection to the clipboard.
+    /// Copy the focused terminal's selection to the clipboard — or, with
+    /// nothing selected, open a claude tab (both live on Ctrl+Shift+C).
     Copy,
     /// Capture what the active group's browser shows.
     Screenshot,
@@ -1093,6 +1107,17 @@ impl SimpleComponent for App {
                 Err(_) => gtk::glib::ControlFlow::Break,
             }
         });
+        // Only with tmux: the pane pids are what ties a claude to a tab, and
+        // without tmux there is no session to respawn into anyway.
+        if model.tmux.is_some() {
+            let input = sender.input_sender().clone();
+            gtk::glib::timeout_add_seconds_local(CLAUDE_TICK_SECS, move || {
+                match input.send(Msg::ClaudeTick) {
+                    Ok(()) => gtk::glib::ControlFlow::Continue,
+                    Err(_) => gtk::glib::ControlFlow::Break,
+                }
+            });
+        }
         ComponentParts { model, widgets }
     }
 
@@ -1157,9 +1182,20 @@ impl SimpleComponent for App {
                                     }
                                 }
                             }
+                            // Likewise for a claude the tab had: ignored by
+                            // a genuine reattach, resumed if -A creates.
                             if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                                let resume = tab.claude.as_ref().map(|c| c.resume_argv());
+                                let cwd = tab.claude.as_ref().map(|c| c.cwd.as_path());
                                 tab.armed.respawn();
-                                spawn_backing(&tab.terminal, &uuid, Some(tmux), None, None, &env);
+                                spawn_backing(
+                                    &tab.terminal,
+                                    &uuid,
+                                    Some(tmux),
+                                    cwd,
+                                    resume.as_deref(),
+                                    &env,
+                                );
                             }
                         }
                     }
@@ -1266,11 +1302,22 @@ impl SimpleComponent for App {
                 }
                 return;
             }
+            // With a selection in the focused terminal this is Copy, which
+            // touches only the clipboard; otherwise it opens a claude tab,
+            // a layout change that falls through to the save.
             Msg::Copy => {
-                if let Some(tab) = self.active_tab().filter(|t| t.terminal.has_focus()) {
+                if let Some(tab) = self
+                    .active_tab()
+                    .filter(|t| t.terminal.has_focus() && t.terminal.has_selection())
+                {
                     tab.terminal.copy_clipboard_format(vte4::Format::Text);
+                    return;
                 }
-                return;
+                let group = self
+                    .active_tab()
+                    .map(|t| t.group)
+                    .unwrap_or_else(|| self.groups[0].id);
+                self.open_claude_tab(group, &sender);
             }
             // The clipboard and the pty are the only things this touches, and
             // neither is persisted — so both arms return early like the other
@@ -1317,6 +1364,11 @@ impl SimpleComponent for App {
             // arrives as Msg::Remote, which persists as usual.
             Msg::RetryTick => {
                 self.retry_hosts();
+                return;
+            }
+            // Saves only when a tab's claude session changed, never per tick.
+            Msg::ClaudeTick => {
+                self.refresh_claude_sessions();
                 return;
             }
             // Like the tick: a re-sort is a paint, never a disk write.
@@ -1685,9 +1737,19 @@ impl App {
 
         // Saved tabs, in order; attach live ones (crashed if the pane died),
         // respawn the rest. `spawn_argv -A` attaches or creates uniformly.
+        // A local tab whose session is gone and that had a claude in it is
+        // recreated as that claude, resumed in its directory, rather than
+        // as a shell: `-A` ignores both for a session that survived, so the
+        // check against `live` only spares a surviving tab the arguments.
         let dead_exit = |uuid: &str| dead.iter().find(|d| d.uuid == uuid).map(|d| d.exit_code);
         for tab in &saved.tabs {
-            self.add_tab(
+            let local = state::group_host(&saved, tab.group).is_none();
+            let resume = tab
+                .claude
+                .as_ref()
+                .filter(|_| local && !live.contains(&tab.uuid));
+            let command = resume.map(|c| c.resume_argv());
+            let id = self.add_tab(
                 tab.uuid.clone(),
                 tab.group,
                 // `last_title` is the dedupe anchor, and `Tab::title` is what
@@ -1697,10 +1759,15 @@ impl App {
                 // the field, where `title` is the honest fallback.
                 Some(tab.last_title.clone().unwrap_or_else(|| tab.title.clone())),
                 dead_exit(&tab.uuid),
-                None,
-                None,
+                resume.map(|c| c.cwd.as_path()),
+                command.as_deref(),
                 sender,
             );
+            // Carried over as is: discovery confirms or clears it once the
+            // tab's processes are visible again.
+            if let Some(restored) = self.tabs.iter_mut().find(|t| t.id == id) {
+                restored.claude = tab.claude.clone();
+            }
         }
 
         // Orphan live sessions with no saved tab → a "Recovered" group so no
@@ -1838,6 +1905,7 @@ impl App {
                 // The dedupe anchor: what `update_title` will compare the
                 // first post-restart title against.
                 last_title: Some(t.title.clone()),
+                claude: t.claude.clone(),
             })
             .collect();
         let active = self
@@ -3179,6 +3247,76 @@ impl App {
         self.activate(id);
     }
 
+    /// Like `open_tab`, but the tab runs `claude` instead of a shell. Which
+    /// session that becomes is learned afterwards by `refresh_claude_sessions`,
+    /// the same way as for a claude typed into any shell.
+    fn open_claude_tab(&mut self, group: usize, sender: &ComponentSender<Self>) {
+        let cwd = self.new_tab_cwd(group);
+        let uuid = gtk::glib::uuid_string_random().to_string();
+        let command = ["claude".to_string()];
+        let id = self.add_tab(
+            uuid,
+            group,
+            Some("claude".into()),
+            None,
+            cwd.as_deref(),
+            Some(&command),
+            sender,
+        );
+        self.move_tab_to_group_front(id);
+        self.activate(id);
+    }
+
+    /// Match the local tabs against the claude processes running in them and
+    /// persist what changed, so a tab that comes back after a reboot resumes
+    /// the right session. A tab whose claude is gone forgets it: the shell
+    /// is what the tab is now, and what a respawn should give back.
+    fn refresh_claude_sessions(&mut self) {
+        let Some(tmux) = &self.tmux else {
+            return;
+        };
+        let Some(dir) = claude::sessions_dir() else {
+            return;
+        };
+        let proc_root = Path::new("/proc");
+        let records = claude::live_records(&dir, proc_root);
+        // No claude anywhere is the common case; it costs no tmux call.
+        let panes = if records.is_empty() {
+            Vec::new()
+        } else {
+            match tmux.pane_pids() {
+                Ok(panes) => panes,
+                Err(err) => {
+                    eprintln!("tmux list-panes failed: {err}");
+                    return;
+                }
+            }
+        };
+        let found = claude::sessions_by_pane(&records, &panes, proc_root);
+        let remote: HashSet<usize> = self
+            .groups
+            .iter()
+            .filter(|g| g.host.is_some())
+            .map(|g| g.id)
+            .collect();
+        let mut changed = false;
+        for tab in self.tabs.iter_mut().filter(|t| !remote.contains(&t.group)) {
+            let now = found.get(&tab.uuid).cloned();
+            // A crashed pane has no live claude by definition; what it had is
+            // exactly what its restart should resume, so it is kept.
+            if now.is_none() && tab.crashed.is_some() {
+                continue;
+            }
+            if tab.claude != now {
+                tab.claude = now;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_state();
+        }
+    }
+
     /// Newest first: `add_tab` appends, which is what restore wants (saved
     /// order is display order). A tab the user just created instead moves
     /// to the top of its group's block so the sidebar sorts by age.
@@ -3376,6 +3514,7 @@ impl App {
             attached: host.is_none(),
             pending,
             spawned_at: None,
+            claude: None,
         });
         if let Some(host) = &host {
             if let Some(tab) = self.tabs.last() {
@@ -3409,7 +3548,11 @@ impl App {
                 }
             }
             (None, Some(tmux)) => {
-                if let Err(err) = tmux.respawn_pane(&uuid) {
+                // A tab that hosted a claude restarts as that claude, resumed:
+                // rerunning the original command would start a fresh session.
+                let resume = tab.claude.as_ref().map(|c| c.resume_argv());
+                let cwd = tab.claude.as_ref().map(|c| c.cwd.as_path());
+                if let Err(err) = tmux.respawn_pane(&uuid, cwd, resume.as_deref()) {
                     eprintln!("failed to respawn pane: {err}");
                     return;
                 }
@@ -5024,7 +5167,7 @@ fn select_help_body() -> &'static str {
      selection. Other terminals behave the same way under tmux.\n\n\
      \u{2022} Shift+drag \u{2014} select text\n\
      \u{2022} Middle-click \u{2014} paste the selection\n\
-     \u{2022} Ctrl+Shift+C / Ctrl+Shift+V \u{2014} copy / paste the clipboard\n\
+     \u{2022} Ctrl+Shift+C / Ctrl+Shift+V \u{2014} copy the selection / paste the clipboard\n\
      \u{2022} Ctrl+click \u{2014} open a link\n\
      \u{2022} Wheel \u{2014} scroll the scrollback (Escape or q to leave)"
 }

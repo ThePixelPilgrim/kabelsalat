@@ -632,18 +632,61 @@ impl TmuxCtl {
         self.run(&Self::kill_session_args(uuid))
     }
 
-    /// Argv tail that reruns the shell in a tab's dead pane.
-    pub fn respawn_pane_args(uuid: &str) -> Vec<String> {
-        vec![
+    /// Argv tail that reruns a tab's dead pane: its original command, or
+    /// `command` in `cwd` when given (a tab bringing its claude back).
+    pub fn respawn_pane_args(
+        uuid: &str,
+        cwd: Option<&Path>,
+        command: Option<&[String]>,
+    ) -> Vec<String> {
+        let mut args = vec![
             "respawn-pane".into(),
             "-t".into(),
             format!("{SESSION_PREFIX}{uuid}"),
+        ];
+        if let Some(dir) = cwd {
+            args.push("-c".into());
+            args.push(escape_tmux_format(&dir.to_string_lossy()));
+        }
+        if let Some(command) = command.filter(|command| !command.is_empty()) {
+            args.push(shell_quote_argv(command));
+        }
+        args
+    }
+
+    /// Rerun a crashed tab's dead pane (tab restart): the original command,
+    /// or `command` in `cwd` when given.
+    pub fn respawn_pane(
+        &self,
+        uuid: &str,
+        cwd: Option<&Path>,
+        command: Option<&[String]>,
+    ) -> Result<(), TmuxError> {
+        self.run(&Self::respawn_pane_args(uuid, cwd, command))
+    }
+
+    /// Argv tail listing every pane's session name and shell pid.
+    pub fn pane_pids_args() -> Vec<String> {
+        vec![
+            "list-panes".into(),
+            "-a".into(),
+            "-F".into(),
+            "#{session_name}\t#{pane_pid}".into(),
         ]
     }
 
-    /// Rerun the shell in a crashed tab's dead pane (tab restart).
-    pub fn respawn_pane(&self, uuid: &str) -> Result<(), TmuxError> {
-        self.run(&Self::respawn_pane_args(uuid))
+    /// The shell pid of every `ks-*` pane, by tab uuid. A stopped server is
+    /// an empty list, like `list_sessions`.
+    pub fn pane_pids(&self) -> Result<Vec<(String, u32)>, TmuxError> {
+        let output = self.command(&Self::pane_pids_args())?.output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            if is_no_server_stderr(&stderr) {
+                return Ok(Vec::new());
+            }
+            return Err(TmuxError::Command(stderr.trim().to_string()));
+        }
+        pane_pids_from_output(&String::from_utf8_lossy(&output.stdout))
     }
 
     /// Argv tail for publishing one variable into a tab's session environment.
@@ -714,6 +757,26 @@ fn parse_session_line(line: &str) -> Result<Option<SessionInfo>, TmuxError> {
         pane_dead,
         dead_status,
     }))
+}
+
+/// Parse `list-panes -a -F` output into `(uuid, pane_pid)` pairs, skipping
+/// foreign sessions on our socket.
+fn pane_pids_from_output(stdout: &str) -> Result<Vec<(String, u32)>, TmuxError> {
+    let mut panes = Vec::new();
+    for line in stdout.lines() {
+        let (name, pid) = line
+            .split_once('\t')
+            .ok_or_else(|| TmuxError::Parse(line.to_string()))?;
+        let Some(uuid) = name.strip_prefix(SESSION_PREFIX) else {
+            continue;
+        };
+        let pid = pid
+            .trim()
+            .parse()
+            .map_err(|_| TmuxError::Parse(line.to_string()))?;
+        panes.push((uuid.to_string(), pid));
+    }
+    Ok(panes)
 }
 
 /// Whether `list-sessions` stderr indicates "no server / socket running",
@@ -1582,6 +1645,15 @@ mod tests {
     }
 
     #[test]
+    fn pane_pids_output_maps_tabs_to_shell_pids() {
+        let panes = pane_pids_from_output("ks-a\t1234\nother\t5\nks-b\t42\n").unwrap();
+        assert_eq!(panes, [("a".to_string(), 1234), ("b".to_string(), 42)]);
+        assert!(pane_pids_from_output("").unwrap().is_empty());
+        assert!(pane_pids_from_output("ks-a 12").is_err());
+        assert!(pane_pids_from_output("ks-a\tnope").is_err());
+    }
+
+    #[test]
     fn query_argv_builders_keep_their_shapes() {
         assert_eq!(
             TmuxCtl::list_sessions_args(),
@@ -1592,8 +1664,31 @@ mod tests {
             ]
         );
         assert_eq!(
-            TmuxCtl::respawn_pane_args("u"),
+            TmuxCtl::respawn_pane_args("u", None, None),
             ["respawn-pane", "-t", "ks-u"]
+        );
+        assert_eq!(
+            TmuxCtl::respawn_pane_args("u", None, Some(&[])),
+            ["respawn-pane", "-t", "ks-u"]
+        );
+        assert_eq!(
+            TmuxCtl::respawn_pane_args(
+                "u",
+                Some(Path::new("/w/#1")),
+                Some(&["claude".into(), "--resume".into(), "s id".into()])
+            ),
+            [
+                "respawn-pane",
+                "-t",
+                "ks-u",
+                "-c",
+                "/w/##1",
+                "claude --resume 's id'"
+            ]
+        );
+        assert_eq!(
+            TmuxCtl::pane_pids_args(),
+            ["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"]
         );
         assert_eq!(
             TmuxCtl::pane_current_path_args("u"),

@@ -139,6 +139,29 @@ pub struct SavedTab {
     /// attach-time title re-emission from stamping every tab fresh on startup.
     #[serde(default)]
     pub last_title: Option<String>,
+    /// The Claude Code session last seen running in this tab, if any. Kept
+    /// current by the app's discovery tick; when the tab's tmux session is
+    /// gone at startup (a reboot), the tab comes back as
+    /// `claude --resume <id>` in that directory instead of a plain shell.
+    #[serde(default)]
+    pub claude: Option<ClaudeSession>,
+}
+
+/// A Claude Code session, as discovered in a tab: enough to resume it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeSession {
+    /// The session id `claude --resume` takes.
+    pub id: String,
+    /// The directory claude ran in. Sessions are stored per project, so a
+    /// resume has to start there.
+    pub cwd: PathBuf,
+}
+
+impl ClaudeSession {
+    /// The command that brings this session back.
+    pub fn resume_argv(&self) -> Vec<String> {
+        vec!["claude".into(), "--resume".into(), self.id.clone()]
+    }
 }
 
 /// A remote session still to be killed: its tab was closed, and its host has
@@ -648,6 +671,7 @@ mod tests {
                     title: "bash".into(),
                     last_activity: Some(1_700_000_000),
                     last_title: Some("bash".into()),
+                    claude: None,
                 },
                 SavedTab {
                     uuid: "bbb".into(),
@@ -655,6 +679,7 @@ mod tests {
                     title: "vim".into(),
                     last_activity: Some(1_700_000_500),
                     last_title: Some("vim".into()),
+                    claude: None,
                 },
                 SavedTab {
                     uuid: "ccc".into(),
@@ -662,6 +687,7 @@ mod tests {
                     title: "logs".into(),
                     last_activity: None,
                     last_title: None,
+                    claude: None,
                 },
             ],
             active: Some("bbb".into()),
@@ -1052,6 +1078,7 @@ mod tests {
             title: "claude".into(),
             last_activity: Some(1_755_000_000),
             last_title: Some("claude — writing tests".into()),
+            claude: None,
         };
         let json = serde_json::to_string(&tab).unwrap();
         let back: SavedTab = serde_json::from_str(&json).unwrap();
@@ -1091,6 +1118,58 @@ mod tests {
         assert_eq!(plan.respawn[0].last_title.as_deref(), Some("vim"));
         assert_eq!(plan.respawn[1].last_activity, None);
         assert_eq!(plan.respawn[1].last_title, None);
+    }
+
+    // --- claude sessions ---
+
+    #[test]
+    fn claude_session_round_trips_and_builds_the_resume_command() {
+        let tab = SavedTab {
+            uuid: "aaa".into(),
+            group: 0,
+            title: "claude".into(),
+            last_activity: None,
+            last_title: None,
+            claude: Some(ClaudeSession {
+                id: "7b776c86-7bbd-5685-bafa-ec6d54623792".into(),
+                cwd: PathBuf::from("/home/me/project"),
+            }),
+        };
+        let json = serde_json::to_string(&tab).unwrap();
+        let back: SavedTab = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tab);
+        assert_eq!(
+            back.claude.unwrap().resume_argv(),
+            ["claude", "--resume", "7b776c86-7bbd-5685-bafa-ec6d54623792"]
+        );
+    }
+
+    #[test]
+    fn old_tab_without_claude_field_loads_as_none() {
+        let json = r#"{
+            "groups": [],
+            "tabs": [{ "uuid": "aaa", "group": 0, "title": "bash" }],
+            "active": null,
+            "sidebar_visible": true
+        }"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.tabs[0].claude, None);
+    }
+
+    #[test]
+    fn reconcile_carries_the_claude_session_into_respawn() {
+        // The whole point of the field: a tab whose session did not survive
+        // still knows which claude to bring back.
+        let mut state = sample_state();
+        let session = ClaudeSession {
+            id: "sid".into(),
+            cwd: PathBuf::from("/work"),
+        };
+        state.tabs[1].claude = Some(session.clone());
+        let plan = reconcile(&state, &["aaa".to_string()], &[]);
+        assert_eq!(plan.attach[0].tab.claude, None);
+        assert_eq!(plan.respawn[0].claude, Some(session));
+        assert_eq!(plan.respawn[1].claude, None);
     }
 
     #[test]
@@ -1417,6 +1496,7 @@ mod tests {
                 title: String::new(),
                 last_activity: None,
                 last_title: None,
+                claude: None,
             });
         }
         assert_eq!(remote_hosts(&state), ["me@box", "b-host"]);

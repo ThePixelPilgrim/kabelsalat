@@ -410,7 +410,9 @@ impl<R: Runner> HostSession<R> {
     }
 
     fn respawn(&mut self, uuid: &str) {
-        let argv = self.ctl.command_argv(&TmuxCtl::respawn_pane_args(uuid));
+        let argv = self
+            .ctl
+            .command_argv(&TmuxCtl::respawn_pane_args(uuid, None, None));
         let out = self.run(&argv, &[], None);
         if out.code != Some(0) {
             eprintln!(
