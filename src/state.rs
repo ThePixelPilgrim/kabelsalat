@@ -1567,7 +1567,6 @@ mod tests {
         assert!(remote_hosts(&sample_state()).is_empty());
     }
 
-
     // --- boot resume (kabelsalat resume) ---
 
     fn claude_tab(uuid: &str, group: usize) -> SavedTab {

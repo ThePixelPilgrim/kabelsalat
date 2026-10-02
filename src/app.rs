@@ -13,6 +13,7 @@ use relm4::gtk::prelude::*;
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
+use crate::autostart;
 use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::claude;
 use crate::control;
@@ -131,9 +132,9 @@ const CDP_POLL_TRIES: u32 = 100;
 
 /// Environment keys published into each tab's tmux session (see
 /// docs/superpowers/specs/2026-07-30-cdp-endpoint-design.md).
-const ENV_CDP: &str = "KABELSALAT_CDP";
+const ENV_CDP: &str = crate::cli::ENV_CDP;
 const ENV_CDP_PLAYWRIGHT: &str = "PLAYWRIGHT_MCP_CDP_ENDPOINT";
-const ENV_GROUP: &str = "KABELSALAT_GROUP";
+const ENV_GROUP: &str = crate::cli::ENV_GROUP;
 /// The endpoint pair: set on discovery, unset on browser close. `ENV_GROUP`
 /// is deliberately not in here — it describes the tab, not the browser, and
 /// is never unset.
@@ -412,6 +413,8 @@ pub struct App {
     toast_overlay: adw::ToastOverlay,
     /// Popover behind the header bar's browser overflow button.
     browser_menu: gtk::Popover,
+    /// Popover behind the header bar's primary (hamburger) menu button.
+    primary_menu: gtk::Popover,
     /// Endpoint row in the browser overflow menu: dimmed "CDP: unavailable"
     /// until discovery succeeds, then `127.0.0.1:<port>` plus a live copy
     /// button.
@@ -439,6 +442,10 @@ pub struct App {
     linger: LingerStatus,
     /// Whether the linger warning was permanently dismissed (persisted).
     linger_dismissed: bool,
+    /// State of the boot-resume unit, read from the system at startup and
+    /// after every change (never persisted). Drives the primary menu's
+    /// status line and the dialog behind it.
+    autostart: autostart::Status,
     /// Startup check of the local ssh client: remote groups need OpenSSH
     /// >= 8.4, and are disabled (never dropped) otherwise.
     ssh: remote::SshAvailability,
@@ -566,6 +573,16 @@ pub enum Msg {
     LingerEnabled(Result<LingerStatus, String>),
     /// Permanently hide the linger warning (persists the dismissal flag).
     DismissLingerWarning,
+    /// Open the "resume agent sessions at boot" dialog from the primary menu.
+    ShowAutostartDialog,
+    /// Install — or repair — the boot-resume unit; enables lingering when
+    /// it is off, since a unit without it only runs at login.
+    AutostartInstall,
+    /// Disable and delete the boot-resume unit. Lingering is left alone.
+    AutostartRemove,
+    /// Result of the off-thread install or remove: the toast to show, or
+    /// the failure message. Either way the state is re-read from the system.
+    AutostartChanged(Result<&'static str, String>),
     /// The user dragged in a terminal without Shift, so tmux ate the drag
     /// instead of VTE selecting text. Shows the hint icon.
     BareDragHint,
@@ -628,6 +645,13 @@ pub enum Msg {
         group_uuid: String,
         name: String,
     },
+    /// A `kabelsalat browser` invocation: bring up the group's browser if it
+    /// has none. Like a restored browser it comes up hidden unless the
+    /// group is the active one, and like `SpawnCommand` it takes no focus,
+    /// raises no window and changes no active group.
+    OpenBrowser {
+        group_uuid: String,
+    },
     /// A remote host's worker reported back.
     Remote {
         host: String,
@@ -671,10 +695,85 @@ impl SimpleComponent for App {
                     },
                 },
 
-                pack_end = &gtk::Button {
-                    set_icon_name: "help-about-symbolic",
-                    set_tooltip_text: Some("Keyboard shortcuts (F1)"),
-                    connect_clicked => Msg::ShowHelp,
+                // The first pack_end sits rightmost: the primary menu, where
+                // app-wide choices live. Built like the browser overflow
+                // menu — a popover of flat buttons — since three entries do
+                // not justify a gio::Menu and the action plumbing it needs.
+                pack_end = &gtk::MenuButton {
+                    set_icon_name: "open-menu-symbolic",
+                    set_tooltip_text: Some("Main menu"),
+
+                    #[wrap(Some)]
+                    set_popover = &primary_menu.clone() {
+                        #[wrap(Some)]
+                        set_child = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_spacing: 2,
+
+                            gtk::Button {
+                                add_css_class: "flat",
+                                #[watch]
+                                set_sensitive: model.autostart != autostart::Status::Unavailable,
+                                #[watch]
+                                set_tooltip_text: (model.autostart == autostart::Status::Unavailable)
+                                    .then_some("Needs tmux and a systemd user manager"),
+                                connect_clicked[sender, primary_menu] => move |_| {
+                                    primary_menu.popdown();
+                                    sender.input(Msg::ShowAutostartDialog);
+                                },
+
+                                #[wrap(Some)]
+                                set_child = &gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+
+                                    gtk::Label {
+                                        set_label: "Resume agent sessions at boot…",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: autostart::status_label(model.autostart),
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                        add_css_class: "caption",
+                                    },
+                                },
+                            },
+
+                            // The warning icon is the first-time hint; this
+                            // is the way back once it has been dismissed.
+                            gtk::Button {
+                                add_css_class: "flat",
+                                #[watch]
+                                set_sensitive: model.tmux.is_some()
+                                    && model.linger != LingerStatus::NotApplicable,
+                                connect_clicked[sender, primary_menu] => move |_| {
+                                    primary_menu.popdown();
+                                    sender.input(Msg::ShowLingerWarning);
+                                },
+
+                                #[wrap(Some)]
+                                set_child = &gtk::Label {
+                                    set_label: "Keep shells running after logout…",
+                                    set_halign: gtk::Align::Start,
+                                },
+                            },
+
+                            gtk::Button {
+                                add_css_class: "flat",
+                                connect_clicked[sender, primary_menu] => move |_| {
+                                    primary_menu.popdown();
+                                    sender.input(Msg::ShowHelp);
+                                },
+
+                                #[wrap(Some)]
+                                set_child = &gtk::Label {
+                                    set_label: "Keyboard shortcuts (F1)",
+                                    set_halign: gtk::Align::Start,
+                                },
+                            },
+                        },
+                    },
                 },
 
                 pack_end = &gtk::Button {
@@ -935,6 +1034,12 @@ impl SimpleComponent for App {
                             "tmux start-server failed, sessions may not survive logout: {err}"
                         );
                     }
+                    // A server started at boot (`kabelsalat resume`) carries
+                    // the user manager's minimal environment; give it the
+                    // desktop's, so sessions created from here inherit it.
+                    if let Err(err) = ctl.sync_global_environment(tmuxctl::process_environment()) {
+                        eprintln!("kabelsalat: syncing the tmux server environment: {err}");
+                    }
                     Some(ctl)
                 }
                 Err(err) => {
@@ -954,6 +1059,9 @@ impl SimpleComponent for App {
         // Load the persisted dismissal flag before the view is built so the
         // icon's #[watch] visibility is correct on first render.
         let linger_dismissed = state::load(&state::state_file()).linger_warning_dismissed;
+        // Read from the system, never remembered: the unit file, whether it
+        // is enabled, and lingering are the truth about what happens at boot.
+        let boot_resume = autostart::detect(tmux.is_some() && autostart::has_systemctl(), linger);
 
         // The symbolic handle may be absent in a sparse icon theme; fall back
         // to a menu glyph so the affordance never renders as a broken image.
@@ -994,6 +1102,7 @@ impl SimpleComponent for App {
             browser_paned: gtk::Paned::new(gtk::Orientation::Horizontal),
             toast_overlay: adw::ToastOverlay::new(),
             browser_menu: gtk::Popover::new(),
+            primary_menu: gtk::Popover::new(),
             cdp_label: gtk::Label::builder()
                 .label("CDP: unavailable")
                 .css_classes(["monospace", "dim-label"])
@@ -1014,6 +1123,7 @@ impl SimpleComponent for App {
             availability,
             linger,
             linger_dismissed,
+            autostart: boot_resume,
             ssh,
             auth,
             hosts: HashMap::new(),
@@ -1041,6 +1151,13 @@ impl SimpleComponent for App {
         let browser_paned = model.browser_paned.clone();
         let toast_overlay = model.toast_overlay.clone();
         let browser_menu = model.browser_menu.clone();
+        let primary_menu = model.primary_menu.clone();
+        // An enabled unit that no longer matches this build (the binary
+        // moved, a newer template) is rewritten silently, as tmux.conf is;
+        // the dialog's Repair only remains for a rewrite that failed.
+        if model.autostart == autostart::Status::Stale {
+            model.autostart_change(autostart::install, "Boot-resume unit repaired");
+        }
         let cdp_label = model.cdp_label.clone();
         let cdp_copy = model.cdp_copy.clone();
         cdp_copy.connect_clicked({
@@ -1233,6 +1350,33 @@ impl SimpleComponent for App {
             Msg::EnableLinger => self.enable_linger(),
             Msg::LingerEnabled(result) => self.on_linger_enabled(result),
             Msg::DismissLingerWarning => self.linger_dismissed = true,
+            // The boot-resume state lives on the system, not in the state
+            // file, so none of these four need the save at the bottom.
+            Msg::ShowAutostartDialog => {
+                self.show_autostart_dialog();
+                return;
+            }
+            Msg::AutostartInstall => {
+                self.autostart_change(autostart::install, "Boot resume installed");
+                // A unit without lingering only runs at login; installing
+                // from the dialog means "at boot", so the two go together.
+                if self.linger == LingerStatus::Disabled {
+                    self.enable_linger();
+                }
+                return;
+            }
+            Msg::AutostartRemove => {
+                self.autostart_change(autostart::remove, "Boot resume removed");
+                return;
+            }
+            Msg::AutostartChanged(result) => {
+                self.refresh_autostart();
+                match result {
+                    Ok(done) => self.show_toast(done),
+                    Err(err) => self.show_notice(&err),
+                }
+                return;
+            }
             // The three hint messages are pure transient UI and fire as often
             // as the user drags, so they return early to skip the save_state()
             // at the bottom rather than rewriting the state file per drag.
@@ -1292,6 +1436,9 @@ impl SimpleComponent for App {
                         eprintln!("kabelsalat: no CDP endpoint for group {group_id} within 10 s");
                     }
                 }
+                // The CLI's snapshot carries the endpoint, so `kabelsalat
+                // browser` can answer with it from the moment it exists.
+                self.publish_groups();
                 self.refresh_cdp_menu();
                 return;
             }
@@ -1465,6 +1612,7 @@ impl SimpleComponent for App {
                     apply_scheme(&tab.terminal, self.style.is_dark());
                 }
             }
+            Msg::OpenBrowser { group_uuid } => self.open_browser(&group_uuid),
             Msg::SpawnCommand {
                 group,
                 tab_uuid,
@@ -1950,15 +2098,22 @@ impl App {
         self.persist(&state);
         // Same choke point as the save, so the CLI always sees what was last
         // written rather than a separately maintained copy.
+        self.publish_groups();
+    }
+
+    /// Publish the groups for the CLI: on every save, and on `CdpReady`,
+    /// which changes nothing the state file records but is exactly what
+    /// `kabelsalat browser` asks about.
+    fn publish_groups(&self) {
         control::publish(
-            state
-                .groups
+            self.groups
                 .iter()
                 .map(|g| crate::cli::GroupInfo {
                     uuid: g.uuid.clone(),
                     name: g.name.clone(),
-                    tabs: state.tabs.iter().filter(|t| t.group == g.id).count(),
+                    tabs: self.tabs.iter().filter(|t| t.group == g.id).count(),
                     host: g.host.clone(),
+                    cdp: g.browser.as_ref().and_then(|b| b.cdp_url()),
                 })
                 .collect(),
         );
@@ -3137,6 +3292,110 @@ impl App {
         dialog.present(Some(&self.window));
     }
 
+    /// Re-read the boot-resume unit's state from the system.
+    fn refresh_autostart(&mut self) {
+        self.autostart = autostart::detect(
+            self.tmux.is_some() && autostart::has_systemctl(),
+            self.linger,
+        );
+    }
+
+    /// Install or remove the boot-resume unit off the main thread — a user
+    /// manager can be slow to answer `systemctl --user` — and report back
+    /// as `Msg::AutostartChanged`, with `done` as the toast on success.
+    fn autostart_change(&self, change: fn() -> Result<(), String>, done: &'static str) {
+        let input = self.input.clone();
+        std::thread::spawn(move || {
+            let _ = input.send(Msg::AutostartChanged(change().map(|()| done)));
+        });
+    }
+
+    /// The primary menu's "Resume agent sessions at boot…" dialog. Its text
+    /// and responses follow the state (`autostart::responses`); the first
+    /// response is the close response, the suggested one the default.
+    fn show_autostart_dialog(&self) {
+        let path = autostart::config_home()
+            .map(|home| autostart::unit_path(&home))
+            .unwrap_or_else(|| PathBuf::from(autostart::UNIT_NAME));
+        let dialog = adw::AlertDialog::new(
+            Some(autostart::dialog_heading()),
+            Some(&autostart::dialog_body(self.autostart, &path)),
+        );
+        let responses = autostart::responses(self.autostart);
+        for response in &responses {
+            dialog.add_response(response.id(), response.label());
+            let appearance = match response.appearance() {
+                autostart::Appearance::Default => adw::ResponseAppearance::Default,
+                autostart::Appearance::Suggested => adw::ResponseAppearance::Suggested,
+                autostart::Appearance::Destructive => adw::ResponseAppearance::Destructive,
+            };
+            dialog.set_response_appearance(response.id(), appearance);
+            if response.appearance() == autostart::Appearance::Suggested {
+                dialog.set_default_response(Some(response.id()));
+            }
+        }
+        if let Some(first) = responses.first() {
+            dialog.set_close_response(first.id());
+        }
+        let input = self.input.clone();
+        dialog.connect_response(None, move |_, id| {
+            let msg = match autostart::Response::from_id(id) {
+                Some(autostart::Response::Install | autostart::Response::Repair) => {
+                    Msg::AutostartInstall
+                }
+                Some(autostart::Response::Remove) => Msg::AutostartRemove,
+                Some(autostart::Response::EnableLinger) => Msg::EnableLinger,
+                _ => return,
+            };
+            let _ = input.send(msg);
+        });
+        dialog.present(Some(&self.window));
+    }
+
+    /// `kabelsalat browser`: bring a group's browser up the way a restore
+    /// does — hidden unless the group is the active one — and never focus
+    /// it. A group that already has one, or that is remote (the CLI refused
+    /// it against a snapshot copy), is left alone.
+    fn open_browser(&mut self, group_uuid: &str) {
+        let Some(id) = self
+            .groups
+            .iter()
+            .find(|g| g.uuid == group_uuid)
+            .map(|g| g.id)
+        else {
+            eprintln!("browser request for unknown group {group_uuid}");
+            return;
+        };
+        if self.group_host(id).is_some() {
+            return;
+        }
+        let Some((uuid, default_url)) = self
+            .groups
+            .iter()
+            .find(|g| g.id == id && g.browser.is_none())
+            .map(|g| (g.uuid.clone(), g.default_url.clone()))
+        else {
+            return;
+        };
+        let visible = self.active_group() == Some(id);
+        match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
+            Ok(browser) => {
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    group.browser = Some(browser);
+                    group.browser_visible = visible;
+                }
+                self.start_browser_poll();
+                self.start_cdp_poll(id);
+            }
+            Err(err) => {
+                eprintln!("kabelsalat: opening the browser of group {id}: {err}");
+                self.show_notice(&err.to_string());
+                return;
+            }
+        }
+        self.sync_browser_pane();
+    }
+
     /// Run `loginctl enable-linger` and re-check, off the GTK main thread.
     /// `enable-linger` triggers a polkit action that may prompt for interactive
     /// authentication, which would freeze the UI if run synchronously here; the
@@ -3160,6 +3419,8 @@ impl App {
         match result {
             Ok(status) => {
                 self.linger = status;
+                // "On" versus "At login only" depends on lingering.
+                self.refresh_autostart();
                 if self.linger != LingerStatus::Enabled {
                     self.show_notice("Lingering could not be confirmed as enabled.");
                 }

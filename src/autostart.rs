@@ -147,9 +147,7 @@ impl Response {
 
     pub fn appearance(self) -> Appearance {
         match self {
-            Response::Install | Response::EnableLinger | Response::Repair => {
-                Appearance::Suggested
-            }
+            Response::Install | Response::EnableLinger | Response::Repair => Appearance::Suggested,
             Response::Remove => Appearance::Destructive,
             Response::Cancel | Response::Close => Appearance::Default,
         }
@@ -355,7 +353,10 @@ mod tests {
             text.contains("ExecStart=\"/home/me/.cargo/bin/kabelsalat\" resume\n"),
             "{text}"
         );
-        assert!(text.contains("[Install]\nWantedBy=default.target\n"), "{text}");
+        assert!(
+            text.contains("[Install]\nWantedBy=default.target\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -363,9 +364,7 @@ mod tests {
         // An encrypted or unmounted home has no state file yet; the condition
         // turns that into a skip rather than a failed unit.
         assert!(
-            text().contains(
-                "ConditionPathExists=/home/me/.local/state/kabelsalat/state.json\n"
-            ),
+            text().contains("ConditionPathExists=/home/me/.local/state/kabelsalat/state.json\n"),
             "{}",
             text()
         );
@@ -373,15 +372,27 @@ mod tests {
 
     #[test]
     fn percent_signs_in_paths_are_escaped_from_specifier_expansion() {
-        let text = unit_text(Path::new("/opt/100%/kabelsalat"), Path::new("/s/state.json"));
-        assert!(text.contains("ExecStart=\"/opt/100%%/kabelsalat\" resume\n"), "{text}");
+        let text = unit_text(
+            Path::new("/opt/100%/kabelsalat"),
+            Path::new("/s/state.json"),
+        );
+        assert!(
+            text.contains("ExecStart=\"/opt/100%%/kabelsalat\" resume\n"),
+            "{text}"
+        );
     }
 
     #[test]
     fn unavailable_wins_over_everything() {
         let expected = text();
         assert_eq!(
-            classify(false, Some(&expected), &expected, true, LingerStatus::Enabled),
+            classify(
+                false,
+                Some(&expected),
+                &expected,
+                true,
+                LingerStatus::Enabled
+            ),
             Status::Unavailable
         );
     }
@@ -401,7 +412,13 @@ mod tests {
         // way nothing runs at boot, which is what the label must say.
         let expected = text();
         assert_eq!(
-            classify(true, Some(&expected), &expected, false, LingerStatus::Enabled),
+            classify(
+                true,
+                Some(&expected),
+                &expected,
+                false,
+                LingerStatus::Enabled
+            ),
             Status::Off
         );
     }
@@ -410,11 +427,23 @@ mod tests {
     fn a_current_enabled_unit_is_on_at_boot_only_with_lingering() {
         let expected = text();
         assert_eq!(
-            classify(true, Some(&expected), &expected, true, LingerStatus::Enabled),
+            classify(
+                true,
+                Some(&expected),
+                &expected,
+                true,
+                LingerStatus::Enabled
+            ),
             Status::On { at_boot: true }
         );
         assert_eq!(
-            classify(true, Some(&expected), &expected, true, LingerStatus::Disabled),
+            classify(
+                true,
+                Some(&expected),
+                &expected,
+                true,
+                LingerStatus::Disabled
+            ),
             Status::On { at_boot: false }
         );
         // Unknown lingering is not promised as "at boot".
@@ -523,7 +552,10 @@ mod tests {
         let login_only = dialog_body(Status::On { at_boot: false }, path);
         assert!(login_only.contains("log in"), "{login_only}");
         let stale = dialog_body(Status::Stale, path);
-        assert!(stale.contains("repair") || stale.contains("Repair"), "{stale}");
+        assert!(
+            stale.contains("repair") || stale.contains("Repair"),
+            "{stale}"
+        );
     }
 
     #[test]

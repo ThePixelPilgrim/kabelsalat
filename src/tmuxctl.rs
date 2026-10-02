@@ -225,6 +225,14 @@ pub fn exportable_env_key(key: &str) -> bool {
     !key.is_empty() && !matches!(key, "TMUX" | "TMUX_PANE" | "PWD" | "OLDPWD" | "SHLVL" | "_")
 }
 
+/// This process's environment as string pairs. A variable that is not valid
+/// UTF-8 cannot be handed to tmux as text and is skipped.
+pub fn process_environment() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
 /// Argv tail that sets every pair in the server's global environment, as
 /// one command sequence: `set-environment -g K V ; set-environment -g …`.
 /// tmux reads an argument ending in `;` as "argument, then a new command",
@@ -396,14 +404,20 @@ impl TmuxCtl {
         }
     }
 
-    /// Full argv for one tmux subcommand against this target: `tmux -S <sock>
-    /// <args>` locally, or the same tmux words behind `ssh … <dest> --`
-    /// (quoted once more for the login shell, no tty) on a remote host.
+    /// Full argv for one tmux subcommand against this target: `tmux -u -S
+    /// <sock> <args>` locally, or the same tmux words behind `ssh … <dest>
+    /// --` (quoted once more for the login shell, no tty) on a remote host.
+    ///
+    /// `-u` makes the local client UTF-8 whatever its locale: without a
+    /// UTF-8 locale tmux prints the tabs of `list-sessions -F` as `_` and
+    /// the listing cannot be parsed. Desktop sessions have a locale; the
+    /// user manager's environment at boot (`kabelsalat resume`) may not.
     pub fn command_argv(&self, args: &[String]) -> Vec<String> {
         match &self.target {
             Target::Local { socket, .. } => {
                 let mut argv = vec![
                     "tmux".to_string(),
+                    "-u".into(),
                     "-S".into(),
                     socket.to_string_lossy().into_owned(),
                 ];
@@ -1618,10 +1632,9 @@ mod tests {
         assert!(!ctl.is_remote());
         assert!(matches!(ctl.target(), Target::Local { .. }));
         let argv = ctl.command_argv(&TmuxCtl::kill_session_args("abc"));
-        assert_eq!(argv[0], "tmux");
-        assert_eq!(argv[1], "-S");
-        assert!(argv[2].ends_with("run/tmux.sock"));
-        assert_eq!(&argv[3..], ["kill-session", "-t", "ks-abc"]);
+        assert_eq!(&argv[..3], ["tmux", "-u", "-S"]);
+        assert!(argv[3].ends_with("run/tmux.sock"));
+        assert_eq!(&argv[4..], ["kill-session", "-t", "ks-abc"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1888,7 +1901,6 @@ mod tests {
         );
     }
 
-
     // --- detached creation (kabelsalat resume) ---
 
     #[test]
@@ -1898,7 +1910,11 @@ mod tests {
         let argv = ctl.spawn_detached_argv(
             "abc",
             Some(Path::new("/home/me/proj")),
-            &["/bin/zsh".to_string(), "-lc".into(), "exec claude --resume x".into()],
+            &[
+                "/bin/zsh".to_string(),
+                "-lc".into(),
+                "exec claude --resume x".into(),
+            ],
             &[("KABELSALAT_GROUP", "g-1")],
         );
         let socket = dir.join("run/tmux.sock").to_string_lossy().into_owned();
@@ -1945,7 +1961,13 @@ mod tests {
         for key in ["TMUX", "TMUX_PANE", "PWD", "OLDPWD", "SHLVL", "_", ""] {
             assert!(!exportable_env_key(key), "{key:?}");
         }
-        for key in ["PATH", "LANG", "XDG_CURRENT_DESKTOP", "SSH_AUTH_SOCK", "HOME"] {
+        for key in [
+            "PATH",
+            "LANG",
+            "XDG_CURRENT_DESKTOP",
+            "SSH_AUTH_SOCK",
+            "HOME",
+        ] {
             assert!(exportable_env_key(key), "{key}");
         }
     }
@@ -1985,5 +2007,20 @@ mod tests {
         assert_eq!(args[3], "x\\;");
         assert_eq!(args[8], "\\;");
         assert_eq!(args[13], "a;b");
+    }
+    // --- client locale ---
+
+    #[test]
+    fn local_commands_force_utf8_output() {
+        // Without a UTF-8 locale tmux prints the tabs of `list-sessions -F`
+        // as `_`, which breaks the listing; `-u` makes the client UTF-8
+        // regardless. The user manager's environment at boot (`kabelsalat
+        // resume`) may have no locale at all.
+        let dir = temp_dir("utf8");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.command_argv(&TmuxCtl::list_sessions_args());
+        assert_eq!(argv[1], "-u", "{argv:?}");
+        assert_eq!(argv[2], "-S", "{argv:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

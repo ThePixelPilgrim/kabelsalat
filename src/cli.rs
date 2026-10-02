@@ -1090,7 +1090,6 @@ mod tests {
         assert!(help_text().contains("remote"));
     }
 
-
     // --- browser and resume ---
 
     #[test]

@@ -51,6 +51,9 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
 - A tab in which Claude Code is running is recreated as
   `claude --resume <id>` when its tmux session did not survive; see
   "Claude Code sessions" below.
+- **Resume at boot** (opt-in, from the primary menu): a systemd user unit
+  recreates those Claude Code sessions right after boot, before login; see
+  "Resume agent sessions at boot" below.
 - **Logout survival**: the tmux server is detached from the login session
   (`systemd-run --user --scope`). If lingering is disabled for your user, a
   header-bar icon explains what `loginctl enable-linger` adds and its
@@ -88,6 +91,8 @@ second window:
     kabelsalat run -g web -- npm run dev   # new tab in the "web" group
     kabelsalat run -g newproj --create -- claude   # create "newproj" if missing
     kabelsalat rename newproj proj2        # rename an existing group
+    kabelsalat browser -g web              # bring up "web"'s browser, or print its CDP endpoint
+    kabelsalat resume                      # recreate saved claude sessions, no GUI (the boot unit)
 
 `--group` takes a group name or uuid; `--cwd` overrides the working directory,
 which defaults to the caller's. For a remote group the command runs on its
@@ -96,9 +101,14 @@ directory is ignored. `--create` always makes a local group. Everything
 after `--` is the command. The new tab does not steal focus. `run --create`
 reuses a unique existing match, or else creates a new group named exactly
 the given selector. `rename` refuses
-to create a duplicate name and is a no-op if the name is unchanged. Exit
-codes: 0 success, 1 not running, 2 usage, 3 no such group, ambiguous, or (for
-`rename`) name already in use.
+to create a duplicate name and is a no-op if the name is unchanged. `browser`
+takes the group from the caller's `KABELSALAT_GROUP` when `-g` is omitted; it
+prints the endpoint if the browser is already up, otherwise brings it up —
+hidden unless that group is the active one, never taking focus — and prints
+nothing, the endpoint then appearing in the group's sessions as
+`KABELSALAT_CDP`. Exit codes: 0 success, 1 not running, 2 usage, 3 no such
+group, ambiguous, remote (for `browser`), or (for `rename`) name already in
+use, 4 (for `resume`) tmux unavailable.
 
 Claude Code learns this interface through the plugin below.
 
@@ -142,6 +152,34 @@ Limits:
 - Without tmux there is no tracking; a tab is then a plain shell.
 - A session whose transcript no longer exists cannot be resumed; the tab
   then shows claude's exit code and offers a restart like any crashed tab.
+
+## Resume agent sessions at boot
+
+Optional, off by default. The primary menu (top right) → "Resume agent
+sessions at boot…" installs a systemd user unit,
+`~/.config/systemd/user/kabelsalat-resume.service`, that runs
+`kabelsalat resume` once the user manager is up. With lingering enabled that
+is right after boot, before anyone logs in; without it, at first login — the
+dialog enables lingering along with the unit, and the menu entry's status
+line says which of the two you have. The same dialog removes the unit again,
+leaving lingering as it is. Nothing in your shell setup is touched either way.
+
+`kabelsalat resume` starts the private tmux server the way the GUI does, then
+recreates every saved tab that had a Claude Code session and whose tmux
+session is gone, as `claude --resume <id>` in its directory — behind a login
+shell, so `PATH` and the rest of your profile apply. Plain shells are not
+resumed. When the GUI starts it finds those sessions live and attaches to
+them; a `claude` that could not start shows as a crashed tab like any other.
+The GUI also hands the server its own environment on every launch, so shells
+opened later see the desktop's variables rather than the boot environment.
+Running `kabelsalat resume` while the GUI is up does nothing.
+
+This needs an unencrypted home directory: an encrypted one is not mounted
+before login, and the unit then does nothing (its `ConditionPathExists` on
+`state.json` fails cleanly). The unit is rewritten on launch when the binary
+moves or the template changes. `systemctl --user status
+kabelsalat-resume.service` shows the last run, `journalctl --user -u
+kabelsalat-resume.service` its output.
 
 ## Claude Code plugin
 
@@ -291,6 +329,10 @@ Terminals in the group receive the endpoint as `KABELSALAT_CDP` and
 is frozen at spawn, the live values are always available from tmux:
 
     tmux show-environment KABELSALAT_CDP
+
+An agent whose group has no browser yet asks for one with `kabelsalat
+browser`. The browser is transient — nothing restarts a crashed one — so the
+same command brings it back.
 
 The tmux server keeps running after the last tab closes (this is what makes
 the crash and logout guarantees work). To stop it entirely:
