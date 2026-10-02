@@ -945,4 +945,164 @@ mod tests {
     fn help_explains_cwd_on_remote_groups() {
         assert!(help_text().contains("remote"));
     }
+
+
+    // --- browser and resume ---
+
+    #[test]
+    fn browser_parses_with_and_without_a_group() {
+        assert_eq!(parse(&args(&["browser"])), Ok(Cli::Browser { group: None }));
+        assert_eq!(
+            parse(&args(&["browser", "-g", "web"])),
+            Ok(Cli::Browser {
+                group: Some("web".into())
+            })
+        );
+        assert_eq!(
+            parse(&args(&["browser", "--group", "aaa-111"])),
+            Ok(Cli::Browser {
+                group: Some("aaa-111".into())
+            })
+        );
+    }
+
+    #[test]
+    fn browser_rejects_stray_arguments() {
+        assert!(parse(&args(&["browser", "--group"])).is_err());
+        assert!(parse(&args(&["browser", "-g", ""])).is_err());
+        assert!(parse(&args(&["browser", "extra"])).is_err());
+        assert!(parse(&args(&["browser", "-g", "web", "extra"])).is_err());
+    }
+
+    #[test]
+    fn resume_takes_no_arguments_and_needs_no_instance() {
+        assert_eq!(parse(&args(&["resume"])), Ok(Cli::Resume));
+        assert!(parse(&args(&["resume", "now"])).is_err());
+        assert!(!Cli::Resume.needs_instance());
+        assert!(Cli::Browser { group: None }.needs_instance());
+    }
+
+    #[test]
+    fn the_callers_group_variable_fills_a_missing_group() {
+        let filled = with_default_group(Cli::Browser { group: None }, Some("aaa-111"));
+        assert_eq!(
+            filled,
+            Ok(Cli::Browser {
+                group: Some("aaa-111".into())
+            })
+        );
+        // An explicit --group wins over the environment.
+        let explicit = with_default_group(
+            Cli::Browser {
+                group: Some("web".into()),
+            },
+            Some("aaa-111"),
+        );
+        assert_eq!(
+            explicit,
+            Ok(Cli::Browser {
+                group: Some("web".into())
+            })
+        );
+        // Outside a kabelsalat tab there is nothing to default to.
+        assert!(with_default_group(Cli::Browser { group: None }, None).is_err());
+        assert!(with_default_group(Cli::Browser { group: None }, Some("")).is_err());
+        // Other commands pass through untouched.
+        assert_eq!(with_default_group(Cli::Groups, None), Ok(Cli::Groups));
+    }
+
+    fn browser_groups() -> Vec<GroupInfo> {
+        vec![
+            GroupInfo {
+                uuid: "aaa-111".into(),
+                name: "web".into(),
+                tabs: 2,
+                host: None,
+                cdp: Some("http://127.0.0.1:40455".into()),
+            },
+            GroupInfo {
+                uuid: "bbb-222".into(),
+                name: "api".into(),
+                tabs: 1,
+                host: None,
+                cdp: None,
+            },
+            GroupInfo {
+                uuid: "rrr-555".into(),
+                name: "box".into(),
+                tabs: 1,
+                host: Some("me@box".into()),
+                cdp: None,
+            },
+        ]
+    }
+
+    fn browser(group: &str) -> Cli {
+        Cli::Browser {
+            group: Some(group.into()),
+        }
+    }
+
+    #[test]
+    fn browser_prints_a_live_endpoint_without_asking_the_gui() {
+        let out = dispatch(&browser("web"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "http://127.0.0.1:40455\n");
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn browser_asks_the_gui_to_open_a_missing_one() {
+        let out = dispatch(&browser("bbb-222"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert_eq!(
+            out.action,
+            Some(Action::OpenBrowser {
+                group_uuid: "bbb-222".into()
+            })
+        );
+    }
+
+    #[test]
+    fn browser_refuses_a_remote_group() {
+        let out = dispatch(&browser("box"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+        assert!(out.stderr.contains("me@box"), "stderr was: {}", out.stderr);
+    }
+
+    #[test]
+    fn browser_on_an_unknown_group_fails_like_run() {
+        let out = dispatch(&browser("nope"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn a_browser_without_any_group_is_a_usage_error_at_dispatch_too() {
+        // control.rs fills the default first; this is the belt to that brace.
+        let out = dispatch(
+            &Cli::Browser { group: None },
+            &browser_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_USAGE);
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn resume_against_a_running_gui_is_a_noop_success() {
+        let out = dispatch(&Cli::Resume, &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.action.is_none());
+        assert!(!out.stderr.is_empty());
+    }
+
+    #[test]
+    fn help_lists_browser_and_resume() {
+        assert!(help_text().contains("kabelsalat browser"));
+        assert!(help_text().contains("kabelsalat resume"));
+        assert!(help_text().contains(&format!("{EXIT_FAILED} ")));
+    }
 }

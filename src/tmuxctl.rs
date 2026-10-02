@@ -1753,4 +1753,103 @@ mod tests {
             ]
         );
     }
+
+
+    // --- detached creation (kabelsalat resume) ---
+
+    #[test]
+    fn detached_argv_creates_without_attaching() {
+        let dir = temp_dir("detached");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_detached_argv(
+            "abc",
+            Some(Path::new("/home/me/proj")),
+            &["/bin/zsh".to_string(), "-lc".into(), "exec claude --resume x".into()],
+            &[("KABELSALAT_GROUP", "g-1")],
+        );
+        let socket = dir.join("run/tmux.sock").to_string_lossy().into_owned();
+        let conf = dir.join("state/tmux.conf").to_string_lossy().into_owned();
+        assert_eq!(
+            argv,
+            vec![
+                "tmux".to_string(),
+                "-S".into(),
+                socket,
+                "-f".into(),
+                conf,
+                "new-session".into(),
+                "-d".into(),
+                "-e".into(),
+                "KABELSALAT_GROUP=g-1".into(),
+                "-c".into(),
+                "/home/me/proj".into(),
+                "-s".into(),
+                "ks-abc".into(),
+                "/bin/zsh -lc 'exec claude --resume x'".into(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detached_argv_is_local_only() {
+        let argv = remote_ctl().spawn_detached_argv("abc", None, &["ls".to_string()], &[]);
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_session_is_recognised_from_stderr() {
+        assert!(is_duplicate_session_stderr("duplicate session: ks-abc\n"));
+        assert!(!is_duplicate_session_stderr("no server running on /run/x"));
+        assert!(!is_duplicate_session_stderr(""));
+    }
+
+    // --- global environment sync ---
+
+    #[test]
+    fn process_private_variables_are_not_exported_to_the_server() {
+        for key in ["TMUX", "TMUX_PANE", "PWD", "OLDPWD", "SHLVL", "_", ""] {
+            assert!(!exportable_env_key(key), "{key:?}");
+        }
+        for key in ["PATH", "LANG", "XDG_CURRENT_DESKTOP", "SSH_AUTH_SOCK", "HOME"] {
+            assert!(exportable_env_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn global_environment_args_chain_one_set_per_variable() {
+        let args = global_environment_args(&[
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                "set-environment".to_string(),
+                "-g".into(),
+                "PATH".into(),
+                "/usr/bin".into(),
+                ";".into(),
+                "set-environment".into(),
+                "-g".into(),
+                "LANG".into(),
+                "C.UTF-8".into(),
+            ]
+        );
+        assert!(global_environment_args(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_value_ending_in_a_semicolon_is_escaped_from_the_command_separator() {
+        // tmux treats an argument ending in `;` as "argument, then a new
+        // command"; `\;` keeps the semicolon literal.
+        let args = global_environment_args(&[
+            ("A".to_string(), "x;".to_string()),
+            ("B".to_string(), ";".to_string()),
+            ("C".to_string(), "a;b".to_string()),
+        ]);
+        assert_eq!(args[3], "x\\;");
+        assert_eq!(args[8], "\\;");
+        assert_eq!(args[13], "a;b");
+    }
 }
