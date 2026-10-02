@@ -17,7 +17,7 @@ jobs:
         run: >
           dnf install -y --setopt=install_weak_deps=False
           git gcc cargo rustfmt clippy tmux
-          gtk4-devel libadwaita-devel vte291-gtk4-devel
+          gtk4-devel libadwaita-devel vte291-gtk4-devel mesa-libgbm-devel
 
       - uses: actions/checkout@v4
 
