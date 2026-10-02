@@ -1,5 +1,7 @@
 # kabelsalat
 
+[![CI](https://github.com/ThePixelPilgrim/kabelsalat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ThePixelPilgrim/kabelsalat/actions/workflows/ci.yml?query=branch%3Amain)
+
 A crash-safe GTK4/libadwaita terminal emulator with tabs organised into
 colour-coded groups.
 
