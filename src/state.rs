@@ -530,8 +530,12 @@ pub fn reconcile(saved: &SavedState, live: &[String], dead: &[DeadPane]) -> Reco
 /// whose session is not among the `live` ones (`new-session -A` ignores a
 /// command for one that is). The same on either side: a remote tab's session
 /// was found by its host's worker, and its directory is a path there.
-pub fn resume_on_restore<'a>(tab: &'a SavedTab, live: &[String]) -> Option<&'a ClaudeSession> {
-    tab.claude.as_ref().filter(|_| !live.contains(&tab.uuid))
+pub fn resume_on_restore<'a>(
+    claude: Option<&'a ClaudeSession>,
+    uuid: &str,
+    live: &[String],
+) -> Option<&'a ClaudeSession> {
+    claude.filter(|_| !live.iter().any(|live| live == uuid))
 }
 
 pub fn group_host(saved: &SavedState, group: usize) -> Option<&str> {

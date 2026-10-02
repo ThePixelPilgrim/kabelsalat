@@ -90,6 +90,10 @@ const AGE_TICK_SECS: u32 = 30;
 /// them. Cheap (a few small files, one `list-panes`), so often enough that a
 /// crash shortly after a claude starts still knows what to resume.
 const CLAUDE_TICK_SECS: u32 = 5;
+
+/// How long a live host rests between two discoveries: each is a round trip
+/// on its serial worker queue, so it is paced below the local tick.
+const REMOTE_CLAUDE_SECS: u64 = 15;
 /// How long after a tab's first output — and after every tab activation —
 /// the activity sources (`contents-changed`, title writes) stay ignored.
 /// Attaching a tmux session repaints the whole screen; without this window
@@ -266,6 +270,18 @@ struct RemoteHost {
     link: Option<HostLink>,
     /// Background retries of a disconnected host; runtime only.
     retry: Retry,
+    /// Claude discovery on a live host; runtime only.
+    discovery: Discovery,
+}
+
+/// Where a live host stands with its claude discoveries.
+#[derive(Default)]
+struct Discovery {
+    /// One is on the worker's queue; its answer (or the host going down)
+    /// clears this. Never two in flight: a slow host must not pile them up.
+    running: bool,
+    /// Not before this; set when the last answer arrived.
+    next: Option<Instant>,
 }
 
 /// Where a disconnected host stands with its background retries.
@@ -1107,17 +1123,15 @@ impl SimpleComponent for App {
                 Err(_) => gtk::glib::ControlFlow::Break,
             }
         });
-        // Only with tmux: the pane pids are what ties a claude to a tab, and
-        // without tmux there is no session to respawn into anyway.
-        if model.tmux.is_some() {
-            let input = sender.input_sender().clone();
-            gtk::glib::timeout_add_seconds_local(CLAUDE_TICK_SECS, move || {
-                match input.send(Msg::ClaudeTick) {
-                    Ok(()) => gtk::glib::ControlFlow::Continue,
-                    Err(_) => gtk::glib::ControlFlow::Break,
-                }
-            });
-        }
+        // Always on: a remote host's panes are inspected by its worker even
+        // when there is no local tmux (locally the tick is then a no-op).
+        let input = sender.input_sender().clone();
+        gtk::glib::timeout_add_seconds_local(CLAUDE_TICK_SECS, move || {
+            match input.send(Msg::ClaudeTick) {
+                Ok(()) => gtk::glib::ControlFlow::Continue,
+                Err(_) => gtk::glib::ControlFlow::Break,
+            }
+        });
         ComponentParts { model, widgets }
     }
 
@@ -1555,6 +1569,16 @@ impl SimpleComponent for App {
                 // snapshot the CLI reads; rebuild_list() redraws the header.
                 self.rebuild_list();
             }
+            // A discovery answer saves only when it changed a tab, like the
+            // local tick; every other host event is a layout change.
+            Msg::Remote {
+                host,
+                event: RemoteEvent::ClaudeSessions(found),
+            } => {
+                if !self.on_claude_sessions(&host, found) {
+                    return;
+                }
+            }
             Msg::Remote { host, event } => self.on_remote_event(host, event),
             Msg::Reconnect(host) => self.connect_host(&host),
         }
@@ -1742,8 +1766,13 @@ impl App {
         // as a shell: `-A` ignores both for a session that survived, so the
         // check against `live` only spares a surviving tab the arguments.
         let dead_exit = |uuid: &str| dead.iter().find(|d| d.uuid == uuid).map(|d| d.exit_code);
+        // A remote tab's decision waits for its host's listing
+        // (on_host_connected); `live` is the local server's.
         for tab in &saved.tabs {
-            let resume = state::resume_on_restore(&saved, tab, &live);
+            let resume = match state::group_host(&saved, tab.group) {
+                None => state::resume_on_restore(tab.claude.as_ref(), &tab.uuid, &live),
+                Some(_) => None,
+            };
             let command = resume.map(|c| c.resume_argv());
             let id = self.add_tab(
                 tab.uuid.clone(),
@@ -2088,14 +2117,19 @@ impl App {
     }
 
     fn set_host_state(&mut self, host: &str, state: HostState) {
-        self.hosts
+        let entry = self
+            .hosts
             .entry(host.to_string())
             .or_insert_with(|| RemoteHost {
                 state: HostState::Connecting,
                 link: None,
                 retry: Retry::default(),
-            })
-            .state = state;
+                discovery: Discovery::default(),
+            });
+        entry.state = state;
+        // Whatever was in flight on the old state is moot; the host's own
+        // answer, if it ever comes, is harmless.
+        entry.discovery = Discovery::default();
         self.refresh_host_pages(host);
         self.rebuild_list();
     }
@@ -2140,6 +2174,7 @@ impl App {
                             state: HostState::Connecting,
                             link: None,
                             retry: Retry::default(),
+                            discovery: Discovery::default(),
                         })
                         .link = Some(link);
                 }
@@ -2207,6 +2242,48 @@ impl App {
                 self.set_host_state(&host, HostState::Disconnected(RemoteError::Unreachable));
             }
             RemoteEvent::TabSessions { tab, result } => self.on_tab_sessions(tab, result),
+            // Taken off the message before it gets here.
+            RemoteEvent::ClaudeSessions(_) => {}
+        }
+    }
+
+    /// A host answered a discovery: apply it to its tabs with the same rule
+    /// as the local tick. Returns whether any tab changed.
+    fn on_claude_sessions(&mut self, host: &str, found: HashMap<String, ClaudeSession>) -> bool {
+        if let Some(entry) = self.hosts.get_mut(host) {
+            entry.discovery.running = false;
+            entry.discovery.next = Some(Instant::now() + Duration::from_secs(REMOTE_CLAUDE_SECS));
+        }
+        let mut changed = false;
+        for id in self.host_tab_ids(host) {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                let seen = found.get(&tab.uuid).cloned();
+                let now = claude::after_tick(tab.claude.clone(), seen, tab.crashed.is_some());
+                if tab.claude != now {
+                    tab.claude = now;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Queue a discovery on every live host that is due and has none in
+    /// flight.
+    fn discover_remote_claude(&mut self) {
+        let now = Instant::now();
+        for entry in self.hosts.values_mut() {
+            if entry.state != HostState::Live || entry.discovery.running {
+                continue;
+            }
+            let Some(link) = &entry.link else {
+                continue;
+            };
+            if entry.discovery.next.is_some_and(|next| now < next) {
+                continue;
+            }
+            entry.discovery.running = true;
+            link.worker.discover_claude();
         }
     }
 
@@ -2254,12 +2331,28 @@ impl App {
                 tab.crashed = Some(code);
             }
         }
+        // A tab whose session did not survive on the host comes back as the
+        // claude it had, resumed there; a tab with a first spawn still
+        // pending (created while the host was down) keeps that instead.
+        for tab in self.tabs.iter_mut().filter(|t| tabs.contains(&t.uuid)) {
+            let resume = state::resume_on_restore(tab.claude.as_ref(), &tab.uuid, &listing.live);
+            if let Some(session) = resume
+                && tab.pending.as_ref().is_none_or(|p| p.command.is_none())
+            {
+                tab.pending = Some(PendingSpawn {
+                    cwd: Some(session.cwd.clone()),
+                    command: Some(session.resume_argv()),
+                });
+            }
+        }
         if let Some(entry) = self.hosts.get_mut(host) {
             entry.state = HostState::Live;
             // A retry may still be queued behind this connect; it reports
             // Connected too, which is harmless.
             entry.retry.failures = 0;
             entry.retry.due = None;
+            // A fresh host is inspected by the next tick.
+            entry.discovery = Discovery::default();
         }
         self.attach_host_tabs(host);
         self.refresh_host_pages(host);
@@ -3268,6 +3361,13 @@ impl App {
     /// the right session. A tab whose claude is gone forgets it: the shell
     /// is what the tab is now, and what a respawn should give back.
     fn refresh_claude_sessions(&mut self) {
+        self.discover_remote_claude();
+        self.refresh_local_claude_sessions();
+    }
+
+    /// The local half of `refresh_claude_sessions`: the registry and `/proc`
+    /// against the local server's panes. Nothing to do without tmux.
+    fn refresh_local_claude_sessions(&mut self) {
         let Some(tmux) = &self.tmux else {
             return;
         };
@@ -3288,7 +3388,7 @@ impl App {
                 }
             }
         };
-        let found = claude::sessions_by_pane(&records, &panes, proc_root);
+        let found = claude::sessions_by_pane(&records, &panes, &claude::ProcFs(proc_root));
         let remote: HashSet<usize> = self
             .groups
             .iter()
@@ -3535,8 +3635,12 @@ impl App {
                 if self.host_state(&host) != HostState::Live {
                     return;
                 }
+                // As locally: a tab that hosted a claude restarts as that
+                // claude, resumed on the host.
+                let resume = tab.claude.as_ref().map(|c| c.resume_argv());
+                let cwd = tab.claude.as_ref().map(|c| c.cwd.clone());
                 if let Some(worker) = self.worker(&host) {
-                    worker.respawn(uuid);
+                    worker.respawn(uuid, cwd, resume);
                 }
             }
             (None, Some(tmux)) => {
