@@ -252,6 +252,10 @@ set -g set-titles on
 set -g set-titles-string \"#{pane_title}\"
 set -g history-limit 100000
 set -g default-terminal xterm-256color
+# Pass OSC 8 hyperlinks through to VTE, which opens them on Ctrl+click.
+# tmux before 3.4 ignores the unknown feature name. A fixed index rather
+# than -a, so re-sourcing on every launch does not keep appending.
+set -s terminal-features[99] '*:hyperlinks'
 set-hook -g pane-died 'run-shell \"printf \\\"%s %s\\\" \\\"#{session_name}\\\" \\\"#{pane_dead_status}\\\" > \\\"{events_dir}/#{session_name}\\\"\"'
 ";
 
