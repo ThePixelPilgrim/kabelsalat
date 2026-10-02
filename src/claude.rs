@@ -12,6 +12,7 @@
 //! whole thing is testable with fabricated trees. No GTK, no tmux.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -53,11 +54,37 @@ pub struct Record {
 /// Where Claude Code keeps its registry: `$CLAUDE_CONFIG_DIR/sessions`, or
 /// `~/.claude/sessions`.
 pub fn sessions_dir() -> Option<PathBuf> {
-    let config = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+    sessions_dir_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// `sessions_dir` over explicit `$CLAUDE_CONFIG_DIR` and `$HOME` values; an
+/// empty config dir counts as unset, as it does for claude itself.
+pub fn sessions_dir_from(config_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    let config = match config_dir {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".claude"),
+        _ => PathBuf::from(home?).join(".claude"),
     };
     Some(config.join("sessions"))
+}
+
+/// What a tab knows after a discovery tick: the claude found under its pane
+/// if there is one; nothing if the pane is live without one (the tab is a
+/// shell again); and, for a dead pane, whatever it knew before — a crashed
+/// pane has no live claude by definition, and what it had is exactly what
+/// its restart should resume.
+pub fn after_tick(
+    previous: Option<ClaudeSession>,
+    found: Option<ClaudeSession>,
+    pane_dead: bool,
+) -> Option<ClaudeSession> {
+    match found {
+        Some(session) => Some(session),
+        None if pane_dead => previous,
+        None => None,
+    }
 }
 
 /// Parse one registry file. Anything malformed is `None`: the registry is

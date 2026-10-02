@@ -599,16 +599,7 @@ impl TmuxCtl {
         stdout: &str,
         stderr: &str,
     ) -> Result<Vec<SessionInfo>, TmuxError> {
-        if code != Some(0) {
-            let from_tmux = !self.is_remote() || code == Some(1);
-            if from_tmux && is_no_server_stderr(stderr) {
-                return Ok(Vec::new());
-            }
-            if self.is_remote() && code == Some(remote::SSH_FAILED) {
-                return Err(TmuxError::Command(format!("ssh: {}", stderr.trim())));
-            }
-            return Err(TmuxError::Command(stderr.trim().to_string()));
-        }
+        self.check_listing_status(code, stderr)?;
         let mut sessions = Vec::new();
         for line in stdout.lines() {
             if let Some(session) = parse_session_line(line)? {
@@ -616,6 +607,23 @@ impl TmuxCtl {
             }
         }
         Ok(sessions)
+    }
+
+    /// The status rule shared by the listings: exit 0 is a listing to parse;
+    /// a "no server" complaint from tmux itself is an empty one (`Ok(())`
+    /// here, with nothing on stdout); anything else is an error.
+    fn check_listing_status(&self, code: Option<i32>, stderr: &str) -> Result<(), TmuxError> {
+        if code == Some(0) {
+            return Ok(());
+        }
+        let from_tmux = !self.is_remote() || code == Some(1);
+        if from_tmux && is_no_server_stderr(stderr) {
+            return Ok(());
+        }
+        if self.is_remote() && code == Some(remote::SSH_FAILED) {
+            return Err(TmuxError::Command(format!("ssh: {}", stderr.trim())));
+        }
+        Err(TmuxError::Command(stderr.trim().to_string()))
     }
 
     /// Argv tail that kills a tab's session.
@@ -679,14 +687,38 @@ impl TmuxCtl {
     /// an empty list, like `list_sessions`.
     pub fn pane_pids(&self) -> Result<Vec<(String, u32)>, TmuxError> {
         let output = self.command(&Self::pane_pids_args())?.output()?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() {
-            if is_no_server_stderr(&stderr) {
-                return Ok(Vec::new());
-            }
-            return Err(TmuxError::Command(stderr.trim().to_string()));
+        self.pane_pids_from_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
+    /// Interpret a finished `list-panes`: the status rules of
+    /// `list_sessions_from_output`, then `(uuid, pane_pid)` per line, with
+    /// foreign sessions on our socket skipped.
+    pub fn pane_pids_from_output(
+        &self,
+        code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<Vec<(String, u32)>, TmuxError> {
+        self.check_listing_status(code, stderr)?;
+        let mut panes = Vec::new();
+        for line in stdout.lines() {
+            let (name, pid) = line
+                .split_once('\t')
+                .ok_or_else(|| TmuxError::Parse(line.to_string()))?;
+            let Some(uuid) = name.strip_prefix(SESSION_PREFIX) else {
+                continue;
+            };
+            let pid = pid
+                .trim()
+                .parse()
+                .map_err(|_| TmuxError::Parse(line.to_string()))?;
+            panes.push((uuid.to_string(), pid));
         }
-        pane_pids_from_output(&String::from_utf8_lossy(&output.stdout))
+        Ok(panes)
     }
 
     /// Argv tail for publishing one variable into a tab's session environment.
@@ -757,26 +789,6 @@ fn parse_session_line(line: &str) -> Result<Option<SessionInfo>, TmuxError> {
         pane_dead,
         dead_status,
     }))
-}
-
-/// Parse `list-panes -a -F` output into `(uuid, pane_pid)` pairs, skipping
-/// foreign sessions on our socket.
-fn pane_pids_from_output(stdout: &str) -> Result<Vec<(String, u32)>, TmuxError> {
-    let mut panes = Vec::new();
-    for line in stdout.lines() {
-        let (name, pid) = line
-            .split_once('\t')
-            .ok_or_else(|| TmuxError::Parse(line.to_string()))?;
-        let Some(uuid) = name.strip_prefix(SESSION_PREFIX) else {
-            continue;
-        };
-        let pid = pid
-            .trim()
-            .parse()
-            .map_err(|_| TmuxError::Parse(line.to_string()))?;
-        panes.push((uuid.to_string(), pid));
-    }
-    Ok(panes)
 }
 
 /// Whether `list-sessions` stderr indicates "no server / socket running",

@@ -1743,11 +1743,7 @@ impl App {
         // check against `live` only spares a surviving tab the arguments.
         let dead_exit = |uuid: &str| dead.iter().find(|d| d.uuid == uuid).map(|d| d.exit_code);
         for tab in &saved.tabs {
-            let local = state::group_host(&saved, tab.group).is_none();
-            let resume = tab
-                .claude
-                .as_ref()
-                .filter(|_| local && !live.contains(&tab.uuid));
+            let resume = state::resume_on_restore(&saved, tab, &live);
             let command = resume.map(|c| c.resume_argv());
             let id = self.add_tab(
                 tab.uuid.clone(),
@@ -3301,12 +3297,8 @@ impl App {
             .collect();
         let mut changed = false;
         for tab in self.tabs.iter_mut().filter(|t| !remote.contains(&t.group)) {
-            let now = found.get(&tab.uuid).cloned();
-            // A crashed pane has no live claude by definition; what it had is
-            // exactly what its restart should resume, so it is kept.
-            if now.is_none() && tab.crashed.is_some() {
-                continue;
-            }
+            let seen = found.get(&tab.uuid).cloned();
+            let now = claude::after_tick(tab.claude.clone(), seen, tab.crashed.is_some());
             if tab.claude != now {
                 tab.claude = now;
                 changed = true;
