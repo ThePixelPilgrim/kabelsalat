@@ -8,22 +8,6 @@ colour-coded groups.
 - **Shells survive everything.** Tabs are backed by an invisible tmux
   server; crash, quit or upgrade the GUI and every shell reattaches, layout
   intact. With systemd lingering they survive logout too.
-- **Your AI agent sees the web page you see.** Each group's embedded browser
-  hands its CDP endpoint to the group's terminals automatically — an agent
-  running there inspects and drives the page in front of you, zero
-  configuration. One camera-button click hands it a screenshot of the pane
-  instead, pasted straight into the tab you took it from.
-- **One browser per project.** `Alt+2` opens a per-group Chromium pane with
-  its own profile and start page.
-- **Tabs live in groups.** Colour-coded, nameable, drag-and-drop; the
-  sidebar collapses to a compact tab bar.
-- **Groups can live on another machine.** A remote group's tabs are tmux
-  sessions on that host, reached over one shared ssh connection — they
-  survive the GUI, the network dropping and the next login just like local
-  ones.
-- **Agent-friendly CLI.** `kabelsalat run -g web -- npm run dev` opens a
-  command in a visible tab without stealing focus; a Claude Code plugin
-  teaches agents the whole interface.
 - **Claude Code sessions are resumed.** A tab in which `claude` runs
   records its session id; after a reboot the tab comes back as
   `claude --resume` in the same directory rather than as a plain shell.
@@ -31,6 +15,22 @@ colour-coded groups.
 - **Failure is survivable.** Crashed shells keep their output and restart in
   one click; orphaned sessions land in a "Recovered" group. Works without
   tmux, minus the survival guarantees.
+- **Groups can live on another machine.** A remote group's tabs are tmux
+  sessions on that host, reached over one shared ssh connection — they
+  survive the GUI, the network dropping and the next login just like local
+  ones.
+- **Tabs live in groups.** Colour-coded, nameable, drag-and-drop; the
+  sidebar collapses to a compact tab bar.
+- **One browser per project.** `Alt+2` opens a per-group Chromium pane with
+  its own profile and start page.
+- **Your AI agent sees the web page you see.** Each group's embedded browser
+  hands its CDP endpoint to the group's terminals automatically — an agent
+  running there inspects and drives the page in front of you, zero
+  configuration. One camera-button click hands it a screenshot of the pane
+  instead, pasted straight into the tab you took it from.
+- **Agent-friendly CLI.** `kabelsalat run -g web -- npm run dev` opens a
+  command in a visible tab without stealing focus; a Claude Code plugin
+  teaches agents the whole interface.
 
 Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
 [VTE](https://gitlab.gnome.org/GNOME/vte).
