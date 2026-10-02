@@ -1646,11 +1646,51 @@ mod tests {
 
     #[test]
     fn pane_pids_output_maps_tabs_to_shell_pids() {
-        let panes = pane_pids_from_output("ks-a\t1234\nother\t5\nks-b\t42\n").unwrap();
+        let dir = temp_dir("pane-pids");
+        let ctl = test_ctl(&dir);
+        let panes = ctl
+            .pane_pids_from_output(Some(0), "ks-a\t1234\nother\t5\nks-b\t42\n", "")
+            .unwrap();
         assert_eq!(panes, [("a".to_string(), 1234), ("b".to_string(), 42)]);
-        assert!(pane_pids_from_output("").unwrap().is_empty());
-        assert!(pane_pids_from_output("ks-a 12").is_err());
-        assert!(pane_pids_from_output("ks-a\tnope").is_err());
+        assert!(
+            ctl.pane_pids_from_output(Some(0), "", "")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(ctl.pane_pids_from_output(Some(0), "ks-a 12", "").is_err());
+        assert!(
+            ctl.pane_pids_from_output(Some(0), "ks-a\tnope", "")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pane_pids_follow_the_session_listing_status_rules() {
+        // Same rules as list_sessions_from_output: a stopped server is an
+        // empty list, anything else non-zero is an error, and on a remote
+        // target only tmux's own status 1 may mean "no server".
+        let dir = temp_dir("pane-pids-status");
+        let local = test_ctl(&dir);
+        assert!(
+            local
+                .pane_pids_from_output(Some(1), "", "no server running on /x")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(local.pane_pids_from_output(Some(1), "", "boom").is_err());
+        assert!(local.pane_pids_from_output(None, "", "").is_err());
+        let remote = remote_ctl();
+        assert!(
+            remote
+                .pane_pids_from_output(Some(1), "", "no server running on /x")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            remote
+                .pane_pids_from_output(Some(remote::SSH_FAILED), "", "no server running on /x")
+                .is_err()
+        );
     }
 
     #[test]

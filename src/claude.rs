@@ -179,6 +179,7 @@ fn parse_stat(stat: &str) -> Option<StatFields> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -212,6 +213,58 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn sessions_dir_prefers_claude_config_dir_over_home() {
+        let cfg = OsStr::new("/cfg");
+        let home = OsStr::new("/home/me");
+        assert_eq!(
+            sessions_dir_from(Some(cfg), Some(home)),
+            Some(PathBuf::from("/cfg/sessions"))
+        );
+        assert_eq!(
+            sessions_dir_from(None, Some(home)),
+            Some(PathBuf::from("/home/me/.claude/sessions"))
+        );
+        // An empty CLAUDE_CONFIG_DIR is as good as unset.
+        assert_eq!(
+            sessions_dir_from(Some(OsStr::new("")), Some(home)),
+            Some(PathBuf::from("/home/me/.claude/sessions"))
+        );
+        assert_eq!(sessions_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn after_tick_takes_what_is_found_and_keeps_a_crashed_tabs_session() {
+        let old = ClaudeSession {
+            id: "old".into(),
+            cwd: PathBuf::from("/a"),
+        };
+        let new = ClaudeSession {
+            id: "new".into(),
+            cwd: PathBuf::from("/b"),
+        };
+        // A claude seen in the pane is the truth, whatever was known before.
+        assert_eq!(
+            after_tick(None, Some(new.clone()), false),
+            Some(new.clone())
+        );
+        assert_eq!(
+            after_tick(Some(old.clone()), Some(new.clone()), false),
+            Some(new.clone())
+        );
+        assert_eq!(
+            after_tick(Some(old.clone()), Some(new.clone()), true),
+            Some(new)
+        );
+        // No claude under a live pane: the tab is a shell again.
+        assert_eq!(after_tick(Some(old.clone()), None, false), None);
+        assert_eq!(after_tick(None, None, false), None);
+        // No claude under a dead pane means nothing: what it had is what a
+        // restart resumes.
+        assert_eq!(after_tick(Some(old.clone()), None, true), Some(old));
+        assert_eq!(after_tick(None, None, true), None);
     }
 
     #[test]

@@ -1173,6 +1173,32 @@ mod tests {
     }
 
     #[test]
+    fn resume_on_restore_only_for_a_gone_local_tab_with_a_session() {
+        let mut state = remote_state(); // group 1 is remote
+        let session = ClaudeSession {
+            id: "sid".into(),
+            cwd: PathBuf::from("/work"),
+        };
+        state.tabs[0].claude = Some(session.clone()); // aaa: local
+        state.tabs[1].claude = Some(session.clone()); // bbb: remote
+        let gone: Vec<String> = Vec::new();
+        // Local, session gone, claude known: resume.
+        assert_eq!(
+            resume_on_restore(&state, &state.tabs[0], &gone),
+            Some(&session)
+        );
+        // Session survived: -A attaches, nothing to resume.
+        assert_eq!(
+            resume_on_restore(&state, &state.tabs[0], &["aaa".to_string()]),
+            None
+        );
+        // Remote group: the registry is not this machine's.
+        assert_eq!(resume_on_restore(&state, &state.tabs[1], &gone), None);
+        // Nothing known.
+        assert_eq!(resume_on_restore(&state, &state.tabs[2], &gone), None);
+    }
+
+    #[test]
     fn newest_first_index_lands_before_the_groups_first_tab() {
         // Tabs of groups 0,1,1,2 already exist. A new group-1 tab goes in
         // front of the first group-1 tab; a new group-2 tab in front of the
