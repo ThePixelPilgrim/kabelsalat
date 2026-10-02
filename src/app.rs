@@ -1158,6 +1158,7 @@ impl SimpleComponent for App {
                                 }
                             }
                             if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                                tab.armed.respawn();
                                 spawn_backing(&tab.terminal, &uuid, Some(tmux), None, None, &env);
                             }
                         }
@@ -2294,6 +2295,9 @@ impl App {
             pending.command.as_deref(),
             &[],
         );
+        // A reconnect re-attaches a tab that may have been armed long ago;
+        // its attach repaint must not count as activity.
+        tab.armed.respawn();
         spawn_client(&tab.terminal, &argv);
         tab.attached = true;
         tab.spawned_at = Some(Instant::now());
@@ -3235,6 +3239,7 @@ impl App {
             .enable_fallback_scrolling(false)
             .build();
         apply_scheme(&terminal, self.style.is_dark());
+        enable_links(&terminal);
         let host = self.group_host(group);
         let pending = match &host {
             // Never spawned here: a remote shell may only be created after a
@@ -3265,6 +3270,7 @@ impl App {
         };
 
         attach_drag_hint(&terminal, sender);
+        attach_link_opener(&terminal);
 
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -3301,15 +3307,24 @@ impl App {
         // restored tab would then be stamped "now" and its persisted age
         // lost). Known cost: a TUI that repaints while idle (spinner, clock)
         // keeps its tab fresh.
+        // A change of the grid size is not activity either: tmux repaints
+        // every pane on a resize (the window settling after launch, a tab
+        // first shown, the sidebar toggled), which would stamp every tab at
+        // once. It reopens the settle window instead.
         let armed = Rc::new(ActivityArm::new());
+        let grid = Cell::new((0, 0));
         terminal.connect_contents_changed({
             let armed = armed.clone();
             let last = last_activity.clone();
             let pending = self.resort_pending.clone();
             let input = sender.input_sender().clone();
-            move |_| {
+            move |terminal| {
+                let resized = grid.replace((terminal.row_count(), terminal.column_count()))
+                    != (terminal.row_count(), terminal.column_count());
                 if let Some(generation) = armed.output() {
                     arm_later(&armed, generation);
+                } else if resized {
+                    arm_later(&armed, armed.disarm());
                 } else if armed.is_armed() {
                     last.set(SystemTime::now());
                     request_resort(&pending, &input);
@@ -4020,14 +4035,10 @@ impl App {
             SidebarOrder::Activity => {
                 // `activity_order` keeps two tabs that both read "now" in
                 // vec order instead of swapping on every chunk of output.
-                let now = SystemTime::now();
+                let now = unix_secs(SystemTime::now());
                 let elapsed: Vec<u64> = members
                     .iter()
-                    .map(|t| {
-                        now.duration_since(t.last_activity.get())
-                            .unwrap_or(Duration::ZERO)
-                            .as_secs()
-                    })
+                    .map(|t| now.saturating_sub(unix_secs(t.last_activity.get())))
                     .collect();
                 state::activity_order(&elapsed)
                     .into_iter()
@@ -4813,6 +4824,14 @@ impl ActivityArm {
         generation
     }
 
+    /// A new client is being attached in the terminal (reattach after the
+    /// client died, remote reconnect): deaf again until its attach repaint
+    /// has arrived and settled, exactly like a fresh tab.
+    fn respawn(&self) {
+        self.awaiting_output.set(true);
+        self.disarm();
+    }
+
     /// Output arrived. For the first output after spawn this opens the
     /// settle window and returns its generation for the caller to `arm`
     /// later; otherwise `None`, and `is_armed` says whether it counts.
@@ -4863,6 +4882,17 @@ fn is_activity_key(key: gtk::gdk::Key) -> bool {
 /// nothing happened.
 fn title_changed(current: &str, incoming: &str) -> bool {
     current != incoming
+}
+
+/// Whole seconds since the epoch. The activity sort compares stamps at this
+/// granularity, on both sides of the subtraction: truncating only the
+/// difference (`(now - stamp).as_secs()`) makes two tabs stamped a fraction
+/// of a second apart tie or not depending on the sub-second phase of `now`,
+/// so every re-sort could swap them back and forth.
+fn unix_secs(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Decide a restored tab's `last_activity` from what the state file held.
@@ -5032,6 +5062,72 @@ fn attach_drag_hint(terminal: &Terminal, sender: &ComponentSender<App>) {
     drag.connect_drag_end(move |_, _, _| fired.set(false));
 
     terminal.add_controller(drag);
+}
+
+/// Plain-text URLs the terminal underlines on hover and opens on Ctrl+click.
+/// Trailing punctuation is left out so "see https://x.org/a." opens `/a`.
+const URL_REGEX: &str = r#"\b(?:https?|ftp|file)://[^\s<>"'`()\[\]{}]*[^\s<>"'`()\[\]{}.,;:!?]"#;
+/// PCRE2_MULTILINE, which VTE requires on every match regex.
+const PCRE2_MULTILINE: u32 = 0x0000_0400;
+/// PCRE2_CASELESS: `HTTPS://` is a URL too.
+const PCRE2_CASELESS: u32 = 0x0000_0008;
+
+/// Make links in the terminal recognisable: OSC 8 hyperlinks (tmux forwards
+/// them, see `terminal-features` in `TMUX_CONF`) and bare URLs, both shown
+/// with a pointer cursor on hover.
+fn enable_links(terminal: &Terminal) {
+    terminal.set_allow_hyperlink(true);
+    match vte4::Regex::for_match(URL_REGEX, PCRE2_MULTILINE | PCRE2_CASELESS) {
+        Ok(regex) => {
+            let tag = terminal.match_add_regex(&regex, 0);
+            terminal.match_set_cursor_name(tag, "pointer");
+        }
+        Err(err) => eprintln!("URL regex rejected: {err}"),
+    }
+}
+
+/// Whether a primary click with these modifiers opens the link under it.
+/// Ctrl, as in other VTE terminals: a plain click belongs to tmux (mouse is
+/// on), which selects text and positions panes with it.
+fn opens_link(state: gtk::gdk::ModifierType) -> bool {
+    state.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+}
+
+/// Open the link under a Ctrl+click in the default handler.
+///
+/// Capture phase, so the click is seen before VTE forwards it to tmux as a
+/// mouse event. The sequence is claimed only when there is a link to open;
+/// every other click reaches VTE (and tmux) untouched.
+fn attach_link_opener(terminal: &Terminal) {
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_PRIMARY);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed(|gesture, _, x, y| {
+        if !opens_link(gesture.current_event_state()) {
+            return;
+        }
+        let Some(terminal) = gesture.widget().and_downcast::<Terminal>() else {
+            return;
+        };
+        let Some(uri) = terminal
+            .check_hyperlink_at(x, y)
+            .or_else(|| terminal.check_match_at(x, y).0)
+        else {
+            return;
+        };
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let window = terminal.root().and_downcast::<gtk::Window>();
+        gtk::UriLauncher::new(&uri).launch(
+            window.as_ref(),
+            gio::Cancellable::NONE,
+            move |result| {
+                if let Err(err) = result {
+                    eprintln!("failed to open {uri}: {err}");
+                }
+            },
+        );
+    });
+    terminal.add_controller(click);
 }
 
 fn apply_scheme(terminal: &Terminal, dark: bool) {
@@ -5494,6 +5590,50 @@ mod tests {
         // Later output is plain activity, not another window.
         assert_eq!(arm.output(), None);
         assert!(arm.is_armed());
+    }
+
+    #[test]
+    fn activity_arm_respawn_waits_for_the_new_attach_repaint() {
+        let arm = ActivityArm::new();
+        arm.arm(arm.output().unwrap());
+        assert!(arm.is_armed());
+        // Reconnect: the old window's timer and the new client's first
+        // output must not arm early; only the new settle window does.
+        arm.respawn();
+        assert!(!arm.is_armed());
+        let attach = arm.output().expect("attach repaint opens a window");
+        assert!(!arm.is_armed());
+        arm.arm(attach);
+        assert!(arm.is_armed());
+    }
+
+    #[test]
+    fn activity_sort_does_not_flap_on_sub_second_stamps() {
+        // Two tabs stamped 0.2 s apart across a second boundary. Re-sorted
+        // at any sub-second phase of `now`, they must keep one order.
+        let a = UNIX_EPOCH + Duration::from_millis(1_000_900);
+        let b = UNIX_EPOCH + Duration::from_millis(1_001_100);
+        let mut orders = HashSet::new();
+        for phase in (0..1000).step_by(50) {
+            let now = UNIX_EPOCH + Duration::from_millis(1_000_000 + 600_000 + phase);
+            let elapsed: Vec<u64> = [a, b]
+                .iter()
+                .map(|&t| unix_secs(now).saturating_sub(unix_secs(t)))
+                .collect();
+            orders.insert(state::activity_order(&elapsed));
+        }
+        assert_eq!(orders.len(), 1, "order flapped: {orders:?}");
+    }
+
+    #[test]
+    fn links_open_on_ctrl_click_only() {
+        use gtk::gdk::ModifierType;
+        assert!(opens_link(ModifierType::CONTROL_MASK));
+        assert!(opens_link(
+            ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
+        ));
+        assert!(!opens_link(ModifierType::empty()));
+        assert!(!opens_link(ModifierType::SHIFT_MASK));
     }
 
     #[test]
