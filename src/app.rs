@@ -3271,6 +3271,7 @@ impl App {
 
         attach_drag_hint(&terminal, sender);
         attach_link_opener(&terminal);
+        attach_middle_paste(&terminal);
 
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -5022,6 +5023,9 @@ fn select_help_body() -> &'static str {
      holding Shift is the terminal's standard way to take them back for \
      selection. Other terminals behave the same way under tmux.\n\n\
      \u{2022} Shift+drag \u{2014} select text\n\
+     \u{2022} Middle-click \u{2014} paste the selection\n\
+     \u{2022} Ctrl+Shift+C / Ctrl+Shift+V \u{2014} copy / paste the clipboard\n\
+     \u{2022} Ctrl+click \u{2014} open a link\n\
      \u{2022} Wheel \u{2014} scroll the scrollback (Escape or q to leave)"
 }
 
@@ -5126,6 +5130,35 @@ fn attach_link_opener(terminal: &Terminal) {
                 }
             },
         );
+    });
+    terminal.add_controller(click);
+}
+
+/// Whether a middle click with these modifiers is ours to paste. With Shift
+/// held VTE bypasses mouse reporting and pastes PRIMARY by itself.
+fn pastes_primary(state: gtk::gdk::ModifierType) -> bool {
+    !state.contains(gtk::gdk::ModifierType::SHIFT_MASK)
+}
+
+/// Paste the PRIMARY selection on a plain middle click, as X terminals do.
+///
+/// tmux has the mouse, and its root key table is wiped (`TMUX_CONF`), so a
+/// plain middle click would otherwise do nothing. Capture phase and claimed,
+/// so tmux never sees the click; programs in the pane that use the middle
+/// button themselves lose it, as they do under tmux's stock paste binding.
+fn attach_middle_paste(terminal: &Terminal) {
+    let click = gtk::GestureClick::new();
+    click.set_button(gtk::gdk::BUTTON_MIDDLE);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed(|gesture, _, _, _| {
+        if !pastes_primary(gesture.current_event_state()) {
+            return;
+        }
+        let Some(terminal) = gesture.widget().and_downcast::<Terminal>() else {
+            return;
+        };
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        terminal.paste_primary();
     });
     terminal.add_controller(click);
 }
@@ -5623,6 +5656,14 @@ mod tests {
             orders.insert(state::activity_order(&elapsed));
         }
         assert_eq!(orders.len(), 1, "order flapped: {orders:?}");
+    }
+
+    #[test]
+    fn middle_click_pastes_unless_shift_hands_it_to_vte() {
+        use gtk::gdk::ModifierType;
+        assert!(pastes_primary(ModifierType::empty()));
+        assert!(pastes_primary(ModifierType::CONTROL_MASK));
+        assert!(!pastes_primary(ModifierType::SHIFT_MASK));
     }
 
     #[test]
