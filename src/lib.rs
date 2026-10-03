@@ -157,8 +157,8 @@ pub fn run() {
          .tab-crashed label { color: #e01b24; font-weight: bold; }
          button.tab-active label { font-weight: bold; }
          button.tab-active { background: alpha(currentColor, 0.12); }
-         row.tab-claude, button.tab-claude { background: alpha(#33d17a, 0.16); }
-         button.tab-claude.tab-active { background: alpha(#33d17a, 0.32); }
+         row.tab-claude, button.tab-claude { background: alpha(#33d17a, 0.08); }
+         row.tab-claude:selected, button.tab-claude.tab-active { background: alpha(#33d17a, 0.32); }
          button.group-c0, button.group-c1, button.group-c2,
          button.group-c3, button.group-c4, button.group-c5 {
              border-left: none;
