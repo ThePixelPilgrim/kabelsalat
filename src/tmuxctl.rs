@@ -203,6 +203,58 @@ pub struct SessionInfo {
     pub dead_status: Option<i32>,
 }
 
+/// What [`TmuxCtl::create_detached_session`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Created {
+    /// The session did not exist and was created.
+    Created,
+    /// The session was already there; nothing was changed.
+    AlreadyExists,
+}
+
+/// Whether tmux refused a `new-session` because the name is taken.
+pub fn is_duplicate_session_stderr(stderr: &str) -> bool {
+    stderr.trim_start().starts_with("duplicate session")
+}
+
+/// Whether a variable of this process belongs in the server's global
+/// environment. What describes a process rather than the desktop — the tmux
+/// client markers, the working directory, the shell nesting depth, the
+/// last argument — is left out.
+pub fn exportable_env_key(key: &str) -> bool {
+    !key.is_empty() && !matches!(key, "TMUX" | "TMUX_PANE" | "PWD" | "OLDPWD" | "SHLVL" | "_")
+}
+
+/// This process's environment as string pairs. A variable that is not valid
+/// UTF-8 cannot be handed to tmux as text and is skipped.
+pub fn process_environment() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+/// Argv tail that sets every pair in the server's global environment, as
+/// one command sequence: `set-environment -g K V ; set-environment -g …`.
+/// tmux reads an argument ending in `;` as "argument, then a new command",
+/// so a value that ends in one is escaped to `\;`, which tmux reads back
+/// as the literal semicolon.
+pub fn global_environment_args(pairs: &[(String, String)]) -> Vec<String> {
+    let mut args = Vec::with_capacity(pairs.len() * 5);
+    for (i, (key, value)) in pairs.iter().enumerate() {
+        if i > 0 {
+            args.push(";".into());
+        }
+        args.push("set-environment".into());
+        args.push("-g".into());
+        args.push(key.clone());
+        args.push(match value.strip_suffix(';') {
+            Some(head) => format!("{head}\\;"),
+            None => value.clone(),
+        });
+    }
+    args
+}
+
 /// Invisible-plumbing tmux configuration. `{events_dir}` is replaced with
 /// the runtime events directory before writing.
 const TMUX_CONF: &str = "\
@@ -352,14 +404,20 @@ impl TmuxCtl {
         }
     }
 
-    /// Full argv for one tmux subcommand against this target: `tmux -S <sock>
-    /// <args>` locally, or the same tmux words behind `ssh … <dest> --`
-    /// (quoted once more for the login shell, no tty) on a remote host.
+    /// Full argv for one tmux subcommand against this target: `tmux -u -S
+    /// <sock> <args>` locally, or the same tmux words behind `ssh … <dest>
+    /// --` (quoted once more for the login shell, no tty) on a remote host.
+    ///
+    /// `-u` makes the local client UTF-8 whatever its locale: without a
+    /// UTF-8 locale tmux prints the tabs of `list-sessions -F` as `_` and
+    /// the listing cannot be parsed. Desktop sessions have a locale; the
+    /// user manager's environment at boot (`kabelsalat resume`) may not.
     pub fn command_argv(&self, args: &[String]) -> Vec<String> {
         match &self.target {
             Target::Local { socket, .. } => {
                 let mut argv = vec![
                     "tmux".to_string(),
+                    "-u".into(),
                     "-S".into(),
                     socket.to_string_lossy().into_owned(),
                 ];
@@ -460,6 +518,96 @@ impl TmuxCtl {
                 remote::mux_argv(dest, control_path, true, &remote_argv)
             }
         }
+    }
+
+    /// Argv that creates a tab's session detached, without a client: what
+    /// `kabelsalat resume` runs at boot, where there is no terminal to
+    /// attach. `new-session -d` rather than `-A`, so an existing session is
+    /// reported (`duplicate session`) instead of silently reused — see
+    /// [`TmuxCtl::create_detached_session`]. Local only: a remote tab's
+    /// session is created by its host's worker, so a remote target yields
+    /// an empty argv.
+    pub fn spawn_detached_argv(
+        &self,
+        uuid: &str,
+        cwd: Option<&Path>,
+        command: &[String],
+        env: &[(&str, &str)],
+    ) -> Vec<String> {
+        let Target::Local { socket, conf, .. } = &self.target else {
+            return Vec::new();
+        };
+        let mut argv = vec![
+            "tmux".to_string(),
+            "-S".into(),
+            socket.to_string_lossy().into_owned(),
+            "-f".into(),
+            conf.to_string_lossy().into_owned(),
+            "new-session".into(),
+            "-d".into(),
+        ];
+        for (key, value) in env {
+            argv.push("-e".into());
+            argv.push(format!("{key}={value}"));
+        }
+        if let Some(dir) = cwd {
+            argv.push("-c".into());
+            argv.push(escape_tmux_format(&dir.to_string_lossy()));
+        }
+        argv.push("-s".into());
+        argv.push(format!("{SESSION_PREFIX}{uuid}"));
+        argv.push(shell_quote_argv(command));
+        argv
+    }
+
+    /// Create a tab's session detached. A session that already exists is
+    /// `AlreadyExists`, not an error: the GUI may have come up meanwhile and
+    /// created it with `-A`, and either order of that race must be safe.
+    pub fn create_detached_session(
+        &self,
+        uuid: &str,
+        cwd: Option<&Path>,
+        command: &[String],
+        env: &[(&str, &str)],
+    ) -> Result<Created, TmuxError> {
+        let argv = self.spawn_detached_argv(uuid, cwd, command, env);
+        let (program, rest) = argv.split_first().ok_or_else(|| {
+            TmuxError::Command("a remote session is created by its host's worker".into())
+        })?;
+        let output = Command::new(program).args(rest).output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() {
+            Ok(Created::Created)
+        } else if is_duplicate_session_stderr(&stderr) {
+            Ok(Created::AlreadyExists)
+        } else {
+            Err(TmuxError::Command(stderr.trim().to_string()))
+        }
+    }
+
+    /// Copy the exportable variables of this process into the server's
+    /// global environment, in one tmux invocation. A server started at boot
+    /// (`kabelsalat resume`) carries the user manager's minimal environment,
+    /// and every session created later would inherit it — a `PATH` without
+    /// the desktop's additions, no `XDG_CURRENT_DESKTOP` — until the next
+    /// reboot. The GUI runs this after `ensure_server`, so the server
+    /// describes the desktop it is used from. Local only.
+    pub fn sync_global_environment<I>(&self, vars: I) -> Result<(), TmuxError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        if self.is_remote() {
+            return Ok(());
+        }
+        let pairs: Vec<(String, String)> = vars
+            .into_iter()
+            .filter(|(key, _)| exportable_env_key(key))
+            .collect();
+        let args = global_environment_args(&pairs);
+        if args.is_empty() {
+            return Ok(());
+        }
+        self.run(&args)
     }
 
     /// Argv tail of the `pane_current_path` query.
@@ -1484,10 +1632,9 @@ mod tests {
         assert!(!ctl.is_remote());
         assert!(matches!(ctl.target(), Target::Local { .. }));
         let argv = ctl.command_argv(&TmuxCtl::kill_session_args("abc"));
-        assert_eq!(argv[0], "tmux");
-        assert_eq!(argv[1], "-S");
-        assert!(argv[2].ends_with("run/tmux.sock"));
-        assert_eq!(&argv[3..], ["kill-session", "-t", "ks-abc"]);
+        assert_eq!(&argv[..3], ["tmux", "-u", "-S"]);
+        assert!(argv[3].ends_with("run/tmux.sock"));
+        assert_eq!(&argv[4..], ["kill-session", "-t", "ks-abc"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1752,5 +1899,128 @@ mod tests {
                 "#{pane_current_path}"
             ]
         );
+    }
+
+    // --- detached creation (kabelsalat resume) ---
+
+    #[test]
+    fn detached_argv_creates_without_attaching() {
+        let dir = temp_dir("detached");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.spawn_detached_argv(
+            "abc",
+            Some(Path::new("/home/me/proj")),
+            &[
+                "/bin/zsh".to_string(),
+                "-lc".into(),
+                "exec claude --resume x".into(),
+            ],
+            &[("KABELSALAT_GROUP", "g-1")],
+        );
+        let socket = dir.join("run/tmux.sock").to_string_lossy().into_owned();
+        let conf = dir.join("state/tmux.conf").to_string_lossy().into_owned();
+        assert_eq!(
+            argv,
+            vec![
+                "tmux".to_string(),
+                "-S".into(),
+                socket,
+                "-f".into(),
+                conf,
+                "new-session".into(),
+                "-d".into(),
+                "-e".into(),
+                "KABELSALAT_GROUP=g-1".into(),
+                "-c".into(),
+                "/home/me/proj".into(),
+                "-s".into(),
+                "ks-abc".into(),
+                "/bin/zsh -lc 'exec claude --resume x'".into(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detached_argv_is_local_only() {
+        let argv = remote_ctl().spawn_detached_argv("abc", None, &["ls".to_string()], &[]);
+        assert!(argv.is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_session_is_recognised_from_stderr() {
+        assert!(is_duplicate_session_stderr("duplicate session: ks-abc\n"));
+        assert!(!is_duplicate_session_stderr("no server running on /run/x"));
+        assert!(!is_duplicate_session_stderr(""));
+    }
+
+    // --- global environment sync ---
+
+    #[test]
+    fn process_private_variables_are_not_exported_to_the_server() {
+        for key in ["TMUX", "TMUX_PANE", "PWD", "OLDPWD", "SHLVL", "_", ""] {
+            assert!(!exportable_env_key(key), "{key:?}");
+        }
+        for key in [
+            "PATH",
+            "LANG",
+            "XDG_CURRENT_DESKTOP",
+            "SSH_AUTH_SOCK",
+            "HOME",
+        ] {
+            assert!(exportable_env_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn global_environment_args_chain_one_set_per_variable() {
+        let args = global_environment_args(&[
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+        ]);
+        assert_eq!(
+            args,
+            vec![
+                "set-environment".to_string(),
+                "-g".into(),
+                "PATH".into(),
+                "/usr/bin".into(),
+                ";".into(),
+                "set-environment".into(),
+                "-g".into(),
+                "LANG".into(),
+                "C.UTF-8".into(),
+            ]
+        );
+        assert!(global_environment_args(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_value_ending_in_a_semicolon_is_escaped_from_the_command_separator() {
+        // tmux treats an argument ending in `;` as "argument, then a new
+        // command"; `\;` keeps the semicolon literal.
+        let args = global_environment_args(&[
+            ("A".to_string(), "x;".to_string()),
+            ("B".to_string(), ";".to_string()),
+            ("C".to_string(), "a;b".to_string()),
+        ]);
+        assert_eq!(args[3], "x\\;");
+        assert_eq!(args[8], "\\;");
+        assert_eq!(args[13], "a;b");
+    }
+    // --- client locale ---
+
+    #[test]
+    fn local_commands_force_utf8_output() {
+        // Without a UTF-8 locale tmux prints the tabs of `list-sessions -F`
+        // as `_`, which breaks the listing; `-u` makes the client UTF-8
+        // regardless. The user manager's environment at boot (`kabelsalat
+        // resume`) may have no locale at all.
+        let dir = temp_dir("utf8");
+        let ctl = test_ctl(&dir);
+        let argv = ctl.command_argv(&TmuxCtl::list_sessions_args());
+        assert_eq!(argv[1], "-u", "{argv:?}");
+        assert_eq!(argv[2], "-S", "{argv:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

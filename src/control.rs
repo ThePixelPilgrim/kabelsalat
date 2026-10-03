@@ -91,6 +91,15 @@ pub fn request_rename(group_uuid: String, name: String) -> bool {
         .is_ok()
 }
 
+/// Ask the component to bring up a group's browser. Returns false when there
+/// is no component to ask, or when it has already shut down.
+pub fn request_open_browser(group_uuid: String) -> bool {
+    let Some(control) = CONTROL.get() else {
+        return false;
+    };
+    control.sender.send(Msg::OpenBrowser { group_uuid }).is_ok()
+}
+
 /// Handle one invocation — the local one on a plain GUI start, or a remote
 /// one forwarded over the session bus by a second launch of the binary.
 ///
@@ -155,6 +164,14 @@ pub fn handle_command_line(
                 return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
             }
         }
+        // The endpoint arrives in the group's tmux sessions once the browser
+        // is up; the caller reads it from there, so nothing is printed.
+        Some(Action::OpenBrowser { group_uuid }) => {
+            if !request_open_browser(group_uuid) {
+                command_line.printerr_literal("kabelsalat: no window to open a browser in\n");
+                return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
+            }
+        }
         None => {}
     }
 
@@ -186,5 +203,10 @@ mod tests {
     #[test]
     fn a_rename_request_without_a_gui_is_refused() {
         assert!(!request_rename("aaa-111".into(), "frontend".into()));
+    }
+
+    #[test]
+    fn an_open_browser_request_without_a_gui_is_refused() {
+        assert!(!request_open_browser("aaa-111".into()));
     }
 }

@@ -563,6 +563,32 @@ pub fn reconcile_local(saved: &SavedState, live: &[String], dead: &[DeadPane]) -
     reconcile(&local, live, dead)
 }
 
+/// The tabs `kabelsalat resume` recreates right after boot: the local tabs
+/// [`reconcile_local`] would respawn that carry a claude session. Plain
+/// shells are left to the GUI — started at boot they would only lack the
+/// desktop's environment — and a tab whose session is live is already
+/// somebody's. Saved order, so the GUI attaches them in the order it shows.
+pub fn boot_resume_plan(saved: &SavedState, live: &[String]) -> Vec<SavedTab> {
+    reconcile_local(saved, live, &[])
+        .respawn
+        .into_iter()
+        .filter(|tab| tab.claude.is_some())
+        .collect()
+}
+
+/// The command a boot-time resume runs: the claude's [`ClaudeSession::resume_argv`]
+/// behind a login shell. The user manager's environment has no `~/.cargo/bin`
+/// and nothing from `.profile`; `$SHELL -l` brings that back without touching
+/// any rc file. The words of `resume_argv` are a program name, a flag and a
+/// session id — nothing a shell would reinterpret — so they are joined bare.
+pub fn boot_resume_argv(shell: &str, session: &ClaudeSession) -> Vec<String> {
+    vec![
+        shell.to_string(),
+        "-lc".into(),
+        format!("exec {}", session.resume_argv().join(" ")),
+    ]
+}
+
 /// Every remote host that has at least one saved tab, once, in group order:
 /// the hosts to connect at startup. A host known only from its pending kills
 /// is not connected unasked; its queue flushes on the next connect.
@@ -1539,5 +1565,77 @@ mod tests {
         }
         assert_eq!(remote_hosts(&state), ["me@box", "b-host"]);
         assert!(remote_hosts(&sample_state()).is_empty());
+    }
+
+    // --- boot resume (kabelsalat resume) ---
+
+    fn claude_tab(uuid: &str, group: usize) -> SavedTab {
+        SavedTab {
+            uuid: uuid.into(),
+            group,
+            title: "claude".into(),
+            last_activity: None,
+            last_title: None,
+            claude: Some(ClaudeSession {
+                id: format!("sess-{uuid}"),
+                cwd: PathBuf::from(format!("/home/me/{uuid}")),
+            }),
+        }
+    }
+
+    #[test]
+    fn boot_plan_keeps_only_local_claude_tabs_whose_session_is_gone() {
+        let mut state = sample_state();
+        state.groups.push(SavedGroup {
+            uuid: "g-remote".into(),
+            id: 7,
+            name: "box".into(),
+            palette: 0,
+            browser_open: false,
+            browser_split: DEFAULT_BROWSER_SPLIT,
+            default_url: None,
+            host: Some("me@box".into()),
+        });
+        // aaa/bbb/ccc are plain shells. Add a resumable claude, a claude that
+        // is still live, and a claude on a remote host.
+        state.tabs.push(claude_tab("gone", 1));
+        state.tabs.push(claude_tab("live", 1));
+        state.tabs.push(claude_tab("far", 7));
+        let plan = boot_resume_plan(&state, &["live".to_string(), "bbb".to_string()]);
+        let uuids: Vec<&str> = plan.iter().map(|t| t.uuid.as_str()).collect();
+        assert_eq!(uuids, vec!["gone"]);
+    }
+
+    #[test]
+    fn boot_plan_is_empty_without_claude_tabs() {
+        assert!(boot_resume_plan(&sample_state(), &[]).is_empty());
+    }
+
+    #[test]
+    fn boot_plan_keeps_saved_order() {
+        let mut state = sample_state();
+        state.tabs.push(claude_tab("second", 1));
+        state.tabs.insert(0, claude_tab("first", 0));
+        let plan = boot_resume_plan(&state, &[]);
+        let uuids: Vec<&str> = plan.iter().map(|t| t.uuid.as_str()).collect();
+        assert_eq!(uuids, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn boot_resume_runs_through_a_login_shell() {
+        // The user manager's environment has no ~/.cargo/bin and nothing from
+        // .profile; a login shell brings that back without touching rc files.
+        let session = ClaudeSession {
+            id: "abc-123".into(),
+            cwd: PathBuf::from("/home/me/proj"),
+        };
+        assert_eq!(
+            boot_resume_argv("/bin/zsh", &session),
+            vec![
+                "/bin/zsh".to_string(),
+                "-lc".into(),
+                "exec claude --resume abc-123".into()
+            ]
+        );
     }
 }

@@ -38,12 +38,20 @@ This file provides guidance to Claude Code when working with code in this reposi
   it is where the CLI's unit tests live. `src/control.rs` holds the gio glue and
   the group snapshot the command-line handler reads.
 - A CLI-created tab must not steal focus: no activate, no window raise, no
-  active-group change, and no touching the group's browser pane.
+  active-group change, and no touching the group's browser pane. `kabelsalat
+  browser` is the one command that touches a pane — only the named group's,
+  brought up hidden unless that group is active — under the same no-focus,
+  no-raise, no-switch rules.
+- `src/autostart.rs` is pure over the facts it is handed (unit text, status
+  classification, dialog responses) plus thin `systemctl --user` runners;
+  `src/resume.rs` is the `kabelsalat resume` glue and never writes
+  `state.json` — the GUI stays the state file's single writer.
 
 ## Runtime facts
 
 - State: `$XDG_STATE_HOME/kabelsalat/state.json` (fallback `~/.local/state`), written atomically.
 - Private tmux server socket: `$XDG_RUNTIME_DIR/kabelsalat/tmux.sock`, launched under `systemd-run --user --scope --collect`. Full logout survival additionally needs `loginctl enable-linger`.
+- Boot resume (opt-in, from the primary menu): `$XDG_CONFIG_HOME/systemd/user/kabelsalat-resume.service`, a oneshot running `kabelsalat resume`, which recreates the claude sessions of saved tabs on the tmux server without a GUI. Its state is read from the system (file, `is-enabled`, lingering), never persisted.
 
 ## Licensing
 

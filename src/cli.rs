@@ -14,6 +14,16 @@ pub const EXIT_NOT_RUNNING: u8 = 1;
 pub const EXIT_USAGE: u8 = 2;
 /// `--group` matched no group, or matched more than one.
 pub const EXIT_GROUP: u8 = 3;
+/// `resume` could not reach tmux, start the server, or create a session.
+pub const EXIT_FAILED: u8 = 4;
+
+/// The variable every tab's tmux session carries: its group's uuid. Set by
+/// the GUI at session creation and refreshed on every move; read back by
+/// `browser` as the default group, and by agents (see the skill).
+pub const ENV_GROUP: &str = "KABELSALAT_GROUP";
+/// The variable that carries a group browser's CDP endpoint while it is up
+/// (`http://127.0.0.1:<port>`), alongside `PLAYWRIGHT_MCP_CDP_ENDPOINT`.
+pub const ENV_CDP: &str = "KABELSALAT_CDP";
 
 /// What an invocation asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +32,16 @@ pub enum Cli {
     Gui,
     Help,
     Groups,
+    /// Bring up a group's browser pane, or print its live CDP endpoint.
+    Browser {
+        /// A group uuid or name; `None` until `with_default_group` fills it
+        /// from the caller's `KABELSALAT_GROUP`.
+        group: Option<String>,
+    },
+    /// Recreate the claude sessions of saved tabs on the private tmux
+    /// server, without a GUI: what the boot unit runs. Handled entirely in
+    /// the calling process; against a running GUI it does nothing.
+    Resume,
     Run {
         /// A group uuid or name, resolved later against the live instance.
         group: String,
@@ -46,19 +66,43 @@ impl Cli {
     /// Whether answering this needs the running GUI. `Gui` and `Help` are
     /// handled entirely in the calling process.
     pub fn needs_instance(&self) -> bool {
-        matches!(self, Cli::Groups | Cli::Run { .. } | Cli::Rename { .. })
+        matches!(
+            self,
+            Cli::Groups | Cli::Run { .. } | Cli::Rename { .. } | Cli::Browser { .. }
+        )
+    }
+}
+
+/// Fill `browser`'s group from the caller's environment when `--group` was
+/// not given: a tab's shell carries its group in `KABELSALAT_GROUP`, so an
+/// agent in a tab need not name the group it sits in. Outside a tab there
+/// is nothing to default to, and that is a usage error. Every other command
+/// passes through untouched.
+pub fn with_default_group(cli: Cli, env_group: Option<&str>) -> Result<Cli, UsageError> {
+    match cli {
+        Cli::Browser { group: None } => match env_group.filter(|g| !g.is_empty()) {
+            Some(group) => Ok(Cli::Browser {
+                group: Some(group.to_string()),
+            }),
+            None => Err(UsageError(format!(
+                "browser needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)"
+            ))),
+        },
+        other => Ok(other),
     }
 }
 
 /// One group as the CLI sees it: the stable uuid, the (possibly empty,
-/// possibly duplicated) name, how many tabs it holds, and — for a remote
-/// group — the ssh destination its tabs run on.
+/// possibly duplicated) name, how many tabs it holds, for a remote group
+/// the ssh destination its tabs run on, and the live CDP endpoint of its
+/// browser when it has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupInfo {
     pub uuid: String,
     pub name: String,
     pub tabs: usize,
     pub host: Option<String>,
+    pub cdp: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +151,11 @@ Usage:
   kabelsalat run -g <group> [--create] [--cwd DIR] -- CMD [ARGS...]
                                                Run CMD in a new tab of <group>
   kabelsalat rename <group> <new-name>         Rename an existing group
+  kabelsalat browser [-g <group>]              Open <group>'s browser pane, or print its live
+                                               CDP endpoint; <group> defaults to the caller's
+                                               KABELSALAT_GROUP
+  kabelsalat resume                            Recreate saved claude sessions on the tmux
+                                               server without a GUI (what the boot unit runs)
 
 Options for run:
   -g, --group <name|uuid>   Target group. A uuid always wins; otherwise the
@@ -120,7 +169,8 @@ Options for run:
 
 Exit codes:
   0 success   1 kabelsalat not running   2 usage error
-  3 group not found, ambiguous, or the new name is already taken
+  3 group not found, ambiguous, remote (browser), or the new name is already taken
+  4 resume could not reach tmux
 "
 }
 
@@ -144,8 +194,38 @@ pub fn parse(args: &[String]) -> Result<Cli, UsageError> {
         }
         "run" => parse_run(&rest[1..]),
         "rename" => parse_rename(&rest[1..]),
+        "browser" => parse_browser(&rest[1..]),
+        "resume" => {
+            if rest.len() > 1 {
+                return Err(UsageError(format!(
+                    "resume takes no arguments (got '{}')",
+                    rest[1]
+                )));
+            }
+            Ok(Cli::Resume)
+        }
         other => Err(UsageError(format!("unknown command '{other}'"))),
     }
+}
+
+/// `browser [-g <group>]`: at most the group flag, nothing positional.
+fn parse_browser(args: &[String]) -> Result<Cli, UsageError> {
+    let mut group: Option<String> = None;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "--group" | "-g" => {
+                let value = args
+                    .get(i + 1)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| UsageError(format!("{arg} needs a value")))?;
+                group = Some(value.clone());
+                i += 2;
+            }
+            other => return Err(UsageError(format!("unknown argument '{other}'"))),
+        }
+    }
+    Ok(Cli::Browser { group })
 }
 
 /// Flags of `run`, up to the mandatory `--`. The separator is required: without
@@ -272,6 +352,12 @@ pub enum Action {
         group_uuid: String,
         name: String,
     },
+    /// Bring up this group's browser. Like `Spawn`, inert otherwise: no
+    /// focus, no raise, no active-group change; a non-active group's
+    /// browser comes up hidden, as a restored one does.
+    OpenBrowser {
+        group_uuid: String,
+    },
 }
 
 /// The complete result of an invocation: what to print, what to exit with,
@@ -362,6 +448,56 @@ pub fn dispatch(cli: &Cli, groups: &[GroupInfo], caller_cwd: &Path) -> Outcome {
                 }),
             }
         }
+        // control.rs fills the default before dispatching; this is only
+        // reached by a caller that skipped that step.
+        Cli::Browser { group: None } => Outcome::fail(
+            EXIT_USAGE,
+            format!("browser needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)\n"),
+        ),
+        Cli::Browser { group: Some(group) } => {
+            let target = match resolve_group(groups, group) {
+                Ok(found) => found,
+                Err(err) => return resolve_failure(group, err),
+            };
+            // The pane is a local widget; a loopback endpoint means nothing
+            // on the host a remote group's tabs run on.
+            if let Some(host) = &target.host {
+                return Outcome::fail(
+                    EXIT_GROUP,
+                    format!("the browser pane is local, but '{group}' runs on {host}\n"),
+                );
+            }
+            match &target.cdp {
+                // Already up: the endpoint is the answer, nothing to ask for.
+                Some(url) => Outcome::ok(format!("{url}\n")),
+                None => Outcome {
+                    stdout: String::new(),
+                    stderr: format!(
+                        "kabelsalat: bringing up the browser of group '{}'; read {ENV_CDP} \
+                         from `tmux show-environment` once it is there\n",
+                        if target.name.is_empty() {
+                            &target.uuid
+                        } else {
+                            &target.name
+                        }
+                    ),
+                    code: EXIT_OK,
+                    action: Some(Action::OpenBrowser {
+                        group_uuid: target.uuid.clone(),
+                    }),
+                },
+            }
+        }
+        // Reaching the GUI means it is running, and then the sessions are
+        // its to manage: nothing to do, and nothing wrong.
+        Cli::Resume => Outcome {
+            stdout: String::new(),
+            stderr: "kabelsalat: the GUI is running and manages the sessions itself; \
+                     nothing to resume\n"
+                .into(),
+            code: EXIT_OK,
+            action: None,
+        },
         Cli::Rename { group, name } => {
             let target = match resolve_group(groups, group) {
                 Ok(found) => found,
@@ -531,24 +667,28 @@ mod tests {
                 name: "web".into(),
                 tabs: 2,
                 host: None,
+                cdp: None,
             },
             GroupInfo {
                 uuid: "bbb-222".into(),
                 name: "api".into(),
                 tabs: 1,
                 host: None,
+                cdp: None,
             },
             GroupInfo {
                 uuid: "ccc-333".into(),
                 name: "api".into(),
                 tabs: 3,
                 host: None,
+                cdp: None,
             },
             GroupInfo {
                 uuid: "ddd-444".into(),
                 name: String::new(),
                 tabs: 1,
                 host: None,
+                cdp: None,
             },
         ]
     }
@@ -597,12 +737,14 @@ mod tests {
                 name: "other".into(),
                 tabs: 1,
                 host: None,
+                cdp: None,
             },
             GroupInfo {
                 uuid: "qqq".into(),
                 name: "xyz".into(),
                 tabs: 1,
                 host: None,
+                cdp: None,
             },
         ];
         assert_eq!(resolve_group(&groups, "xyz").unwrap().uuid, "xyz");
@@ -876,12 +1018,14 @@ mod tests {
                 name: "box".into(),
                 tabs: 1,
                 host: Some("me@box".into()),
+                cdp: None,
             },
             GroupInfo {
                 uuid: "lll-666".into(),
                 name: "here".into(),
                 tabs: 1,
                 host: None,
+                cdp: None,
             },
         ]
     }
@@ -944,5 +1088,164 @@ mod tests {
     #[test]
     fn help_explains_cwd_on_remote_groups() {
         assert!(help_text().contains("remote"));
+    }
+
+    // --- browser and resume ---
+
+    #[test]
+    fn browser_parses_with_and_without_a_group() {
+        assert_eq!(parse(&args(&["browser"])), Ok(Cli::Browser { group: None }));
+        assert_eq!(
+            parse(&args(&["browser", "-g", "web"])),
+            Ok(Cli::Browser {
+                group: Some("web".into())
+            })
+        );
+        assert_eq!(
+            parse(&args(&["browser", "--group", "aaa-111"])),
+            Ok(Cli::Browser {
+                group: Some("aaa-111".into())
+            })
+        );
+    }
+
+    #[test]
+    fn browser_rejects_stray_arguments() {
+        assert!(parse(&args(&["browser", "--group"])).is_err());
+        assert!(parse(&args(&["browser", "-g", ""])).is_err());
+        assert!(parse(&args(&["browser", "extra"])).is_err());
+        assert!(parse(&args(&["browser", "-g", "web", "extra"])).is_err());
+    }
+
+    #[test]
+    fn resume_takes_no_arguments_and_needs_no_instance() {
+        assert_eq!(parse(&args(&["resume"])), Ok(Cli::Resume));
+        assert!(parse(&args(&["resume", "now"])).is_err());
+        assert!(!Cli::Resume.needs_instance());
+        assert!(Cli::Browser { group: None }.needs_instance());
+    }
+
+    #[test]
+    fn the_callers_group_variable_fills_a_missing_group() {
+        let filled = with_default_group(Cli::Browser { group: None }, Some("aaa-111"));
+        assert_eq!(
+            filled,
+            Ok(Cli::Browser {
+                group: Some("aaa-111".into())
+            })
+        );
+        // An explicit --group wins over the environment.
+        let explicit = with_default_group(
+            Cli::Browser {
+                group: Some("web".into()),
+            },
+            Some("aaa-111"),
+        );
+        assert_eq!(
+            explicit,
+            Ok(Cli::Browser {
+                group: Some("web".into())
+            })
+        );
+        // Outside a kabelsalat tab there is nothing to default to.
+        assert!(with_default_group(Cli::Browser { group: None }, None).is_err());
+        assert!(with_default_group(Cli::Browser { group: None }, Some("")).is_err());
+        // Other commands pass through untouched.
+        assert_eq!(with_default_group(Cli::Groups, None), Ok(Cli::Groups));
+    }
+
+    fn browser_groups() -> Vec<GroupInfo> {
+        vec![
+            GroupInfo {
+                uuid: "aaa-111".into(),
+                name: "web".into(),
+                tabs: 2,
+                host: None,
+                cdp: Some("http://127.0.0.1:40455".into()),
+            },
+            GroupInfo {
+                uuid: "bbb-222".into(),
+                name: "api".into(),
+                tabs: 1,
+                host: None,
+                cdp: None,
+            },
+            GroupInfo {
+                uuid: "rrr-555".into(),
+                name: "box".into(),
+                tabs: 1,
+                host: Some("me@box".into()),
+                cdp: None,
+            },
+        ]
+    }
+
+    fn browser(group: &str) -> Cli {
+        Cli::Browser {
+            group: Some(group.into()),
+        }
+    }
+
+    #[test]
+    fn browser_prints_a_live_endpoint_without_asking_the_gui() {
+        let out = dispatch(&browser("web"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "http://127.0.0.1:40455\n");
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn browser_asks_the_gui_to_open_a_missing_one() {
+        let out = dispatch(&browser("bbb-222"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert_eq!(
+            out.action,
+            Some(Action::OpenBrowser {
+                group_uuid: "bbb-222".into()
+            })
+        );
+    }
+
+    #[test]
+    fn browser_refuses_a_remote_group() {
+        let out = dispatch(&browser("box"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+        assert!(out.stderr.contains("me@box"), "stderr was: {}", out.stderr);
+    }
+
+    #[test]
+    fn browser_on_an_unknown_group_fails_like_run() {
+        let out = dispatch(&browser("nope"), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn a_browser_without_any_group_is_a_usage_error_at_dispatch_too() {
+        // control.rs fills the default first; this is the belt to that brace.
+        let out = dispatch(
+            &Cli::Browser { group: None },
+            &browser_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_USAGE);
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn resume_against_a_running_gui_is_a_noop_success() {
+        let out = dispatch(&Cli::Resume, &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.action.is_none());
+        assert!(!out.stderr.is_empty());
+    }
+
+    #[test]
+    fn help_lists_browser_and_resume() {
+        assert!(help_text().contains("kabelsalat browser"));
+        assert!(help_text().contains("kabelsalat resume"));
+        assert!(help_text().contains(&format!("{EXIT_FAILED} ")));
     }
 }

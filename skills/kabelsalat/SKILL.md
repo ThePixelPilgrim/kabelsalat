@@ -81,7 +81,7 @@ anything.
 | 0 | Tab created | Tell the user which group it went to |
 | 1 | kabelsalat is not running | Report this to the user and stop. Do not retry, and do not try to start it — that is theirs to do |
 | 2 | Usage error | Fix the invocation; check `--` is present |
-| 3 | Group not found, ambiguous, or (rename) name already in use | Re-run `kabelsalat groups` and retry with a uuid, or pick a different name |
+| 3 | Group not found, ambiguous, (rename) name already in use, or (browser) a remote group | Re-run `kabelsalat groups` and retry with a uuid, or pick a different name |
 
 ## After launching
 
@@ -116,6 +116,22 @@ A leading `-` in the output means the variable is unset (no browser running).
 If `show-environment` reports no `KABELSALAT_GROUP` at all, the tab predates
 the feature or lost its stamp — say so to the user instead of guessing a
 group.
+
+### Bringing the browser up
+
+The browser is transient: it may never have been opened, and a crashed one
+is not restarted by anything. When `KABELSALAT_CDP` is unset, ask for it:
+
+    kabelsalat browser            # the group is taken from your KABELSALAT_GROUP
+    kabelsalat browser -g <name|uuid>
+
+If the browser is already up, the endpoint is printed and you are done.
+Otherwise nothing is printed and the pane is being brought up — hidden
+unless the user is looking at that group, and without taking their focus.
+Poll `tmux show-environment KABELSALAT_CDP` about once a second for up to
+ten seconds until it is set. Exit 1 means kabelsalat's window is not running,
+and without it there can be no browser: tell the user and stop. Exit 3
+means a remote group, whose browser pane does not exist.
 
 Drive the browser from a script — Python or JavaScript against stock
 Playwright, connecting to `KABELSALAT_CDP`. **Do not use a Playwright MCP

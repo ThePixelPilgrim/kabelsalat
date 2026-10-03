@@ -5,12 +5,14 @@ use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 mod app;
+pub mod autostart;
 pub mod browser;
 pub mod claude;
 mod cli;
 mod control;
 pub mod remote;
 pub mod remote_worker;
+mod resume;
 pub mod state;
 pub mod tmuxctl;
 
@@ -73,6 +75,38 @@ pub fn run() {
         print!("{}", cli::help_text());
         return;
     }
+    if parsed == cli::Cli::Resume {
+        // The boot unit's path: no display, no GTK, no GApplication. A GUI
+        // that is already running owns the sessions, so it is asked about
+        // first, the same way the subcommands do; an unreachable bus means
+        // there is none.
+        let running = instance_is_running().unwrap_or(false);
+        std::process::exit(resume::run(running).into());
+    }
+    // `browser` without --group takes the caller's KABELSALAT_GROUP. That is
+    // resolved here, in the caller's own environment — GApplication does not
+    // ship the environment to the primary instance — and forwarded as an
+    // explicit --group. The usage error for "no group at all" belongs here
+    // too, before anything touches the bus.
+    let parsed =
+        match cli::with_default_group(parsed, std::env::var(cli::ENV_GROUP).ok().as_deref()) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!("kabelsalat: {}", err.0);
+                std::process::exit(cli::EXIT_USAGE.into());
+            }
+        };
+    let args = match &parsed {
+        cli::Cli::Browser { group: Some(group) } => {
+            vec![
+                args[0].clone(),
+                "browser".into(),
+                "-g".into(),
+                group.clone(),
+            ]
+        }
+        _ => args,
+    };
 
     // Constructing a GtkApplication is safe before GTK is initialised (the
     // gtk4 builder has no init assertion), so the subcommand path below never
