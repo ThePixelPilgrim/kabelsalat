@@ -83,9 +83,13 @@ second idiom:
 - **Resume agent sessions at boot…** with a dimmed status line: *Off*, *On*,
   *At login only* (installed, lingering off), *Needs repair*. Insensitive with
   a tooltip when tmux or `systemctl --user` is unavailable.
-- **Keep shells running after logout…** opens the existing linger dialog.
-  The warning icon stays as the first-time hint; the menu is the permanent
-  way back once the icon is dismissed.
+- **Keep shells running after logout…** has a status line of its own, *On*
+  or *Off*, re-read from `loginctl show-user` each time the dialog opens.
+  While lingering is off it opens the existing linger offer (Not now /
+  Don't show again / Enable); once it is on, a dialog stating the fact with
+  Close / Disable, which runs `loginctl disable-linger`. Either change is
+  confirmed with a toast. The warning icon stays as the first-time hint;
+  the menu is the permanent way back once the icon is dismissed.
 - **Keyboard shortcuts**, moved here from the `help-about-symbolic` button,
   which is the About icon.
 

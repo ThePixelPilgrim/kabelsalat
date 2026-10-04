@@ -146,11 +146,21 @@ pub fn detect_linger() -> LingerStatus {
     }
 }
 
-/// Enable lingering for the current user (`loginctl enable-linger <user>`).
-pub fn enable_linger() -> Result<(), TmuxError> {
+/// The `loginctl` verb that turns lingering on or off.
+pub fn linger_verb(enabled: bool) -> &'static str {
+    if enabled {
+        "enable-linger"
+    } else {
+        "disable-linger"
+    }
+}
+
+/// Enable or disable lingering for the current user
+/// (`loginctl enable-linger <user>` / `loginctl disable-linger <user>`).
+pub fn set_linger(enabled: bool) -> Result<(), TmuxError> {
     let user = current_user().ok_or_else(|| TmuxError::Command("no current user".into()))?;
     let output = Command::new("loginctl")
-        .args(["enable-linger", &user])
+        .args([linger_verb(enabled), &user])
         .output()?;
     if output.status.success() {
         Ok(())
@@ -1368,6 +1378,12 @@ mod tests {
         assert_eq!(parse_linger("Linger=yes"), Some(true));
         assert_eq!(parse_linger("Linger=no\n"), Some(false));
         assert_eq!(parse_linger("Linger=yes\n"), Some(true));
+    }
+
+    #[test]
+    fn linger_verb_enables_or_disables() {
+        assert_eq!(linger_verb(true), "enable-linger");
+        assert_eq!(linger_verb(false), "disable-linger");
     }
 
     #[test]
