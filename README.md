@@ -58,7 +58,9 @@ Written in Rust using [relm4](https://relm4.org/), [libadwaita] and
   (`systemd-run --user --scope`). If lingering is disabled for your user, a
   header-bar icon explains what `loginctl enable-linger` adds and its
   trade-offs, and can enable it for you; the hint can be dismissed
-  permanently.
+  permanently. The primary menu's *Keep shells running after logout…* entry
+  shows whether lingering is on or off, opens the same offer while it is
+  off, and turns it off again once it is on.
 - **Without tmux** (or tmux < 3.2) everything still works — plain shells,
   no session survival — and a warning icon explains what installing tmux
   enables.

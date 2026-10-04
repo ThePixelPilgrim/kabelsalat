@@ -221,6 +221,130 @@ pub fn dialog_body(status: Status, path: &Path) -> String {
     }
 }
 
+// --- Lingering: the "Keep shells running after logout…" entry ------------
+//
+// The same shape as the boot-resume dialog above: the detected
+// `LingerStatus` decides the menu caption, the heading, the body and the
+// responses, so the dialog says whether lingering is on and offers the one
+// change that makes sense from there.
+
+/// The caption under the menu entry.
+pub fn linger_status_label(status: LingerStatus) -> &'static str {
+    match status {
+        LingerStatus::Enabled => "On",
+        LingerStatus::Disabled => "Off",
+        LingerStatus::NotApplicable => "Unavailable",
+    }
+}
+
+/// A response of the linger dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LingerResponse {
+    NotNow,
+    /// Hide the header-bar hint for good; never enables anything.
+    Dismiss,
+    Enable,
+    Close,
+    Disable,
+}
+
+impl LingerResponse {
+    pub fn id(self) -> &'static str {
+        match self {
+            LingerResponse::NotNow => "not-now",
+            LingerResponse::Dismiss => "dismiss",
+            LingerResponse::Enable => "enable",
+            LingerResponse::Close => "close",
+            LingerResponse::Disable => "disable",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LingerResponse::NotNow => "Not now",
+            LingerResponse::Dismiss => "Don't show again",
+            LingerResponse::Enable => "Enable",
+            LingerResponse::Close => "Close",
+            LingerResponse::Disable => "Disable",
+        }
+    }
+
+    pub fn appearance(self) -> Appearance {
+        match self {
+            LingerResponse::Enable => Appearance::Suggested,
+            LingerResponse::Disable => Appearance::Destructive,
+            LingerResponse::NotNow | LingerResponse::Dismiss | LingerResponse::Close => {
+                Appearance::Default
+            }
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        [
+            LingerResponse::NotNow,
+            LingerResponse::Dismiss,
+            LingerResponse::Enable,
+            LingerResponse::Close,
+            LingerResponse::Disable,
+        ]
+        .into_iter()
+        .find(|response| response.id() == id)
+    }
+}
+
+/// The responses the linger dialog offers in each state, in display order.
+/// The first one is also the close response (Escape).
+pub fn linger_responses(status: LingerStatus) -> Vec<LingerResponse> {
+    use LingerResponse::*;
+    match status {
+        LingerStatus::Disabled => vec![NotNow, Dismiss, Enable],
+        LingerStatus::Enabled => vec![Close, Disable],
+        LingerStatus::NotApplicable => vec![Close],
+    }
+}
+
+/// A question while lingering is off, a statement once it is on.
+pub fn linger_dialog_heading(status: LingerStatus) -> &'static str {
+    match status {
+        LingerStatus::Disabled => "Keep shells running after logout?",
+        LingerStatus::Enabled => "Shells keep running after logout",
+        LingerStatus::NotApplicable => "Keep shells running after logout",
+    }
+}
+
+/// The linger dialog's body. The offer (`Disabled`) is ordered per the
+/// spec: what enabling adds comes first, then the honest, non-dramatized
+/// downsides (background footprint, unattended processes on shared
+/// machines, persisting state), closing with reversibility.
+pub fn linger_dialog_body(status: LingerStatus) -> String {
+    match status {
+        LingerStatus::Disabled => "Enabling lingering keeps your shells running after you log out \
+             and back in, not only when kabelsalat is closed, crashes, or is upgraded.\n\n\
+             In exchange:\n\
+             \u{2022} A small, permanent background footprint: your user service \
+             manager and enabled user services keep running while you are logged out.\n\
+             \u{2022} \u{201c}Logged out\u{201d} no longer means nothing of yours is \
+             running \u{2014} long-running processes and agents keep going unattended, \
+             worth considering on a shared machine.\n\
+             \u{2022} State that a fresh login used to clear can persist between \
+             sessions.\n\n\
+             You can turn this off again at any time from this dialog or with \
+             `loginctl disable-linger`."
+            .to_string(),
+        LingerStatus::Enabled => "Lingering is enabled for your user: your user service manager, \
+             and with it the tmux server behind your tabs, keeps running while you are \
+             logged out, so shells and agent sessions survive logout and are there again \
+             when you log in.\n\n\
+             Disable runs `loginctl disable-linger`. Nothing is stopped right away, but \
+             from your next logout on shells end with the session, and a boot-resume \
+             unit, if installed, only runs once you log in."
+            .to_string(),
+        LingerStatus::NotApplicable => "Keeping shells running after logout needs tmux and \
+             systemd-logind (`loginctl`), which this system does not provide."
+            .to_string(),
+    }
+}
+
 // --- I/O: the system's answers, and the two changes ---------------------
 
 /// Whether `systemctl` exists at all. Whether the *user* manager answers is
@@ -565,5 +689,115 @@ mod tests {
         assert!(!parse_is_enabled("not-found\n"));
         assert!(!parse_is_enabled("enabled-runtime\n"));
         assert!(!parse_is_enabled(""));
+    }
+
+    // --- the "Keep shells running after logout…" entry -------------------
+
+    #[test]
+    fn linger_labels_say_on_off_or_unavailable() {
+        assert_eq!(linger_status_label(LingerStatus::Enabled), "On");
+        assert_eq!(linger_status_label(LingerStatus::Disabled), "Off");
+        assert_eq!(
+            linger_status_label(LingerStatus::NotApplicable),
+            "Unavailable"
+        );
+    }
+
+    #[test]
+    fn linger_responses_offer_enable_when_off_and_disable_when_on() {
+        use LingerResponse::*;
+        assert_eq!(
+            linger_responses(LingerStatus::Disabled),
+            vec![NotNow, Dismiss, Enable]
+        );
+        assert_eq!(
+            linger_responses(LingerStatus::Enabled),
+            vec![Close, Disable]
+        );
+        assert_eq!(linger_responses(LingerStatus::NotApplicable), vec![Close]);
+    }
+
+    #[test]
+    fn only_enable_is_suggested_and_only_disable_destructive() {
+        for status in [
+            LingerStatus::Enabled,
+            LingerStatus::Disabled,
+            LingerStatus::NotApplicable,
+        ] {
+            for response in linger_responses(status) {
+                assert_eq!(
+                    response.appearance() == Appearance::Suggested,
+                    response == LingerResponse::Enable,
+                    "{response:?}"
+                );
+                assert_eq!(
+                    response.appearance() == Appearance::Destructive,
+                    response == LingerResponse::Disable,
+                    "{response:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linger_response_ids_are_distinct_and_round_trip() {
+        use LingerResponse::*;
+        let all = [NotNow, Dismiss, Enable, Close, Disable];
+        for (i, a) in all.iter().enumerate() {
+            assert_eq!(LingerResponse::from_id(a.id()), Some(*a));
+            for b in &all[i + 1..] {
+                assert_ne!(a.id(), b.id());
+            }
+        }
+        assert_eq!(LingerResponse::from_id("nope"), None);
+    }
+
+    #[test]
+    fn linger_heading_asks_when_off_and_states_the_fact_when_on() {
+        assert!(linger_dialog_heading(LingerStatus::Disabled).ends_with('?'));
+        assert!(!linger_dialog_heading(LingerStatus::Enabled).ends_with('?'));
+    }
+
+    #[test]
+    fn linger_body_puts_enables_before_downsides() {
+        let body = linger_dialog_body(LingerStatus::Disabled);
+        let enables = body
+            .find("keeps your shells running after you log out")
+            .expect("enables clause present");
+        let downside = body
+            .find("permanent background footprint")
+            .expect("downside clause present");
+        assert!(enables < downside, "enables must precede downsides");
+    }
+
+    #[test]
+    fn linger_body_mentions_logout_survival() {
+        let body = linger_dialog_body(LingerStatus::Disabled);
+        assert!(body.contains("log out"));
+        assert!(body.contains("crashes"));
+    }
+
+    #[test]
+    fn linger_body_mentions_downsides_and_shared_machine() {
+        let body = linger_dialog_body(LingerStatus::Disabled);
+        assert!(body.contains("background footprint"));
+        assert!(body.contains("shared machine"));
+        assert!(body.contains("unattended"));
+    }
+
+    #[test]
+    fn linger_body_mentions_reversibility_via_disable_linger() {
+        let body = linger_dialog_body(LingerStatus::Disabled);
+        assert!(body.contains("disable-linger"));
+    }
+
+    #[test]
+    fn the_enabled_body_says_it_is_on_and_what_disable_does() {
+        let body = linger_dialog_body(LingerStatus::Enabled);
+        assert!(body.contains("enabled"), "{body}");
+        assert!(body.contains("Disable"), "{body}");
+        assert!(body.contains("log in"), "{body}");
+        let unavailable = linger_dialog_body(LingerStatus::NotApplicable);
+        assert!(unavailable.contains("loginctl"), "{unavailable}");
     }
 }

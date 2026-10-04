@@ -564,13 +564,16 @@ pub enum Msg {
     RestartTab(usize),
     /// Open the "tmux unavailable" explanation dialog.
     ShowTmuxWarning,
-    /// Open the "shells won't survive logout" (linger) explanation dialog.
+    /// Re-read the linger state and open the "keep shells running after
+    /// logout" dialog for it: the offer while it is off, the fact plus
+    /// Disable once it is on.
     ShowLingerWarning,
-    /// Run `loginctl enable-linger`, re-check, and hide the icon on success.
-    EnableLinger,
-    /// Result of the off-thread `enable_linger` + re-check: the new linger
-    /// status on success, or the failure message.
-    LingerEnabled(Result<LingerStatus, String>),
+    /// Run `loginctl enable-linger` (`true`) or `disable-linger` (`false`)
+    /// and re-check.
+    SetLinger(bool),
+    /// Result of the off-thread `set_linger` + re-check: what was asked
+    /// for, and the new linger status on success or the failure message.
+    LingerChanged(bool, Result<LingerStatus, String>),
     /// Permanently hide the linger warning (persists the dismissal flag).
     DismissLingerWarning,
     /// Open the "resume agent sessions at boot" dialog from the primary menu.
@@ -623,7 +626,7 @@ pub enum Msg {
     /// tab that was active when the capture was asked for — the readback can
     /// take seconds, and the paste belongs to that tab or to none.
     ///
-    /// The error is already rendered to text, like [`Msg::LingerEnabled`]'s:
+    /// The error is already rendered to text, like [`Msg::LingerChanged`]'s:
     /// klamottenkiste's `CaptureError` is not `Clone`, and both failure kinds
     /// mean the same thing here — a toast and a line on stderr.
     ScreenshotCaptured(usize, Result<CapturedFrame, String>),
@@ -753,9 +756,19 @@ impl SimpleComponent for App {
                                 },
 
                                 #[wrap(Some)]
-                                set_child = &gtk::Label {
-                                    set_label: "Keep shells running after logout…",
-                                    set_halign: gtk::Align::Start,
+                                set_child = &gtk::Box {
+                                    set_orientation: gtk::Orientation::Vertical,
+                                    gtk::Label {
+                                        set_label: "Keep shells running after logout…",
+                                        set_halign: gtk::Align::Start,
+                                    },
+                                    gtk::Label {
+                                        #[watch]
+                                        set_label: autostart::linger_status_label(model.linger),
+                                        set_halign: gtk::Align::Start,
+                                        add_css_class: "dim-label",
+                                        add_css_class: "caption",
+                                    },
                                 },
                             },
 
@@ -1347,8 +1360,8 @@ impl SimpleComponent for App {
             Msg::RestartTab(id) => self.restart_tab(id),
             Msg::ShowTmuxWarning => self.show_tmux_warning(),
             Msg::ShowLingerWarning => self.show_linger_warning(),
-            Msg::EnableLinger => self.enable_linger(),
-            Msg::LingerEnabled(result) => self.on_linger_enabled(result),
+            Msg::SetLinger(enabled) => self.set_linger(enabled),
+            Msg::LingerChanged(wanted, result) => self.on_linger_changed(wanted, result),
             Msg::DismissLingerWarning => self.linger_dismissed = true,
             // The boot-resume state lives on the system, not in the state
             // file, so none of these four need the save at the bottom.
@@ -1361,7 +1374,7 @@ impl SimpleComponent for App {
                 // A unit without lingering only runs at login; installing
                 // from the dialog means "at boot", so the two go together.
                 if self.linger == LingerStatus::Disabled {
-                    self.enable_linger();
+                    self.set_linger(true);
                 }
                 return;
             }
@@ -3265,31 +3278,52 @@ impl App {
         dialog.present(Some(&self.window));
     }
 
-    /// Offer to enable lingering so shells survive logout, with honest
-    /// downsides. Buttons: Enable / Not now / Don't show again.
-    fn show_linger_warning(&self) {
+    /// Re-read lingering from the system — it may have been changed with
+    /// `loginctl` outside the app — then show the dialog for that state:
+    /// the offer with its honest downsides while it is off, the fact and a
+    /// Disable button once it is on. The responses come from
+    /// `autostart::linger_responses`, so the layout is tested there.
+    fn show_linger_warning(&mut self) {
+        self.refresh_linger();
+        let status = self.linger;
         let dialog = adw::AlertDialog::new(
-            Some("Keep shells running after logout?"),
-            Some(&linger_warning_body()),
+            Some(autostart::linger_dialog_heading(status)),
+            Some(&autostart::linger_dialog_body(status)),
         );
-        dialog.add_response("not-now", "Not now");
-        dialog.add_response("dismiss", "Don't show again");
-        dialog.add_response("enable", "Enable");
-        dialog.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("enable"));
-        dialog.set_close_response("not-now");
+        let responses = autostart::linger_responses(status);
+        for response in &responses {
+            dialog.add_response(response.id(), response.label());
+            dialog
+                .set_response_appearance(response.id(), response_appearance(response.appearance()));
+            if response.appearance() == autostart::Appearance::Suggested {
+                dialog.set_default_response(Some(response.id()));
+            }
+        }
+        if let Some(first) = responses.first() {
+            dialog.set_close_response(first.id());
+        }
 
         let input = self.input.clone();
-        dialog.connect_response(Some("enable"), {
-            let input = input.clone();
-            move |_, _| {
-                let _ = input.send(Msg::EnableLinger);
-            }
-        });
-        dialog.connect_response(Some("dismiss"), move |_, _| {
-            let _ = input.send(Msg::DismissLingerWarning);
+        dialog.connect_response(None, move |_, id| {
+            let msg = match autostart::LingerResponse::from_id(id) {
+                Some(autostart::LingerResponse::Enable) => Msg::SetLinger(true),
+                Some(autostart::LingerResponse::Disable) => Msg::SetLinger(false),
+                Some(autostart::LingerResponse::Dismiss) => Msg::DismissLingerWarning,
+                _ => return,
+            };
+            let _ = input.send(msg);
         });
         dialog.present(Some(&self.window));
+    }
+
+    /// Re-read lingering from the system, and with it the boot-resume state
+    /// ("On" versus "At login only" depends on it). Only meaningful with a
+    /// usable tmux: without one logout survival is not on offer.
+    fn refresh_linger(&mut self) {
+        if self.tmux.is_some() {
+            self.linger = tmuxctl::detect_linger();
+        }
+        self.refresh_autostart();
     }
 
     /// Re-read the boot-resume unit's state from the system.
@@ -3324,12 +3358,8 @@ impl App {
         let responses = autostart::responses(self.autostart);
         for response in &responses {
             dialog.add_response(response.id(), response.label());
-            let appearance = match response.appearance() {
-                autostart::Appearance::Default => adw::ResponseAppearance::Default,
-                autostart::Appearance::Suggested => adw::ResponseAppearance::Suggested,
-                autostart::Appearance::Destructive => adw::ResponseAppearance::Destructive,
-            };
-            dialog.set_response_appearance(response.id(), appearance);
+            dialog
+                .set_response_appearance(response.id(), response_appearance(response.appearance()));
             if response.appearance() == autostart::Appearance::Suggested {
                 dialog.set_default_response(Some(response.id()));
             }
@@ -3344,7 +3374,7 @@ impl App {
                     Msg::AutostartInstall
                 }
                 Some(autostart::Response::Remove) => Msg::AutostartRemove,
-                Some(autostart::Response::EnableLinger) => Msg::EnableLinger,
+                Some(autostart::Response::EnableLinger) => Msg::SetLinger(true),
                 _ => return,
             };
             let _ = input.send(msg);
@@ -3396,36 +3426,48 @@ impl App {
         self.sync_browser_pane();
     }
 
-    /// Run `loginctl enable-linger` and re-check, off the GTK main thread.
-    /// `enable-linger` triggers a polkit action that may prompt for interactive
-    /// authentication, which would freeze the UI if run synchronously here; the
-    /// work happens on a background thread and its outcome comes back as
-    /// `Msg::LingerEnabled`.
-    fn enable_linger(&self) {
+    /// Run `loginctl enable-linger` or `disable-linger` and re-check, off the
+    /// GTK main thread. Both trigger a polkit action that may prompt for
+    /// interactive authentication, which would freeze the UI if run
+    /// synchronously here; the work happens on a background thread and its
+    /// outcome comes back as `Msg::LingerChanged`.
+    fn set_linger(&self, enabled: bool) {
         let input = self.input.clone();
         std::thread::spawn(move || {
-            let result = match tmuxctl::enable_linger() {
+            let result = match tmuxctl::set_linger(enabled) {
                 Ok(()) => Ok(tmuxctl::detect_linger()),
                 Err(err) => Err(err.to_string()),
             };
-            let _ = input.send(Msg::LingerEnabled(result));
+            let _ = input.send(Msg::LingerChanged(enabled, result));
         });
     }
 
-    /// Apply the outcome of the off-thread `enable_linger`. On success the
-    /// re-check reports `Enabled` and the #[watch] hides the icon; failure (or
-    /// an unconfirmed enable) shows a brief notice and leaves it visible.
-    fn on_linger_enabled(&mut self, result: Result<LingerStatus, String>) {
+    /// Apply the outcome of the off-thread `set_linger`. The re-read state
+    /// drives the menu caption, the header icon and the boot-resume status
+    /// through #[watch]; a toast confirms the change, a notice reports a
+    /// failure or a state that did not come out as asked.
+    fn on_linger_changed(&mut self, wanted: bool, result: Result<LingerStatus, String>) {
+        let verb = if wanted { "enabled" } else { "disabled" };
         match result {
             Ok(status) => {
                 self.linger = status;
                 // "On" versus "At login only" depends on lingering.
                 self.refresh_autostart();
-                if self.linger != LingerStatus::Enabled {
-                    self.show_notice("Lingering could not be confirmed as enabled.");
+                let expected = if wanted {
+                    LingerStatus::Enabled
+                } else {
+                    LingerStatus::Disabled
+                };
+                if self.linger == expected {
+                    self.show_toast(&format!("Lingering {verb}"));
+                } else {
+                    self.show_notice(&format!("Lingering could not be confirmed as {verb}."));
                 }
             }
-            Err(err) => self.show_notice(&format!("Enabling lingering failed: {err}")),
+            Err(err) => self.show_notice(&format!(
+                "{} lingering failed: {err}",
+                if wanted { "Enabling" } else { "Disabling" }
+            )),
         }
     }
 
@@ -5497,23 +5539,13 @@ fn tmux_warning_body(availability: &TmuxAvailability) -> String {
     )
 }
 
-/// Body text of the linger (logout survival) warning dialog. Ordered per the
-/// spec: what enabling adds comes first, then the honest, non-dramatized
-/// downsides (background footprint, unattended processes on shared machines,
-/// persisting state), closing with reversibility via `disable-linger`.
-fn linger_warning_body() -> String {
-    "Enabling lingering keeps your shells running after you log out and back \
-     in, not only when kabelsalat is closed, crashes, or is upgraded.\n\n\
-     In exchange:\n\
-     \u{2022} A small, permanent background footprint: your user service \
-     manager and enabled user services keep running while you are logged out.\n\
-     \u{2022} \u{201c}Logged out\u{201d} no longer means nothing of yours is \
-     running \u{2014} long-running processes and agents keep going unattended, \
-     worth considering on a shared machine.\n\
-     \u{2022} State that a fresh login used to clear can persist between \
-     sessions.\n\n\
-     You can turn this off again at any time with `loginctl disable-linger`."
-        .to_string()
+/// How a dialog response of the autostart or linger dialog is drawn.
+fn response_appearance(appearance: autostart::Appearance) -> adw::ResponseAppearance {
+    match appearance {
+        autostart::Appearance::Default => adw::ResponseAppearance::Default,
+        autostart::Appearance::Suggested => adw::ResponseAppearance::Suggested,
+        autostart::Appearance::Destructive => adw::ResponseAppearance::Destructive,
+    }
 }
 
 /// Minimum width request (`width_chars`) for a tab button's label.
@@ -6350,41 +6382,6 @@ mod tests {
         assert!(body.contains("3.1c")); // detected version
         assert!(body.contains("3.2")); // required minimum
         assert!(body.contains("apt install tmux"));
-    }
-
-    // --- linger-warning dialog body -------------------------------------
-
-    #[test]
-    fn linger_body_puts_enables_before_downsides() {
-        let body = linger_warning_body();
-        let enables = body
-            .find("keeps your shells running after you log out")
-            .expect("enables clause present");
-        let downside = body
-            .find("permanent background footprint")
-            .expect("downside clause present");
-        assert!(enables < downside, "enables must precede downsides");
-    }
-
-    #[test]
-    fn linger_body_mentions_logout_survival() {
-        let body = linger_warning_body();
-        assert!(body.contains("log out"));
-        assert!(body.contains("crashes"));
-    }
-
-    #[test]
-    fn linger_body_mentions_downsides_and_shared_machine() {
-        let body = linger_warning_body();
-        assert!(body.contains("background footprint"));
-        assert!(body.contains("shared machine"));
-        assert!(body.contains("unattended"));
-    }
-
-    #[test]
-    fn linger_body_mentions_reversibility_via_disable_linger() {
-        let body = linger_warning_body();
-        assert!(body.contains("disable-linger"));
     }
 
     #[test]
