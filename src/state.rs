@@ -197,6 +197,11 @@ pub struct SavedState {
     /// confirmed yet. `serde(default)` so older state files load with none.
     #[serde(default)]
     pub pending_kills: Vec<PendingKill>,
+    /// The uuid of the group whose Android pane was open (or still queued
+    /// for restore) at the last save. One per machine, so one owner.
+    /// `serde(default)` so older state files load with none.
+    #[serde(default)]
+    pub android_owner: Option<String>,
 }
 
 /// Sidebar ordering of a group's tabs.
@@ -222,6 +227,7 @@ impl Default for SavedState {
             linger_warning_dismissed: false,
             sidebar_order: SidebarOrder::default(),
             pending_kills: Vec::new(),
+            android_owner: None,
         }
     }
 }
@@ -603,6 +609,25 @@ pub fn remote_hosts(saved: &SavedState) -> Vec<String> {
     hosts
 }
 
+/// The saved group id whose Android pane comes back after a restart: the
+/// group named by `android_owner`, as long as it still exists and is local
+/// (the pane is a local widget). Pure.
+pub fn android_restore_target(saved: &SavedState) -> Option<usize> {
+    let owner = saved.android_owner.as_deref()?;
+    saved
+        .groups
+        .iter()
+        .find(|g| g.uuid == owner && g.host.is_none())
+        .map(|g| g.id)
+}
+
+/// Which owner to persist: the group that holds a live Android, else the
+/// group still queued for restore — restore is idle-driven, and a save in
+/// that window must not forget it (same reasoning as `browser_open`). Pure.
+pub fn android_owner_desired(live: Option<&str>, pending: Option<&str>) -> Option<String> {
+    live.or(pending).map(str::to_string)
+}
+
 /// A successful `list-sessions` from a remote host, as plain data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteListing {
@@ -733,6 +758,7 @@ mod tests {
             linger_warning_dismissed: true,
             sidebar_order: SidebarOrder::default(),
             pending_kills: Vec::new(),
+            android_owner: Some("g-bbb".into()),
         }
     }
 
@@ -1637,5 +1663,62 @@ mod tests {
                 "exec claude --resume abc-123".into()
             ]
         );
+    }
+
+    // --- android pane ---
+
+    #[test]
+    fn old_state_without_android_owner_loads_as_none() {
+        let json = r#"{"groups": [], "tabs": [], "active": null, "sidebar_visible": true}"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.android_owner, None);
+    }
+
+    #[test]
+    fn android_owner_survives_save_and_load() {
+        let dir = tmp_dir("androidowner");
+        let path = dir.join("state.json");
+        save(&sample_state(), &path).unwrap();
+        assert_eq!(load(&path).android_owner.as_deref(), Some("g-bbb"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn android_restore_targets_the_owning_local_group() {
+        // sample_state: g-bbb is group id 1, local.
+        assert_eq!(android_restore_target(&sample_state()), Some(1));
+    }
+
+    #[test]
+    fn android_restore_is_a_noop_without_a_usable_owner() {
+        let mut state = sample_state();
+        state.android_owner = None;
+        assert_eq!(android_restore_target(&state), None);
+
+        state.android_owner = Some("g-gone".into());
+        assert_eq!(android_restore_target(&state), None);
+
+        // A remote group cannot host the (local) pane.
+        let mut remote = sample_state();
+        remote.groups[1].host = Some("me@box".into());
+        assert_eq!(android_restore_target(&remote), None);
+    }
+
+    #[test]
+    fn the_desired_android_owner_keeps_a_pending_restore() {
+        assert_eq!(
+            android_owner_desired(Some("g-aaa"), None).as_deref(),
+            Some("g-aaa")
+        );
+        // Restore is idle-driven: a save before it ran must not forget it.
+        assert_eq!(
+            android_owner_desired(None, Some("g-bbb")).as_deref(),
+            Some("g-bbb")
+        );
+        assert_eq!(
+            android_owner_desired(Some("g-aaa"), Some("g-bbb")).as_deref(),
+            Some("g-aaa")
+        );
+        assert_eq!(android_owner_desired(None, None), None);
     }
 }

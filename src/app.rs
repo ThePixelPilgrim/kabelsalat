@@ -2107,6 +2107,9 @@ impl App {
             linger_warning_dismissed: self.linger_dismissed,
             sidebar_order: self.sidebar_order,
             pending_kills: self.pending_kills.clone(),
+            // No group can hold an Android pane yet; Task 8 of the Android
+            // pane plan persists the real owner here.
+            android_owner: None,
         };
         self.persist(&state);
         // Same choke point as the save, so the CLI always sees what was last
