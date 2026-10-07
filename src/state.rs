@@ -628,6 +628,101 @@ pub fn android_owner_desired(live: Option<&str>, pending: Option<&str>) -> Optio
     live.or(pending).map(str::to_string)
 }
 
+// ---- pane area ----------------------------------------------------------
+
+/// One kind of pane a group's pane area can hold; at most one of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneKind {
+    Browser,
+    Android,
+}
+
+impl PaneKind {
+    /// The tab title in the pane area.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Browser => "Browser",
+            Self::Android => "Android",
+        }
+    }
+
+    /// The GTK widget name a pane carries, so a tab-view page can be mapped
+    /// back to its kind from its child widget.
+    pub fn widget_name(self) -> &'static str {
+        match self {
+            Self::Browser => "pane-browser",
+            Self::Android => "pane-android",
+        }
+    }
+
+    /// Inverse of [`PaneKind::widget_name`]. Pure.
+    pub fn from_widget_name(name: &str) -> Option<Self> {
+        [Self::Browser, Self::Android]
+            .into_iter()
+            .find(|kind| kind.widget_name() == name)
+    }
+
+    /// The other kind.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Browser => Self::Android,
+            Self::Android => Self::Browser,
+        }
+    }
+}
+
+/// What Alt+2 does to the active group's pane area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserKeyStep {
+    /// No browser yet: start one, in front, area visible.
+    Spawn,
+    /// Browser to the front, area visible.
+    Front,
+    /// Hide the area; every pane keeps running.
+    Hide,
+}
+
+/// Alt+2: spawn the browser, bring it to the front, or — when it already is
+/// in front and showing — hide the area. Pure.
+pub fn browser_key_step(has_browser: bool, panes_visible: bool, front: PaneKind) -> BrowserKeyStep {
+    if !has_browser {
+        BrowserKeyStep::Spawn
+    } else if panes_visible && front == PaneKind::Browser {
+        BrowserKeyStep::Hide
+    } else {
+        BrowserKeyStep::Front
+    }
+}
+
+/// The front pane after `opened` joined the area. An interactive open puts it
+/// in front; a quiet one (CLI, restore) leaves the front alone unless there
+/// is no other pane to be in front. Pure.
+pub fn front_after_open(
+    front: PaneKind,
+    opened: PaneKind,
+    other_open: bool,
+    quiet: bool,
+) -> PaneKind {
+    if quiet && other_open { front } else { opened }
+}
+
+/// The front pane after `closed` left the area: the remaining pane when the
+/// closed one was in front, otherwise unchanged. Pure.
+pub fn front_after_close(front: PaneKind, closed: PaneKind, other_open: bool) -> PaneKind {
+    if front == closed && other_open {
+        closed.other()
+    } else {
+        front
+    }
+}
+
+/// Whether the area is visible after a quiet open: an existing area keeps its
+/// state; a first pane shows only in the active group, as a CLI-opened
+/// browser always has. Pure.
+pub fn quiet_open_visible(panes_visible: bool, group_active: bool, other_open: bool) -> bool {
+    panes_visible || (group_active && !other_open)
+}
+
 /// A successful `list-sessions` from a remote host, as plain data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteListing {
@@ -1720,5 +1815,81 @@ mod tests {
             Some("g-aaa")
         );
         assert_eq!(android_owner_desired(None, None), None);
+    }
+
+    // --- pane area ---
+
+    #[test]
+    fn pane_kinds_round_trip_through_their_widget_names() {
+        for kind in [PaneKind::Browser, PaneKind::Android] {
+            assert_eq!(PaneKind::from_widget_name(kind.widget_name()), Some(kind));
+        }
+        assert_eq!(PaneKind::from_widget_name(""), None);
+        assert_eq!(PaneKind::from_widget_name("KstWaylandPane"), None);
+        assert_eq!(PaneKind::Browser.title(), "Browser");
+        assert_eq!(PaneKind::Android.title(), "Android");
+        assert_eq!(PaneKind::Browser.other(), PaneKind::Android);
+        assert_eq!(PaneKind::Android.other(), PaneKind::Browser);
+    }
+
+    #[test]
+    fn alt_2_spawns_fronts_or_hides_the_browser() {
+        use BrowserKeyStep::*;
+        // No browser: spawn one, whatever else is open.
+        assert_eq!(browser_key_step(false, false, PaneKind::Browser), Spawn);
+        assert_eq!(browser_key_step(false, true, PaneKind::Android), Spawn);
+        // Browser in front and showing: hide the area (today's toggle).
+        assert_eq!(browser_key_step(true, true, PaneKind::Browser), Hide);
+        // Area hidden, or the browser behind Android: bring it to the front.
+        assert_eq!(browser_key_step(true, false, PaneKind::Browser), Front);
+        assert_eq!(browser_key_step(true, false, PaneKind::Android), Front);
+        assert_eq!(browser_key_step(true, true, PaneKind::Android), Front);
+    }
+
+    #[test]
+    fn an_opened_pane_goes_in_front_unless_it_opened_quietly_next_to_another() {
+        // Interactive open: always in front.
+        assert_eq!(
+            front_after_open(PaneKind::Browser, PaneKind::Android, true, false),
+            PaneKind::Android
+        );
+        // Quiet (CLI, restore) next to another pane: front untouched.
+        assert_eq!(
+            front_after_open(PaneKind::Browser, PaneKind::Android, true, true),
+            PaneKind::Browser
+        );
+        // Quiet but alone: nothing else can be in front.
+        assert_eq!(
+            front_after_open(PaneKind::Browser, PaneKind::Android, false, true),
+            PaneKind::Android
+        );
+    }
+
+    #[test]
+    fn closing_the_front_pane_fronts_the_other_one() {
+        assert_eq!(
+            front_after_close(PaneKind::Android, PaneKind::Android, true),
+            PaneKind::Browser
+        );
+        // Closing the pane behind changes nothing.
+        assert_eq!(
+            front_after_close(PaneKind::Android, PaneKind::Browser, true),
+            PaneKind::Android
+        );
+        // Nothing left: the value no longer matters, and is left alone.
+        assert_eq!(
+            front_after_close(PaneKind::Android, PaneKind::Android, false),
+            PaneKind::Android
+        );
+    }
+
+    #[test]
+    fn a_quiet_open_shows_the_area_only_for_the_active_groups_first_pane() {
+        assert!(quiet_open_visible(false, true, false));
+        assert!(!quiet_open_visible(false, false, false));
+        // An existing area keeps its state either way.
+        assert!(!quiet_open_visible(false, true, true));
+        assert!(quiet_open_visible(true, false, true));
+        assert!(quiet_open_visible(true, true, true));
     }
 }
