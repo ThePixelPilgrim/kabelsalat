@@ -4,6 +4,7 @@ use relm4::gtk::gio;
 use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
+pub mod android;
 mod app;
 pub mod autostart;
 pub mod browser;
@@ -83,11 +84,12 @@ pub fn run() {
         let running = instance_is_running().unwrap_or(false);
         std::process::exit(resume::run(running).into());
     }
-    // `browser` without --group takes the caller's KABELSALAT_GROUP. That is
-    // resolved here, in the caller's own environment — GApplication does not
-    // ship the environment to the primary instance — and forwarded as an
-    // explicit --group. The usage error for "no group at all" belongs here
-    // too, before anything touches the bus.
+    // `browser` and `android` without --group take the caller's
+    // KABELSALAT_GROUP. That is resolved here, in the caller's own
+    // environment — GApplication does not ship the environment to the
+    // primary instance — and forwarded as an explicit --group. The usage
+    // error for "no group at all" belongs here too, before anything touches
+    // the bus.
     let parsed =
         match cli::with_default_group(parsed, std::env::var(cli::ENV_GROUP).ok().as_deref()) {
             Ok(parsed) => parsed,
@@ -105,6 +107,10 @@ pub fn run() {
                 group.clone(),
             ]
         }
+        cli::Cli::Android {
+            group: Some(group),
+            cmd,
+        } => cli::android_argv(&args[0], group, cmd.as_ref()),
         _ => args,
     };
 

@@ -51,6 +51,9 @@ Constraints found:
 
 ## Decisions
 
+_Realigned with the shipped branch `android-pane` after the final review; the
+items below and the signatures in sections 1–3 describe what was built._
+
 - Page access: geckodriver-managed sessions (Fenix is disposable). Attaching
   to a persistent Fenix is a possible follow-up, not in scope.
 - Surface control: a thin CLI over klamottenkiste's control socket, plus adb
@@ -77,26 +80,40 @@ pub enum WaydroidStatus { NotInitialised, Stopped, Running { display: String } }
 pub fn parse_status(output: &str) -> WaydroidStatus;          // pure
 pub enum Precondition { Ok, NoBinary, NotInitialised, ForeignSession(String) }
 pub fn check(status: Option<WaydroidStatus>, our_display: &str) -> Precondition; // pure
-pub fn session_start_args(display: &str) -> Vec<String>;      // pure
-pub fn show_full_ui_args(display: &str) -> Vec<String>;       // pure
+pub fn session_start_args() -> Vec<String>;   // pure; the display travels in the env
+pub fn show_full_ui_args() -> Vec<String>;    // pure
+pub fn client_env(display: &str) -> Vec<(String, String)>; // pure
+pub fn should_stop_session(child_alive: bool, saw_foreign: bool) -> bool; // pure
+pub fn is_dead(child_exited: bool, compositor_running: bool) -> bool;    // pure
 pub fn adb_serial(status_output: &str) -> String;             // pure, default 192.168.240.112:5555
 ```
 
 - `Android::spawn()`:
   1. `waydroid status` → `parse_status`; `check` must be `Ok`, else return
      `Err` with a user-facing message (no panic; the app degrades like it does
-     without tmux).
-  2. `WaylandPane::new()`, read its socket and control socket path.
+     without tmux). The check runs before the pane exists, so every running
+     session counts as foreign. A status call that does not answer is its
+     own error (`StatusUnanswered`), not "not installed".
+  2. `WaylandPane::new()`, read its socket and control socket path, and
+     `chmod 0600` the control socket (klamottenkiste binds it in the system
+     temp dir with umask permissions).
   3. Run `waydroid session start` with `WAYLAND_DISPLAY=<socket>` in its own
      process group (reuse `isolate_process_group`), stdout/stderr to
      `<state_dir>/android/session.log`.
-  4. Poll `waydroid status` every 500 ms until `Running{display==ours}`, then
-     run `waydroid show-full-ui` with the same env, same process group.
-     Boot timeout 60 s → `AndroidDied`.
-- `teardown()`: `waydroid session stop`, then kill the process group, then
-  close the pane.
-- `control_socket_path()`, `capture_frame()`, `set_visible()`, `has_exited()`
-  with the same semantics as `Browser`.
+  4. A watcher thread polls `waydroid status` every 500 ms until
+     `Running{display==ours}`, runs `waydroid show-full-ui` with the same env
+     and process group, then waits for `sys.boot_completed=1`. One 60 s
+     budget covers all three phases; each command is capped at the remaining
+     budget. The watcher reports through a callback tagged with a boot id;
+     the app ignores reports whose id is stale.
+- `teardown()`: `waydroid session stop` only when our child is still alive
+  and no foreign session was seen (`should_stop_session`), then kill the
+  process group, then close the pane. A foreign session is never stopped.
+- `control_socket_path()`, `capture_frame()`, `has_exited()`, `is_running()`
+  (compositor alive). The poll treats the pane as dead when the child exited
+  or the compositor stopped (`is_dead`); Waydroid does not exit when its
+  display goes away, so both are needed. There is no `set_visible`: panes
+  pause by being unmapped.
 
 ## 2. `src/app.rs` wiring
 
@@ -116,15 +133,22 @@ pub fn adb_serial(status_output: &str) -> String;             // pure, default 1
 - Messages: `ToggleAndroid`, `StopAndroid`, `AndroidReady`, `AndroidDied`,
   `OpenAndroid` (CLI), `PaneSelected(PaneKind)`. `PollAndroid` folds into
   the existing poll timer.
-- Visibility: only the front pane of the active group pumps frames; all
-  others are paused via `set_visible(false)`.
+- Visibility: only the front pane of the active group pumps frames. Panes
+  pause by being unmapped (a non-selected tab, or a detached host); an
+  `adw::TabView` cannot hold a hidden child, so `set_visible` is not used.
 - Env published into the owning group's tabs via the existing
   `tmux set-environment` path: `KABELSALAT_ANDROID_CTL=<control socket>`,
   `KABELSALAT_ANDROID_ADB=<serial>`. Both unset on teardown or death.
 - CLI-created panes never raise, focus, switch groups or change
   `front_pane`; `OpenAndroid` adds a hidden page when the group isn't active.
-- Restart: `state.json` records `android_owner: Option<Uuid>`. On launch the
-  pane is reopened hidden for that group, mirroring `pending_browser_restore`.
+- Restart: `state.json` records `android_owner: Option<String>` (group uuids
+  are strings throughout `state.rs`). On launch the pane is reopened hidden
+  for that group, mirroring `pending_browser_restore`. If another group took
+  Android before the idle restore fires, the restore skips silently.
+- Closing a pane that had the keyboard hands focus back to the terminal.
+- Alt+2 in an Android-only group hidden state spawns a browser (Alt+3 and the
+  indicator re-show Android); with the area visible it hides it whichever
+  pane is in front.
 - Screenshot-to-terminal captures the front pane.
 
 ## 3. CLI (`src/cli.rs` pure, `src/control.rs` glue)
@@ -135,12 +159,18 @@ kabelsalat android screenshot PATH | tap X Y | type TEXT | key NAME | resize W H
 ```
 
 - `android` with no subcommand: if GROUP owns a ready pane, print
-  `ctl=<socket>\nadb=<serial>`, exit 0. If nobody owns one, emit
-  `Action::OpenAndroid`, print nothing (caller polls env), exit 0. If another
-  group owns it, exit 3 with a message naming that group. Remote group: exit 3.
-- Subcommands forward one line to the control socket and print the reply.
-  `cli.rs` returns `Action::Control { line }`; `control.rs` does the socket
-  I/O. No owned pane: exit 3. Wire format follows
+  `ctl=<socket>\nadb=<serial>`, exit 0. While it is still booting: nothing on
+  stdout, a hint on stderr, exit 0. If nobody owns one, emit
+  `Action::OpenAndroid`, nothing on stdout (a hint on stderr; caller polls
+  env), exit 0. If another group owns it, exit 3 with a message naming that
+  group. Remote group: exit 3. `-h`/`--help` prints the help.
+- Subcommands forward one line to the control socket and print the reply
+  (`ok <data>` payload on stdout; an `err` reply → exit 4; unreachable or
+  silent socket → exit 3, one 10 s deadline for the round trip). `cli.rs`
+  returns `Action::Control { socket, line }`; `control.rs` does the socket
+  I/O. No owned pane: exit 3. A relative `screenshot` path resolves against
+  the caller's cwd; non-UTF-8 or whitespace-padded paths, multi-line `type`
+  text and multi-word `key` names are usage errors. Wire format follows
   `vendor/nested-wayland-session/src/protocol.rs` (`click X Y`, `key NAME`,
   `type TEXT`, `resize W H`, `screenshot PATH`).
 - Group defaults from `KABELSALAT_GROUP` as for `browser`.

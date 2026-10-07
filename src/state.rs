@@ -197,6 +197,11 @@ pub struct SavedState {
     /// confirmed yet. `serde(default)` so older state files load with none.
     #[serde(default)]
     pub pending_kills: Vec<PendingKill>,
+    /// The uuid of the group whose Android pane was open (or still queued
+    /// for restore) at the last save. One per machine, so one owner.
+    /// `serde(default)` so older state files load with none.
+    #[serde(default)]
+    pub android_owner: Option<String>,
 }
 
 /// Sidebar ordering of a group's tabs.
@@ -222,6 +227,7 @@ impl Default for SavedState {
             linger_warning_dismissed: false,
             sidebar_order: SidebarOrder::default(),
             pending_kills: Vec::new(),
+            android_owner: None,
         }
     }
 }
@@ -603,6 +609,124 @@ pub fn remote_hosts(saved: &SavedState) -> Vec<String> {
     hosts
 }
 
+/// The saved group id whose Android pane comes back after a restart: the
+/// group named by `android_owner`, as long as it still exists and is local
+/// (the pane is a local widget). Pure.
+pub fn android_restore_target(saved: &SavedState) -> Option<usize> {
+    let owner = saved.android_owner.as_deref()?;
+    saved
+        .groups
+        .iter()
+        .find(|g| g.uuid == owner && g.host.is_none())
+        .map(|g| g.id)
+}
+
+/// Which owner to persist: the group that holds a live Android, else the
+/// group still queued for restore — restore is idle-driven, and a save in
+/// that window must not forget it (same reasoning as `browser_open`). Pure.
+pub fn android_owner_desired(live: Option<&str>, pending: Option<&str>) -> Option<String> {
+    live.or(pending).map(str::to_string)
+}
+
+// ---- pane area ----------------------------------------------------------
+
+/// One kind of pane a group's pane area can hold; at most one of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneKind {
+    Browser,
+    Android,
+}
+
+impl PaneKind {
+    /// The tab title in the pane area.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Browser => "Browser",
+            Self::Android => "Android",
+        }
+    }
+
+    /// The GTK widget name a pane carries, so a tab-view page can be mapped
+    /// back to its kind from its child widget.
+    pub fn widget_name(self) -> &'static str {
+        match self {
+            Self::Browser => "pane-browser",
+            Self::Android => "pane-android",
+        }
+    }
+
+    /// Inverse of [`PaneKind::widget_name`]. Pure.
+    pub fn from_widget_name(name: &str) -> Option<Self> {
+        [Self::Browser, Self::Android]
+            .into_iter()
+            .find(|kind| kind.widget_name() == name)
+    }
+
+    /// The other kind.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Browser => Self::Android,
+            Self::Android => Self::Browser,
+        }
+    }
+}
+
+/// What Alt+2 does to the active group's pane area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserKeyStep {
+    /// No browser yet: start one, in front, area visible.
+    Spawn,
+    /// Browser to the front, area visible.
+    Front,
+    /// Hide the area; every pane keeps running.
+    Hide,
+}
+
+/// Alt+2 toggles the pane area as a whole: a visible area hides, whichever
+/// pane is in front and whether or not a browser exists; a hidden one shows
+/// with the browser in front, spawning the browser when there is none. Pure.
+pub fn browser_key_step(has_browser: bool, panes_visible: bool) -> BrowserKeyStep {
+    if panes_visible {
+        BrowserKeyStep::Hide
+    } else if has_browser {
+        BrowserKeyStep::Front
+    } else {
+        BrowserKeyStep::Spawn
+    }
+}
+
+/// The front pane after `opened` joined the area. An interactive open puts it
+/// in front; a quiet one (CLI, restore) leaves the front alone unless there
+/// is no other pane to be in front. The caller guarantees `opened` was not
+/// already open. Pure.
+pub fn front_after_open(
+    front: PaneKind,
+    opened: PaneKind,
+    other_open: bool,
+    quiet: bool,
+) -> PaneKind {
+    if quiet && other_open { front } else { opened }
+}
+
+/// The front pane after `closed` left the area: the remaining pane when the
+/// closed one was in front, otherwise unchanged. The caller guarantees
+/// `closed` was open. Pure.
+pub fn front_after_close(front: PaneKind, closed: PaneKind, other_open: bool) -> PaneKind {
+    if front == closed && other_open {
+        closed.other()
+    } else {
+        front
+    }
+}
+
+/// Whether the area is visible after a quiet open: an existing area keeps its
+/// state; a first pane shows only in the active group, as a CLI-opened
+/// browser always has. Invariant: a quiet open never hides the area, so
+/// `panes_visible` true always yields true. Pure.
+pub fn quiet_open_visible(panes_visible: bool, group_active: bool, other_open: bool) -> bool {
+    panes_visible || (group_active && !other_open)
+}
+
 /// A successful `list-sessions` from a remote host, as plain data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteListing {
@@ -733,6 +857,7 @@ mod tests {
             linger_warning_dismissed: true,
             sidebar_order: SidebarOrder::default(),
             pending_kills: Vec::new(),
+            android_owner: Some("g-bbb".into()),
         }
     }
 
@@ -1637,5 +1762,151 @@ mod tests {
                 "exec claude --resume abc-123".into()
             ]
         );
+    }
+
+    // --- android pane ---
+
+    #[test]
+    fn old_state_without_android_owner_loads_as_none() {
+        let json = r#"{"groups": [], "tabs": [], "active": null, "sidebar_visible": true}"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.android_owner, None);
+    }
+
+    #[test]
+    fn android_owner_survives_save_and_load() {
+        let dir = tmp_dir("androidowner");
+        let path = dir.join("state.json");
+        save(&sample_state(), &path).unwrap();
+        assert_eq!(load(&path).android_owner.as_deref(), Some("g-bbb"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn android_restore_targets_the_owning_local_group() {
+        // sample_state: g-bbb is group id 1, local.
+        assert_eq!(android_restore_target(&sample_state()), Some(1));
+    }
+
+    #[test]
+    fn android_restore_is_a_noop_without_a_usable_owner() {
+        let mut state = sample_state();
+        state.android_owner = None;
+        assert_eq!(android_restore_target(&state), None);
+
+        state.android_owner = Some("g-gone".into());
+        assert_eq!(android_restore_target(&state), None);
+
+        // A remote group cannot host the (local) pane.
+        let mut remote = sample_state();
+        remote.groups[1].host = Some("me@box".into());
+        assert_eq!(android_restore_target(&remote), None);
+    }
+
+    #[test]
+    fn the_desired_android_owner_keeps_a_pending_restore() {
+        assert_eq!(
+            android_owner_desired(Some("g-aaa"), None).as_deref(),
+            Some("g-aaa")
+        );
+        // Restore is idle-driven: a save before it ran must not forget it.
+        assert_eq!(
+            android_owner_desired(None, Some("g-bbb")).as_deref(),
+            Some("g-bbb")
+        );
+        assert_eq!(
+            android_owner_desired(Some("g-aaa"), Some("g-bbb")).as_deref(),
+            Some("g-aaa")
+        );
+        assert_eq!(android_owner_desired(None, None), None);
+    }
+
+    // --- pane area ---
+
+    #[test]
+    fn pane_kinds_round_trip_through_their_widget_names() {
+        for kind in [PaneKind::Browser, PaneKind::Android] {
+            assert_eq!(PaneKind::from_widget_name(kind.widget_name()), Some(kind));
+        }
+        assert_eq!(PaneKind::from_widget_name(""), None);
+        assert_eq!(PaneKind::from_widget_name("KstWaylandPane"), None);
+        assert_eq!(PaneKind::Browser.title(), "Browser");
+        assert_eq!(PaneKind::Android.title(), "Android");
+        assert_eq!(PaneKind::Browser.other(), PaneKind::Android);
+        assert_eq!(PaneKind::Android.other(), PaneKind::Browser);
+    }
+
+    #[test]
+    fn alt_2_toggles_the_pane_area_as_a_whole() {
+        use BrowserKeyStep::*;
+        // Area visible: hide it, whichever pane is in front, browser or not.
+        assert_eq!(browser_key_step(true, true), Hide);
+        assert_eq!(browser_key_step(false, true), Hide);
+        // Area hidden with a browser: show it with the browser in front.
+        assert_eq!(browser_key_step(true, false), Front);
+        // Area hidden, no browser: spawn one (Android-only or empty group).
+        assert_eq!(browser_key_step(false, false), Spawn);
+    }
+
+    #[test]
+    fn an_opened_pane_goes_in_front_unless_it_opened_quietly_next_to_another() {
+        // Interactive open: always in front.
+        assert_eq!(
+            front_after_open(PaneKind::Browser, PaneKind::Android, true, false),
+            PaneKind::Android
+        );
+        // Quiet (CLI, restore) next to another pane: front untouched.
+        assert_eq!(
+            front_after_open(PaneKind::Browser, PaneKind::Android, true, true),
+            PaneKind::Browser
+        );
+        // Quiet but alone: nothing else can be in front.
+        assert_eq!(
+            front_after_open(PaneKind::Browser, PaneKind::Android, false, true),
+            PaneKind::Android
+        );
+    }
+
+    #[test]
+    fn a_pane_opened_after_the_last_one_closed_replaces_the_stale_front() {
+        // The Android pane closed last, leaving `front` stale at Android.
+        let front = front_after_close(PaneKind::Android, PaneKind::Android, false);
+        for quiet in [false, true] {
+            assert_eq!(
+                front_after_open(front, PaneKind::Browser, false, quiet),
+                PaneKind::Browser
+            );
+        }
+    }
+
+    #[test]
+    fn closing_the_front_pane_fronts_the_other_one() {
+        assert_eq!(
+            front_after_close(PaneKind::Android, PaneKind::Android, true),
+            PaneKind::Browser
+        );
+        // Closing the pane behind changes nothing.
+        assert_eq!(
+            front_after_close(PaneKind::Android, PaneKind::Browser, true),
+            PaneKind::Android
+        );
+        // Nothing left: the value no longer matters, and is left alone.
+        assert_eq!(
+            front_after_close(PaneKind::Android, PaneKind::Android, false),
+            PaneKind::Android
+        );
+    }
+
+    #[test]
+    fn a_quiet_open_shows_the_area_only_for_the_active_groups_first_pane() {
+        assert!(quiet_open_visible(false, true, false));
+        assert!(!quiet_open_visible(false, false, false));
+        // An existing area keeps its state either way.
+        assert!(!quiet_open_visible(false, true, true));
+        assert!(quiet_open_visible(true, false, true));
+        assert!(quiet_open_visible(true, true, true));
+        // A visible area is visible whatever else is true (first pane, any group).
+        assert!(quiet_open_visible(true, false, false));
+        assert!(quiet_open_visible(true, true, false));
     }
 }

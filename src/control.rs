@@ -10,7 +10,11 @@
 //! snapshot *before* the message is sent, so the exit code is meaningful
 //! without a reply channel.
 
+use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use relm4::adw;
 use relm4::gtk::gio;
@@ -19,6 +23,10 @@ use relm4::gtk::prelude::*;
 
 use crate::app::Msg;
 use crate::cli::{self, Action, Cli, GroupInfo, GroupTarget};
+
+/// How long one control-socket round trip may stall the GUI's main thread:
+/// a `screenshot` renders a frame and writes a PNG.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Control {
     groups: Arc<Mutex<Vec<GroupInfo>>>,
@@ -100,6 +108,47 @@ pub fn request_open_browser(group_uuid: String) -> bool {
     control.sender.send(Msg::OpenBrowser { group_uuid }).is_ok()
 }
 
+/// Ask the component to bring up Android in a group. Returns false when
+/// there is no component to ask, or when it has already shut down.
+pub fn request_open_android(group_uuid: String) -> bool {
+    let Some(control) = CONTROL.get() else {
+        return false;
+    };
+    control.sender.send(Msg::OpenAndroid { group_uuid }).is_ok()
+}
+
+/// One request to a pane's control socket: write `line` and a newline, shut
+/// the write half (the server serves a connection until EOF), read one reply
+/// line. The write and the read share one deadline, `timeout` from the
+/// connect, so the whole exchange is bounded by `timeout` (plus the connect
+/// itself, immediate on a local socket). A pane that closes without a reply
+/// is an error; running out of time is `TimedOut` or `WouldBlock`.
+pub fn send_control(socket: &Path, line: &str, timeout: Duration) -> std::io::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(line.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    // A zero timeout is rejected by the socket API; a spent deadline is a
+    // timeout already.
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    stream.set_read_timeout(Some(left))?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    if reply.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the pane closed the connection without a reply",
+        ));
+    }
+    Ok(reply)
+}
+
 /// Handle one invocation — the local one on a plain GUI start, or a remote
 /// one forwarded over the session bus by a second launch of the binary.
 ///
@@ -172,6 +221,39 @@ pub fn handle_command_line(
                 return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
             }
         }
+        // As for the browser: the endpoints arrive in the group's tmux
+        // sessions once Android has booted, so nothing is printed.
+        Some(Action::OpenAndroid { group_uuid }) => {
+            if !request_open_android(group_uuid) {
+                command_line.printerr_literal("kabelsalat: no window to open Android in\n");
+                return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
+            }
+        }
+        // One blocking round trip on this (the GTK) thread. Safe: the socket
+        // is served by the compositor's own threads, never by this one, and
+        // CONTROL_TIMEOUT bounds the stall.
+        Some(Action::Control { socket, line }) => {
+            let reply = match send_control(&socket, &line, CONTROL_TIMEOUT) {
+                Ok(reply) => reply,
+                Err(err) => {
+                    command_line.printerr_literal(&cli::control_error(
+                        &socket.display().to_string(),
+                        err.kind(),
+                        &err.to_string(),
+                        CONTROL_TIMEOUT.as_secs(),
+                    ));
+                    return glib::ExitCode::new(cli::EXIT_GROUP);
+                }
+            };
+            let answer = cli::control_reply(&reply);
+            if !answer.stdout.is_empty() {
+                command_line.print_literal(&answer.stdout);
+            }
+            if !answer.stderr.is_empty() {
+                command_line.printerr_literal(&answer.stderr);
+            }
+            return glib::ExitCode::new(answer.code);
+        }
         None => {}
     }
 
@@ -208,5 +290,92 @@ mod tests {
     #[test]
     fn an_open_browser_request_without_a_gui_is_refused() {
         assert!(!request_open_browser("aaa-111".into()));
+    }
+
+    fn socket_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kabelsalat-control-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_control_line_gets_its_reply() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = socket_dir("reply");
+        let socket = dir.join("ctl.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut writer = stream;
+            writer.write_all(b"ok\n").unwrap();
+            line
+        });
+        let reply = send_control(&socket, "click 10 20", Duration::from_secs(5)).unwrap();
+        assert_eq!(reply, "ok\n");
+        assert_eq!(server.join().unwrap(), "click 10 20\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pane_that_hangs_up_without_a_reply_is_an_error() {
+        let dir = socket_dir("silent");
+        let socket = dir.join("ctl.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(stream);
+        });
+        assert!(send_control(&socket, "ping", Duration::from_secs(5)).is_err());
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pane_that_never_answers_times_out() {
+        let dir = socket_dir("hang");
+        let socket = dir.join("ctl.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Accept, then hold the connection open without ever replying.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = held.recv();
+            drop(stream);
+        });
+        let (done, result) = std::sync::mpsc::channel();
+        let client_socket = socket.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(send_control(
+                &client_socket,
+                "ping",
+                Duration::from_millis(200),
+            ));
+        });
+        let reply = result.recv_timeout(Duration::from_secs(5));
+        let _ = release.send(());
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(reply, Ok(Err(_))),
+            "a silent pane must fail within the timeout: {reply:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_control_socket_is_an_error() {
+        let missing = Path::new("/nonexistent/kabelsalat-test/ctl.sock");
+        assert!(send_control(missing, "ping", Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn an_open_android_request_without_a_gui_is_refused() {
+        assert!(!request_open_android("aaa-111".into()));
     }
 }

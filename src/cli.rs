@@ -12,9 +12,11 @@ pub const EXIT_OK: u8 = 0;
 pub const EXIT_NOT_RUNNING: u8 = 1;
 /// Bad invocation: unknown flag, missing value, missing command.
 pub const EXIT_USAGE: u8 = 2;
-/// `--group` matched no group, or matched more than one.
+/// `--group` matched no group, or matched more than one; or the Android pane
+/// is remote, owned by another group, not open, or did not answer.
 pub const EXIT_GROUP: u8 = 3;
-/// `resume` could not reach tmux, start the server, or create a session.
+/// `resume` could not reach tmux, start the server, or create a session; or
+/// the Android pane answered a control request with an error.
 pub const EXIT_FAILED: u8 = 4;
 
 /// The variable every tab's tmux session carries: its group's uuid. Set by
@@ -24,6 +26,51 @@ pub const ENV_GROUP: &str = "KABELSALAT_GROUP";
 /// The variable that carries a group browser's CDP endpoint while it is up
 /// (`http://127.0.0.1:<port>`), alongside `PLAYWRIGHT_MCP_CDP_ENDPOINT`.
 pub const ENV_CDP: &str = "KABELSALAT_CDP";
+/// The same endpoint under the name Playwright's MCP server reads.
+pub const ENV_CDP_PLAYWRIGHT: &str = "PLAYWRIGHT_MCP_CDP_ENDPOINT";
+/// The endpoint pair: set on discovery, unset on browser close. `ENV_GROUP`
+/// is deliberately not in here — it describes the tab, not the browser, and
+/// is never unset.
+pub const CDP_ENV_KEYS: [&str; 2] = [ENV_CDP, ENV_CDP_PLAYWRIGHT];
+/// The Android pane's control socket, while a booted Android is up in the
+/// group (`screenshot`, `click`, `type`, `key`, `resize`; one line each).
+pub const ENV_ANDROID_CTL: &str = "KABELSALAT_ANDROID_CTL";
+/// The adb serial of that Android (`<ip>:5555`).
+pub const ENV_ANDROID_ADB: &str = "KABELSALAT_ANDROID_ADB";
+/// The Android pair: set once Android has booted, unset on stop or death.
+pub const ANDROID_ENV_KEYS: [&str; 2] = [ENV_ANDROID_CTL, ENV_ANDROID_ADB];
+
+/// One request to the Android pane's control socket, as typed on the command
+/// line. See `vendor/nested-wayland-session/src/protocol.rs` in klamottenkiste
+/// for the wire format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AndroidCmd {
+    /// Write the pane's current frame to this PNG file.
+    Screenshot(PathBuf),
+    /// Click at pane coordinates (Android sees a mouse, not a finger).
+    Tap(u32, u32),
+    /// Type this text, one key tap per character.
+    Type(String),
+    /// Tap one named key (`enter`, `escape`, `a`, …).
+    Key(String),
+    /// Resize the nested screen; Android follows.
+    Resize(u32, u32),
+}
+
+impl AndroidCmd {
+    /// The argv tail that parses back to this command.
+    pub fn args(&self) -> Vec<String> {
+        match self {
+            Self::Screenshot(path) => {
+                vec!["screenshot".into(), path.to_string_lossy().into_owned()]
+            }
+            Self::Tap(x, y) => vec!["tap".into(), x.to_string(), y.to_string()],
+            Self::Type(text) => vec!["type".into(), text.clone()],
+            Self::Key(name) => vec!["key".into(), name.clone()],
+            Self::Resize(w, h) => vec!["resize".into(), w.to_string(), h.to_string()],
+        }
+    }
+}
 
 /// What an invocation asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +84,15 @@ pub enum Cli {
         /// A group uuid or name; `None` until `with_default_group` fills it
         /// from the caller's `KABELSALAT_GROUP`.
         group: Option<String>,
+    },
+    /// Bring up Android in a group's pane area and print its endpoints, or
+    /// send one request to its pane's control socket.
+    Android {
+        /// A group uuid or name; `None` until `with_default_group` fills it
+        /// from the caller's `KABELSALAT_GROUP`.
+        group: Option<String>,
+        /// `None`: open it, or print `ctl=`/`adb=`. `Some`: one request.
+        cmd: Option<AndroidCmd>,
     },
     /// Recreate the claude sessions of saved tabs on the private tmux
     /// server, without a GUI: what the boot unit runs. Handled entirely in
@@ -68,7 +124,11 @@ impl Cli {
     pub fn needs_instance(&self) -> bool {
         matches!(
             self,
-            Cli::Groups | Cli::Run { .. } | Cli::Rename { .. } | Cli::Browser { .. }
+            Cli::Groups
+                | Cli::Run { .. }
+                | Cli::Rename { .. }
+                | Cli::Browser { .. }
+                | Cli::Android { .. }
         )
     }
 }
@@ -88,14 +148,51 @@ pub fn with_default_group(cli: Cli, env_group: Option<&str>) -> Result<Cli, Usag
                 "browser needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)"
             ))),
         },
+        Cli::Android { group: None, cmd } => match env_group.filter(|g| !g.is_empty()) {
+            Some(group) => Ok(Cli::Android {
+                group: Some(group.to_string()),
+                cmd,
+            }),
+            None => Err(UsageError(format!(
+                "android needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)"
+            ))),
+        },
         other => Ok(other),
     }
 }
 
+/// The Android pair, in the order `ENV_ANDROID_CTL`, `ENV_ANDROID_ADB`.
+pub fn android_env_pairs(ctl: &str, adb: &str) -> [(&'static str, String); 2] {
+    [
+        (ENV_ANDROID_CTL, ctl.to_string()),
+        (ENV_ANDROID_ADB, adb.to_string()),
+    ]
+}
+
+/// The variables a group's session is created with: the group identity
+/// always, the CDP pair while the browser has an endpoint, the Android pair
+/// while a booted Android is up. Pure.
+pub fn session_env_pairs(
+    group_uuid: &str,
+    cdp: Option<&str>,
+    android: Option<(&str, &str)>,
+) -> Vec<(&'static str, String)> {
+    let mut env = vec![(ENV_GROUP, group_uuid.to_string())];
+    if let Some(url) = cdp {
+        for key in CDP_ENV_KEYS {
+            env.push((key, url.to_string()));
+        }
+    }
+    if let Some((ctl, adb)) = android {
+        env.extend(android_env_pairs(ctl, adb));
+    }
+    env
+}
+
 /// One group as the CLI sees it: the stable uuid, the (possibly empty,
 /// possibly duplicated) name, how many tabs it holds, for a remote group
-/// the ssh destination its tabs run on, and the live CDP endpoint of its
-/// browser when it has one.
+/// the ssh destination its tabs run on, the live CDP endpoint of its
+/// browser when it has one, and its Android pane when it owns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupInfo {
     pub uuid: String,
@@ -103,6 +200,15 @@ pub struct GroupInfo {
     pub tabs: usize,
     pub host: Option<String>,
     pub cdp: Option<String>,
+    pub android: Option<AndroidInfo>,
+}
+
+/// A group's Android pane as the CLI sees it: its control socket from the
+/// moment it exists, its adb serial once Android has booted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AndroidInfo {
+    pub ctl: PathBuf,
+    pub adb: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +260,12 @@ Usage:
   kabelsalat browser [-g <group>]              Open <group>'s browser pane, or print its live
                                                CDP endpoint; <group> defaults to the caller's
                                                KABELSALAT_GROUP
+  kabelsalat android [-g <group>]              Open Android (Waydroid) in <group>'s pane area, or
+                                               print its control socket and adb serial as
+                                               ctl=/adb= lines; <group> defaults to the
+                                               caller's KABELSALAT_GROUP
+  kabelsalat android [-g <group>] screenshot PATH | tap X Y | type TEXT | key NAME | resize W H
+                                               Drive <group>'s Android pane
   kabelsalat resume                            Recreate saved claude sessions on the tmux
                                                server without a GUI (what the boot unit runs)
 
@@ -169,8 +281,9 @@ Options for run:
 
 Exit codes:
   0 success   1 kabelsalat not running   2 usage error
-  3 group not found, ambiguous, remote (browser), or the new name is already taken
-  4 resume could not reach tmux
+  3 group not found, ambiguous, remote (browser, android), the new name is already
+    taken, Android owned by another group or not open, or its pane did not answer
+  4 resume could not reach tmux, or the Android pane refused a request
 "
 }
 
@@ -195,6 +308,7 @@ pub fn parse(args: &[String]) -> Result<Cli, UsageError> {
         "run" => parse_run(&rest[1..]),
         "rename" => parse_rename(&rest[1..]),
         "browser" => parse_browser(&rest[1..]),
+        "android" => parse_android(&rest[1..]),
         "resume" => {
             if rest.len() > 1 {
                 return Err(UsageError(format!(
@@ -226,6 +340,179 @@ fn parse_browser(args: &[String]) -> Result<Cli, UsageError> {
         }
     }
     Ok(Cli::Browser { group })
+}
+
+/// `android [-g <group>] [SUBCOMMAND ARGS...]`. The group flag may only come
+/// before the subcommand, so text after `type` is never read as a flag.
+fn parse_android(args: &[String]) -> Result<Cli, UsageError> {
+    let mut group: Option<String> = None;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        if arg != "--group" && arg != "-g" {
+            break;
+        }
+        let value = args
+            .get(i + 1)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| UsageError(format!("{arg} needs a value")))?;
+        group = Some(value.clone());
+        i += 2;
+    }
+    // Only in the verb's place: after it, `--help` is an argument.
+    if matches!(args.get(i).map(String::as_str), Some("-h" | "--help")) {
+        return Ok(Cli::Help);
+    }
+    let cmd = parse_android_cmd(&args[i..])?;
+    Ok(Cli::Android { group, cmd })
+}
+
+/// The subcommand of `android`, if any.
+fn parse_android_cmd(args: &[String]) -> Result<Option<AndroidCmd>, UsageError> {
+    let Some((verb, rest)) = args.split_first() else {
+        return Ok(None);
+    };
+    let cmd = match (verb.as_str(), rest) {
+        ("screenshot", [path]) => {
+            if path.is_empty() {
+                return Err(UsageError("screenshot needs a file path".into()));
+            }
+            check_one_line("screenshot path", path)?;
+            // The pane trims its command line, and an argument that was not
+            // UTF-8 arrives with U+FFFD in it: either way the pane would
+            // write a file other than the one named.
+            if path.trim() != path {
+                return Err(UsageError(
+                    "the screenshot path cannot start or end with whitespace".into(),
+                ));
+            }
+            if path.contains('\u{FFFD}') {
+                return Err(UsageError(
+                    "the screenshot path is not valid UTF-8; choose another name".into(),
+                ));
+            }
+            AndroidCmd::Screenshot(PathBuf::from(path))
+        }
+        ("tap", [x, y]) => AndroidCmd::Tap(coordinate("tap x", x)?, coordinate("tap y", y)?),
+        ("type", [text]) => {
+            if text.is_empty() {
+                return Err(UsageError("type needs some text".into()));
+            }
+            check_one_line("text to type", text)?;
+            AndroidCmd::Type(text.clone())
+        }
+        ("key", [name]) => {
+            if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(UsageError(format!(
+                    "'{name}' is not a key name (one word, e.g. enter)"
+                )));
+            }
+            AndroidCmd::Key(name.clone())
+        }
+        ("resize", [w, h]) => AndroidCmd::Resize(
+            dimension("resize width", w)?,
+            dimension("resize height", h)?,
+        ),
+        ("screenshot" | "type" | "key", _) => {
+            return Err(UsageError(format!("{verb} takes exactly one argument")));
+        }
+        ("tap" | "resize", _) => {
+            return Err(UsageError(format!("{verb} takes exactly two numbers")));
+        }
+        (other, _) => return Err(UsageError(format!("unknown android command '{other}'"))),
+    };
+    Ok(Some(cmd))
+}
+
+/// The control protocol is one request per line, so a value that would end
+/// the line early is a usage error.
+fn check_one_line(what: &str, value: &str) -> Result<(), UsageError> {
+    if value.contains(['\n', '\r']) {
+        return Err(UsageError(format!("the {what} must be a single line")));
+    }
+    Ok(())
+}
+
+fn coordinate(what: &str, value: &str) -> Result<u32, UsageError> {
+    value.parse().map_err(|_| {
+        UsageError(format!(
+            "{what} must be a whole number of pixels (got '{value}')"
+        ))
+    })
+}
+
+/// A screen dimension: the protocol takes a positive `i32`.
+fn dimension(what: &str, value: &str) -> Result<u32, UsageError> {
+    let n = coordinate(what, value)?;
+    if n == 0 || n > i32::MAX as u32 {
+        return Err(UsageError(format!(
+            "{what} must be between 1 and {}",
+            i32::MAX
+        )));
+    }
+    Ok(n)
+}
+
+/// The argv a caller forwards to the running GUI once its group is known:
+/// `android -g <group>` plus the subcommand's own arguments.
+pub fn android_argv(argv0: &str, group: &str, cmd: Option<&AndroidCmd>) -> Vec<String> {
+    let mut argv = vec![
+        argv0.to_string(),
+        "android".to_string(),
+        "-g".to_string(),
+        group.to_string(),
+    ];
+    if let Some(cmd) = cmd {
+        argv.extend(cmd.args());
+    }
+    argv
+}
+
+/// The control-socket request line for `cmd`, without the newline. Pure.
+pub fn control_line(cmd: &AndroidCmd) -> String {
+    match cmd {
+        AndroidCmd::Screenshot(path) => format!("screenshot {}", path.display()),
+        AndroidCmd::Tap(x, y) => format!("click {x} {y}"),
+        AndroidCmd::Type(text) => format!("type {text}"),
+        AndroidCmd::Key(name) => format!("key {name}"),
+        AndroidCmd::Resize(w, h) => format!("resize {w} {h}"),
+    }
+}
+
+/// What a reply line from the pane prints and exits with: `ok` → nothing,
+/// `ok <data>` → the data, `err <message>` → the message and exit 4. Pure.
+pub fn control_reply(reply: &str) -> Outcome {
+    let line = reply.trim_end_matches(['\r', '\n']);
+    if line == "ok" {
+        return Outcome::ok(String::new());
+    }
+    if let Some(data) = line.strip_prefix("ok ") {
+        return Outcome::ok(format!("{data}\n"));
+    }
+    if let Some(message) = line.strip_prefix("err ") {
+        return Outcome::fail(EXIT_FAILED, format!("kabelsalat: android: {message}\n"));
+    }
+    Outcome::fail(
+        EXIT_FAILED,
+        format!("kabelsalat: android: unexpected reply from the pane: '{line}'\n"),
+    )
+}
+
+/// The stderr line for a control-socket round trip that failed with an I/O
+/// error of `kind` (`detail` is its text): a timeout is said as one, with the
+/// bound `timeout_secs`, whatever the platform calls it. Pure.
+pub fn control_error(
+    socket: &str,
+    kind: std::io::ErrorKind,
+    detail: &str,
+    timeout_secs: u64,
+) -> String {
+    let why = match kind {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            format!("timed out after {timeout_secs} s")
+        }
+        _ => detail.to_string(),
+    };
+    format!("kabelsalat: the Android pane did not answer on {socket}: {why}\n")
 }
 
 /// Flags of `run`, up to the mandatory `--`. The separator is required: without
@@ -358,6 +645,16 @@ pub enum Action {
     OpenBrowser {
         group_uuid: String,
     },
+    /// Bring up Android in this group. Inert like `OpenBrowser`: no focus,
+    /// no raise, no active-group change, no front-pane change.
+    OpenAndroid {
+        group_uuid: String,
+    },
+    /// Send `line` to the Android pane's control socket and print the reply.
+    Control {
+        socket: PathBuf,
+        line: String,
+    },
 }
 
 /// The complete result of an invocation: what to print, what to exit with,
@@ -488,6 +785,80 @@ pub fn dispatch(cli: &Cli, groups: &[GroupInfo], caller_cwd: &Path) -> Outcome {
                 },
             }
         }
+        // control.rs fills the default before dispatching, as for browser.
+        Cli::Android { group: None, .. } => Outcome::fail(
+            EXIT_USAGE,
+            format!("android needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)\n"),
+        ),
+        Cli::Android {
+            group: Some(group),
+            cmd,
+        } => {
+            let target = match resolve_group(groups, group) {
+                Ok(found) => found,
+                Err(err) => return resolve_failure(group, err),
+            };
+            if let Some(host) = &target.host {
+                return Outcome::fail(
+                    EXIT_GROUP,
+                    format!("the Android pane is local, but '{group}' runs on {host}\n"),
+                );
+            }
+            // One Waydroid per machine, so at most one owner.
+            let owner = groups.iter().find(|g| g.android.is_some());
+            if let Some(other) = owner.filter(|o| o.uuid != target.uuid) {
+                return Outcome::fail(
+                    EXIT_GROUP,
+                    format!(
+                        "Android is open in group '{}'; there is one per machine, \
+                         so stop it there first\n",
+                        display_name(other)
+                    ),
+                );
+            }
+            match (owner.and_then(|o| o.android.as_ref()), cmd) {
+                (Some(info), None) => match &info.adb {
+                    Some(adb) => Outcome::ok(format!("ctl={}\nadb={adb}\n", info.ctl.display())),
+                    None => Outcome {
+                        stdout: String::new(),
+                        stderr: format!(
+                            "kabelsalat: Android in group '{}' is still booting; read \
+                             {ENV_ANDROID_CTL} from `tmux show-environment` once it is there\n",
+                            display_name(target)
+                        ),
+                        code: EXIT_OK,
+                        action: None,
+                    },
+                },
+                (Some(info), Some(cmd)) => Outcome {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    code: EXIT_OK,
+                    action: Some(Action::Control {
+                        socket: info.ctl.clone(),
+                        line: control_line(&with_absolute_path(cmd, caller_cwd)),
+                    }),
+                },
+                (None, None) => Outcome {
+                    stdout: String::new(),
+                    stderr: format!(
+                        "kabelsalat: bringing up Android in group '{}' (about 20 s); read \
+                         {ENV_ANDROID_CTL} from `tmux show-environment` once it is there\n",
+                        display_name(target)
+                    ),
+                    code: EXIT_OK,
+                    action: Some(Action::OpenAndroid {
+                        group_uuid: target.uuid.clone(),
+                    }),
+                },
+                (None, Some(_)) => Outcome::fail(
+                    EXIT_GROUP,
+                    format!(
+                        "group '{group}' has no Android pane; run `kabelsalat android` first\n"
+                    ),
+                ),
+            }
+        }
         // Reaching the GUI means it is running, and then the sessions are
         // its to manage: nothing to do, and nothing wrong.
         Cli::Resume => Outcome {
@@ -549,6 +920,25 @@ fn resolve_failure(selector: &str, err: ResolveError) -> Outcome {
                 uuids.iter().map(|u| format!("  {u}\n")).collect::<String>()
             ),
         ),
+    }
+}
+
+/// A group's name for messages, or its uuid when it has none.
+fn display_name(group: &GroupInfo) -> &str {
+    if group.name.is_empty() {
+        &group.uuid
+    } else {
+        &group.name
+    }
+}
+
+/// `cmd` with a relative screenshot path resolved against the caller's
+/// directory: the compositor writes the file from inside the GUI process,
+/// whose directory is not the caller's.
+fn with_absolute_path(cmd: &AndroidCmd, caller_cwd: &Path) -> AndroidCmd {
+    match cmd {
+        AndroidCmd::Screenshot(path) => AndroidCmd::Screenshot(caller_cwd.join(path)),
+        other => other.clone(),
     }
 }
 
@@ -668,6 +1058,7 @@ mod tests {
                 tabs: 2,
                 host: None,
                 cdp: None,
+                android: None,
             },
             GroupInfo {
                 uuid: "bbb-222".into(),
@@ -675,6 +1066,7 @@ mod tests {
                 tabs: 1,
                 host: None,
                 cdp: None,
+                android: None,
             },
             GroupInfo {
                 uuid: "ccc-333".into(),
@@ -682,6 +1074,7 @@ mod tests {
                 tabs: 3,
                 host: None,
                 cdp: None,
+                android: None,
             },
             GroupInfo {
                 uuid: "ddd-444".into(),
@@ -689,6 +1082,7 @@ mod tests {
                 tabs: 1,
                 host: None,
                 cdp: None,
+                android: None,
             },
         ]
     }
@@ -738,6 +1132,7 @@ mod tests {
                 tabs: 1,
                 host: None,
                 cdp: None,
+                android: None,
             },
             GroupInfo {
                 uuid: "qqq".into(),
@@ -745,6 +1140,7 @@ mod tests {
                 tabs: 1,
                 host: None,
                 cdp: None,
+                android: None,
             },
         ];
         assert_eq!(resolve_group(&groups, "xyz").unwrap().uuid, "xyz");
@@ -1019,6 +1415,7 @@ mod tests {
                 tabs: 1,
                 host: Some("me@box".into()),
                 cdp: None,
+                android: None,
             },
             GroupInfo {
                 uuid: "lll-666".into(),
@@ -1026,6 +1423,7 @@ mod tests {
                 tabs: 1,
                 host: None,
                 cdp: None,
+                android: None,
             },
         ]
     }
@@ -1162,6 +1560,7 @@ mod tests {
                 tabs: 2,
                 host: None,
                 cdp: Some("http://127.0.0.1:40455".into()),
+                android: None,
             },
             GroupInfo {
                 uuid: "bbb-222".into(),
@@ -1169,6 +1568,7 @@ mod tests {
                 tabs: 1,
                 host: None,
                 cdp: None,
+                android: None,
             },
             GroupInfo {
                 uuid: "rrr-555".into(),
@@ -1176,6 +1576,7 @@ mod tests {
                 tabs: 1,
                 host: Some("me@box".into()),
                 cdp: None,
+                android: None,
             },
         ]
     }
@@ -1247,5 +1648,466 @@ mod tests {
         assert!(help_text().contains("kabelsalat browser"));
         assert!(help_text().contains("kabelsalat resume"));
         assert!(help_text().contains(&format!("{EXIT_FAILED} ")));
+    }
+
+    // --- session environment ---
+
+    #[test]
+    fn a_session_always_names_its_group() {
+        assert_eq!(
+            session_env_pairs("aaa-111", None, None),
+            vec![(ENV_GROUP, "aaa-111".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_live_browser_adds_the_cdp_pair() {
+        assert_eq!(
+            session_env_pairs("aaa-111", Some("http://127.0.0.1:40455"), None),
+            vec![
+                (ENV_GROUP, "aaa-111".to_string()),
+                ("KABELSALAT_CDP", "http://127.0.0.1:40455".to_string()),
+                (
+                    "PLAYWRIGHT_MCP_CDP_ENDPOINT",
+                    "http://127.0.0.1:40455".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_booted_android_adds_its_control_socket_and_serial() {
+        assert_eq!(
+            session_env_pairs(
+                "aaa-111",
+                None,
+                Some(("/tmp/ctl.sock", "192.168.240.112:5555"))
+            ),
+            vec![
+                (ENV_GROUP, "aaa-111".to_string()),
+                ("KABELSALAT_ANDROID_CTL", "/tmp/ctl.sock".to_string()),
+                ("KABELSALAT_ANDROID_ADB", "192.168.240.112:5555".to_string()),
+            ]
+        );
+        assert_eq!(
+            android_env_pairs("/tmp/ctl.sock", "10.0.3.9:5555"),
+            [
+                (ENV_ANDROID_CTL, "/tmp/ctl.sock".to_string()),
+                (ENV_ANDROID_ADB, "10.0.3.9:5555".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_comes_first_then_the_cdp_pair_then_the_android_pair() {
+        assert_eq!(
+            session_env_pairs(
+                "aaa-111",
+                Some("http://127.0.0.1:40455"),
+                Some(("/tmp/ctl.sock", "10.0.3.9:5555"))
+            ),
+            vec![
+                (ENV_GROUP, "aaa-111".to_string()),
+                (ENV_CDP, "http://127.0.0.1:40455".to_string()),
+                (ENV_CDP_PLAYWRIGHT, "http://127.0.0.1:40455".to_string()),
+                (ENV_ANDROID_CTL, "/tmp/ctl.sock".to_string()),
+                (ENV_ANDROID_ADB, "10.0.3.9:5555".to_string()),
+            ]
+        );
+    }
+
+    // --- android ---
+
+    fn android(group: &str, cmd: Option<AndroidCmd>) -> Cli {
+        Cli::Android {
+            group: Some(group.into()),
+            cmd,
+        }
+    }
+
+    #[test]
+    fn android_parses_with_and_without_a_group() {
+        assert_eq!(
+            parse(&args(&["android"])),
+            Ok(Cli::Android {
+                group: None,
+                cmd: None
+            })
+        );
+        assert_eq!(
+            parse(&args(&["android", "-g", "web"])),
+            Ok(android("web", None))
+        );
+        assert_eq!(
+            parse(&args(&["android", "--group", "aaa-111", "tap", "10", "20"])),
+            Ok(android("aaa-111", Some(AndroidCmd::Tap(10, 20))))
+        );
+    }
+
+    #[test]
+    fn android_parses_every_subcommand() {
+        let cases = [
+            (
+                vec!["screenshot", "/tmp/a b.png"],
+                AndroidCmd::Screenshot(PathBuf::from("/tmp/a b.png")),
+            ),
+            (vec!["tap", "0", "1080"], AndroidCmd::Tap(0, 1080)),
+            (
+                vec!["type", "hello world"],
+                AndroidCmd::Type("hello world".into()),
+            ),
+            (vec!["key", "enter"], AndroidCmd::Key("enter".into())),
+            (vec!["resize", "720", "1280"], AndroidCmd::Resize(720, 1280)),
+        ];
+        for (tail, cmd) in cases {
+            let mut argv = vec!["android"];
+            argv.extend(tail);
+            assert_eq!(
+                parse(&args(&argv)),
+                Ok(Cli::Android {
+                    group: None,
+                    cmd: Some(cmd)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn the_group_flag_only_counts_before_the_subcommand() {
+        // Text to type is never read as a flag.
+        assert_eq!(
+            parse(&args(&["android", "type", "-g"])),
+            Ok(Cli::Android {
+                group: None,
+                cmd: Some(AndroidCmd::Type("-g".into()))
+            })
+        );
+    }
+
+    #[test]
+    fn a_control_timeout_names_the_bound() {
+        let timed_out = control_error(
+            "/tmp/ctl.sock",
+            std::io::ErrorKind::TimedOut,
+            "connection timed out",
+            10,
+        );
+        assert_eq!(
+            timed_out,
+            "kabelsalat: the Android pane did not answer on /tmp/ctl.sock: timed out after 10 s\n"
+        );
+        let would_block = control_error(
+            "/tmp/ctl.sock",
+            std::io::ErrorKind::WouldBlock,
+            "Resource temporarily unavailable (os error 11)",
+            10,
+        );
+        assert_eq!(would_block, timed_out);
+        assert_eq!(
+            control_error(
+                "/tmp/ctl.sock",
+                std::io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+                10,
+            ),
+            "kabelsalat: the Android pane did not answer on /tmp/ctl.sock: \
+             No such file or directory (os error 2)\n"
+        );
+    }
+
+    #[test]
+    fn android_help_is_help() {
+        for argv in [
+            vec!["android", "-h"],
+            vec!["android", "--help"],
+            vec!["android", "-g", "web", "--help"],
+        ] {
+            assert_eq!(parse(&args(&argv)), Ok(Cli::Help), "{argv:?}");
+        }
+        // Past the verb it is an argument: `type --help` types it.
+        assert_eq!(
+            parse(&args(&["android", "type", "--help"])),
+            Ok(Cli::Android {
+                group: None,
+                cmd: Some(AndroidCmd::Type("--help".into())),
+            })
+        );
+    }
+
+    #[test]
+    fn android_screenshot_paths_the_pane_would_mangle_are_usage_errors() {
+        // The pane trims the line, and a path that was not UTF-8 reaches us
+        // with replacement characters: neither names the file asked for.
+        for path in [" shot.png", "shot.png ", "\tshot.png", "sh\u{FFFD}t.png"] {
+            let err = parse(&args(&["android", "screenshot", path]));
+            assert!(err.is_err(), "{path:?} should be a usage error");
+        }
+        assert!(parse(&args(&["android", "screenshot", "my shot.png"])).is_ok());
+    }
+
+    #[test]
+    fn android_usage_errors() {
+        let bad = [
+            vec!["android", "-g"],
+            vec!["android", "-g", ""],
+            vec!["android", "swipe", "1", "2"],
+            vec!["android", "tap", "1"],
+            vec!["android", "tap", "1", "2", "3"],
+            vec!["android", "tap", "x", "2"],
+            vec!["android", "tap", "-1", "2"],
+            vec!["android", "tap", "1", "2", "-g", "web"],
+            vec!["android", "resize", "0", "10"],
+            vec!["android", "resize", "10"],
+            vec!["android", "resize", "3000000000", "10"],
+            vec!["android", "type"],
+            vec!["android", "type", ""],
+            vec!["android", "type", "a\nb"],
+            vec!["android", "key", ""],
+            vec!["android", "key", "two words"],
+            vec!["android", "screenshot"],
+            vec!["android", "screenshot", ""],
+            vec!["android", "screenshot", "a\nb.png"],
+        ];
+        for argv in bad {
+            assert!(
+                parse(&args(&argv)).is_err(),
+                "{argv:?} should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn android_argv_round_trips_through_parse() {
+        let cmds = [
+            None,
+            Some(AndroidCmd::Screenshot(PathBuf::from("/tmp/a b.png"))),
+            Some(AndroidCmd::Tap(3, 4)),
+            Some(AndroidCmd::Type("-g x".into())),
+            Some(AndroidCmd::Key("enter".into())),
+            Some(AndroidCmd::Resize(720, 1280)),
+        ];
+        for cmd in cmds {
+            let argv = android_argv("kabelsalat", "aaa-111", cmd.as_ref());
+            assert_eq!(parse(&argv), Ok(android("aaa-111", cmd)));
+        }
+    }
+
+    #[test]
+    fn control_lines_follow_the_pane_protocol() {
+        assert_eq!(
+            control_line(&AndroidCmd::Screenshot("/tmp/a b.png".into())),
+            "screenshot /tmp/a b.png"
+        );
+        assert_eq!(control_line(&AndroidCmd::Tap(10, 20)), "click 10 20");
+        assert_eq!(
+            control_line(&AndroidCmd::Type("hello world".into())),
+            "type hello world"
+        );
+        assert_eq!(control_line(&AndroidCmd::Key("enter".into())), "key enter");
+        assert_eq!(
+            control_line(&AndroidCmd::Resize(720, 1280)),
+            "resize 720 1280"
+        );
+    }
+
+    #[test]
+    fn control_replies_become_outcomes() {
+        let ok = control_reply("ok\n");
+        assert_eq!(
+            (ok.code, ok.stdout.as_str(), ok.stderr.as_str()),
+            (EXIT_OK, "", "")
+        );
+        let data = control_reply("ok /tmp/a.png\n");
+        assert_eq!((data.code, data.stdout.as_str()), (EXIT_OK, "/tmp/a.png\n"));
+        let err = control_reply("err no frame yet\n");
+        assert_eq!(err.code, EXIT_FAILED);
+        assert_eq!(err.stderr, "kabelsalat: android: no frame yet\n");
+        let garbage = control_reply("what\n");
+        assert_eq!(garbage.code, EXIT_FAILED);
+        assert!(garbage.stderr.contains("what"), "{}", garbage.stderr);
+        assert!(ok.action.is_none() && err.action.is_none());
+    }
+
+    #[test]
+    fn the_callers_group_variable_fills_android_too() {
+        let filled = with_default_group(
+            Cli::Android {
+                group: None,
+                cmd: Some(AndroidCmd::Key("enter".into())),
+            },
+            Some("aaa-111"),
+        );
+        assert_eq!(
+            filled,
+            Ok(android("aaa-111", Some(AndroidCmd::Key("enter".into()))))
+        );
+        assert!(
+            with_default_group(
+                Cli::Android {
+                    group: None,
+                    cmd: None
+                },
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::Android {
+                group: None,
+                cmd: None
+            }
+            .needs_instance()
+        );
+    }
+
+    fn android_groups() -> Vec<GroupInfo> {
+        vec![
+            GroupInfo {
+                uuid: "aaa-111".into(),
+                name: "web".into(),
+                tabs: 2,
+                host: None,
+                cdp: None,
+                android: Some(AndroidInfo {
+                    ctl: PathBuf::from("/tmp/ctl.sock"),
+                    adb: Some("192.168.240.112:5555".into()),
+                }),
+            },
+            GroupInfo {
+                uuid: "bbb-222".into(),
+                name: "api".into(),
+                tabs: 1,
+                host: None,
+                cdp: None,
+                android: None,
+            },
+            GroupInfo {
+                uuid: "rrr-555".into(),
+                name: "box".into(),
+                tabs: 1,
+                host: Some("me@box".into()),
+                cdp: None,
+                android: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn android_prints_its_endpoints_when_owned_and_booted() {
+        let out = dispatch(&android("web", None), &android_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "ctl=/tmp/ctl.sock\nadb=192.168.240.112:5555\n");
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn android_still_booting_prints_nothing_and_asks_nothing() {
+        let mut groups = android_groups();
+        if let Some(info) = groups[0].android.as_mut() {
+            info.adb = None;
+        }
+        let out = dispatch(&android("web", None), &groups, Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert!(out.stderr.contains("booting"), "{}", out.stderr);
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn android_asks_the_gui_when_nobody_owns_it() {
+        // browser_groups(): nobody has an Android.
+        let out = dispatch(&android("api", None), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert_eq!(
+            out.action,
+            Some(Action::OpenAndroid {
+                group_uuid: "bbb-222".into()
+            })
+        );
+    }
+
+    #[test]
+    fn android_refuses_while_another_group_owns_it() {
+        for cmd in [None, Some(AndroidCmd::Tap(1, 2))] {
+            let out = dispatch(&android("api", cmd), &android_groups(), Path::new("/w"));
+            assert_eq!(out.code, EXIT_GROUP);
+            assert!(out.action.is_none());
+            assert!(out.stderr.contains("web"), "{}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn android_refuses_a_remote_group() {
+        let out = dispatch(&android("box", None), &browser_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+        assert!(out.stderr.contains("me@box"), "{}", out.stderr);
+    }
+
+    #[test]
+    fn android_on_an_unknown_group_or_without_one_fails() {
+        let out = dispatch(&android("nope", None), &android_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_GROUP);
+        let out = dispatch(
+            &Cli::Android {
+                group: None,
+                cmd: None,
+            },
+            &android_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_USAGE);
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn a_subcommand_without_an_owned_pane_is_exit_3() {
+        let out = dispatch(
+            &android("api", Some(AndroidCmd::Tap(1, 2))),
+            &browser_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_GROUP);
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn a_subcommand_sends_one_line_to_the_owned_pane() {
+        let out = dispatch(
+            &android("web", Some(AndroidCmd::Tap(10, 20))),
+            &android_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(
+            out.action,
+            Some(Action::Control {
+                socket: PathBuf::from("/tmp/ctl.sock"),
+                line: "click 10 20".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_relative_screenshot_path_is_the_callers() {
+        let out = dispatch(
+            &android("web", Some(AndroidCmd::Screenshot("shots/a.png".into()))),
+            &android_groups(),
+            Path::new("/home/u/proj"),
+        );
+        assert_eq!(
+            out.action,
+            Some(Action::Control {
+                socket: PathBuf::from("/tmp/ctl.sock"),
+                line: "screenshot /home/u/proj/shots/a.png".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn help_lists_android() {
+        assert!(help_text().contains("kabelsalat android [-g <group>]"));
+        assert!(help_text().contains("screenshot PATH"));
     }
 }

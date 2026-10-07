@@ -38,10 +38,12 @@ This file provides guidance to Claude Code when working with code in this reposi
   it is where the CLI's unit tests live. `src/control.rs` holds the gio glue and
   the group snapshot the command-line handler reads.
 - A CLI-created tab must not steal focus: no activate, no window raise, no
-  active-group change, and no touching the group's browser pane. `kabelsalat
-  browser` is the one command that touches a pane — only the named group's,
-  brought up hidden unless that group is active — under the same no-focus,
-  no-raise, no-switch rules.
+  active-group change, and no touching the group's panes. `kabelsalat
+  browser` and `kabelsalat android` are the two commands that touch a pane —
+  only the named group's, brought up hidden unless that group is active —
+  under the same no-focus, no-raise, no-switch rules. `android` additionally
+  forwards control-socket commands, to the named group's own Android pane
+  only.
 - `src/autostart.rs` is pure over the facts it is handed (unit text, status
   classification, dialog responses) plus thin `systemctl --user` runners;
   `src/resume.rs` is the `kabelsalat resume` glue and never writes
