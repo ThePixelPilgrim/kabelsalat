@@ -881,6 +881,13 @@ pub enum Msg {
     OpenBrowser {
         group_uuid: String,
     },
+    /// A `kabelsalat android` invocation: bring up Android in the group if
+    /// nobody has it. Like `OpenBrowser` it takes no focus, raises no window
+    /// and changes no active group; it becomes the front pane only as the
+    /// group's first pane, and the area only appears for the active group.
+    OpenAndroid {
+        group_uuid: String,
+    },
     /// A remote host's worker reported back.
     Remote {
         host: String,
@@ -1908,6 +1915,7 @@ impl SimpleComponent for App {
                 }
             }
             Msg::OpenBrowser { group_uuid } => self.open_browser(&group_uuid),
+            Msg::OpenAndroid { group_uuid } => self.open_android(&group_uuid),
             Msg::SpawnCommand {
                 group,
                 tab_uuid,
@@ -2435,9 +2443,11 @@ impl App {
         self.publish_groups();
     }
 
-    /// Publish the groups for the CLI: on every save, and on `CdpReady`,
-    /// which changes nothing the state file records but is exactly what
-    /// `kabelsalat browser` asks about.
+    /// Publish the groups for the CLI: on every save, and on `CdpReady`/
+    /// `AndroidReady`, which change nothing the state file records but are
+    /// exactly what `kabelsalat browser`/`kabelsalat android` ask about. The
+    /// adb serial is published only while the pane reported ready and still
+    /// runs: an `Android` torn down at shutdown stays on its group.
     fn publish_groups(&self) {
         control::publish(
             self.groups
@@ -2448,6 +2458,10 @@ impl App {
                     tabs: self.tabs.iter().filter(|t| t.group == g.id).count(),
                     host: g.host.clone(),
                     cdp: g.browser.as_ref().and_then(|b| b.cdp_url()),
+                    android: g.android.as_ref().map(|a| crate::cli::AndroidInfo {
+                        ctl: a.control_socket_path().to_path_buf(),
+                        adb: a.adb().filter(|_| a.is_running()).map(str::to_string),
+                    }),
                 })
                 .collect(),
         );
@@ -3994,6 +4008,38 @@ impl App {
         }
         self.sync_pane_host();
         self.focus_panes_or_terminal();
+    }
+
+    /// `kabelsalat android`: bring Android up quietly — never focus, never
+    /// switch groups, never raise. `spawn_android` adds the page quietly (it
+    /// becomes the front pane only when it is the group's first); this shows
+    /// the area only for the active group's first pane. Refusals (owned
+    /// elsewhere since the CLI's snapshot, Waydroid missing) are reported
+    /// like `open_browser`'s.
+    fn open_android(&mut self, group_uuid: &str) {
+        let Some((id, other_open, has_android)) = self
+            .groups
+            .iter()
+            .find(|g| g.uuid == group_uuid)
+            .map(|g| (g.id, g.has_panes(), g.android.is_some()))
+        else {
+            eprintln!("android request for unknown group {group_uuid}");
+            return;
+        };
+        if has_android {
+            return;
+        }
+        let active = self.active_group() == Some(id);
+        if let Err(message) = self.spawn_android(id) {
+            eprintln!("kabelsalat: opening Android in group {id}: {message}");
+            self.show_notice(&message);
+            return;
+        }
+        if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+            group.panes_visible =
+                state::quiet_open_visible(group.panes_visible, active, other_open);
+        }
+        self.sync_pane_host();
     }
 
     /// "Stop Android" / the tab's close button: wherever it runs.
