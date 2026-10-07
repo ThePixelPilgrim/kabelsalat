@@ -377,12 +377,6 @@ impl Browser {
         &self.pane
     }
 
-    /// Show or hide the pane. Hiding only pauses the frame pump — the
-    /// compositor and Chromium keep running, so page state survives.
-    pub fn set_visible(&self, visible: bool) {
-        self.pane.set_visible(visible);
-    }
-
     /// Is the pane's compositor still running, i.e. is there anything left to
     /// render a frame? Says nothing about the hosted Chromium, which has its
     /// own answer in [`Browser::has_exited`].

@@ -2344,14 +2344,14 @@ impl App {
         for host in state::remote_hosts(&saved) {
             self.connect_host(&host);
         }
+        // Same reasoning as the browsers below: filled before the save, so the
+        // state written below still names the owner while the restore waits.
+        self.pending_android_restore = state::android_restore_target(&saved);
         // Before the save, not after: this fills `pending_browser_restore`, so
         // the state written below already records every restored group as
         // browser_open (see `browser_open_desired`). Reversing the order would
         // persist browser_open=false for all of them until the first
         // RestoreBrowser save.
-        // Same reasoning as the browsers: filled before the save, so the
-        // state written below still names the owner while the restore waits.
-        self.pending_android_restore = state::android_restore_target(&saved);
         self.start_browser_maintenance();
         self.queue_android_restore();
         self.save_state();
@@ -3286,12 +3286,8 @@ impl App {
             }
             BrowserKeyStep::Front => {
                 if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                    group.front_pane = state::front_after_open(
-                        group.front_pane,
-                        PaneKind::Browser,
-                        group.has_panes(),
-                        false,
-                    );
+                    // The browser is open: the key brings it to the front.
+                    group.front_pane = PaneKind::Browser;
                     group.panes_visible = true;
                 }
             }
@@ -3336,6 +3332,7 @@ impl App {
         let Some(mut browser) = group.browser.take() else {
             return;
         };
+        let had_focus = pane_has_focus(browser.widget().upcast_ref());
         // Unparent first, so the compositor is torn down outside the layout.
         group.panes.remove(PaneKind::Browser);
         let other_open = group.has_panes();
@@ -3351,6 +3348,16 @@ impl App {
         self.sync_pane_host();
         browser.teardown(disposition);
         drop(browser);
+        self.refocus_after_close(id, had_focus);
+    }
+
+    /// After a pane of group `id` closed: if it held the keyboard, hand it to
+    /// what is in front now (another pane or the terminal), so nothing is
+    /// left focused-on-nothing. A pane that did not have focus moves nothing.
+    fn refocus_after_close(&self, id: usize, had_focus: bool) {
+        if had_focus && self.active_group() == Some(id) {
+            self.focus_panes_or_terminal();
+        }
     }
 
     /// Remember the divider position of the split the user just dragged, on
@@ -3718,38 +3725,34 @@ impl App {
     }
 
     /// Bring a restored group's Android back, hidden: the area's visibility
-    /// is left as restored, and the front pane only changes when Android is
-    /// the group's only pane. A group that vanished or got an Android
-    /// meanwhile is skipped. A failure is reported once and forgets the
-    /// owner, so a broken Waydroid does not nag at every start.
+    /// is left as restored, and `spawn_android` adds the page quietly, so
+    /// the front pane only changes when Android is the group's only pane. A
+    /// group that vanished or got an Android meanwhile is skipped, and so,
+    /// with a log line only, is one whose Android another group took
+    /// meanwhile. A failure is reported once and forgets the owner, so a
+    /// broken Waydroid does not nag at every start.
     fn restore_android(&mut self, id: usize) {
         if self.pending_android_restore != Some(id) {
             return;
         }
         self.pending_android_restore = None;
-        let Some(other_open) = self
+        if !self
             .groups
             .iter()
-            .find(|g| g.id == id && g.android.is_none())
-            .map(Group::has_panes)
-        else {
+            .any(|g| g.id == id && g.android.is_none())
+        {
             return;
-        };
-        match self.spawn_android(id) {
-            Ok(()) => {
-                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                    group.front_pane = state::front_after_open(
-                        group.front_pane,
-                        PaneKind::Android,
-                        other_open,
-                        true,
-                    );
-                }
-            }
-            Err(message) => {
-                eprintln!("kabelsalat: restoring Android for group {id}: {message}");
-                self.show_notice(&message);
-            }
+        }
+        if let Some(owner) = self.groups.iter().find(|g| g.android.is_some()) {
+            eprintln!(
+                "kabelsalat: not restoring Android for group {id}: group {} has it",
+                owner.id
+            );
+            return;
+        }
+        if let Err(message) = self.spawn_android(id) {
+            eprintln!("kabelsalat: restoring Android for group {id}: {message}");
+            self.show_notice(&message);
         }
         self.sync_pane_host();
     }
@@ -4004,12 +4007,8 @@ impl App {
             return;
         }
         if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-            group.front_pane = state::front_after_open(
-                group.front_pane,
-                PaneKind::Android,
-                group.has_panes(),
-                false,
-            );
+            // Open now, freshly or already: the key brings it to the front.
+            group.front_pane = PaneKind::Android;
             group.panes_visible = true;
         }
         self.sync_pane_host();
@@ -4077,6 +4076,7 @@ impl App {
         let Some(mut android) = group.android.take() else {
             return;
         };
+        let had_focus = pane_has_focus(android.widget().upcast_ref());
         group.panes.remove(PaneKind::Android);
         let other_open = group.has_panes();
         group.front_pane =
@@ -4088,6 +4088,7 @@ impl App {
         android.teardown();
         drop(android);
         self.publish_groups();
+        self.refocus_after_close(id, had_focus);
     }
 
     /// The boot thread's success: record the serial, publish the pair. A
@@ -5952,6 +5953,11 @@ where
         .filter(|(id, _, has_browser)| !has_browser && !live.contains(id))
         .map(|(_, uuid, _)| uuid.to_string())
         .collect()
+}
+
+/// Whether the keyboard focus is in `widget` or one of its descendants.
+fn pane_has_focus(widget: &gtk::Widget) -> bool {
+    widget.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN)
 }
 
 /// May the stale-profile sweep run? Only when the group uuids in the loaded

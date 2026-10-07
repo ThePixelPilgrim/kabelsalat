@@ -81,8 +81,9 @@ pub enum Precondition {
     /// No `waydroid` on `PATH`, or it could not be run at all.
     NoBinary,
     NotInitialised,
-    /// A session already runs on this display. One Waydroid per machine, and
-    /// its display is fixed at `session start`.
+    /// A session already runs on another display, or on one Waydroid did not
+    /// name (empty), so it is not ours. One Waydroid per machine, and its
+    /// display is fixed at `session start`.
     ForeignSession(String),
 }
 
@@ -627,6 +628,11 @@ impl BootWatch {
                     BootStep::Up => return Ok(adb_serial(&output)),
                     BootStep::Wait => {}
                     BootStep::Foreign(display) => {
+                        // Teardown reads this flag once. A teardown that read
+                        // it just before this store would run the global
+                        // `session stop` on a foreign session; the window is
+                        // the few instructions between parsing the status
+                        // and this store, so it is accepted, not locked.
                         self.saw_foreign.store(true, Ordering::SeqCst);
                         return Err(Precondition::ForeignSession(display).to_string());
                     }
