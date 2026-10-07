@@ -271,6 +271,13 @@ pub fn should_stop_session(child_alive: bool, saw_foreign: bool) -> bool {
     child_alive && !saw_foreign
 }
 
+/// Whether a live Android pane must be torn down: its `waydroid session
+/// start` child exited, or its compositor stopped (then the session renders
+/// nowhere and the published socket is dead). Pure.
+pub fn is_dead(child_exited: bool, compositor_running: bool) -> bool {
+    child_exited || !compositor_running
+}
+
 /// The timeout for one command of the boot watcher: its own cap, but never
 /// more than what is left of the boot budget. Pure.
 pub fn command_budget(remaining: Duration, per_command: Duration) -> Duration {
@@ -405,7 +412,6 @@ impl Android {
                 return Err(AndroidError::Compositor(msg));
             }
         };
-
         let log = match open_log(state_dir) {
             Ok(log) => log,
             Err(err) => {
@@ -728,8 +734,17 @@ mod tests {
     }
 
     #[test]
+    fn android_is_dead_when_the_session_or_the_compositor_is_gone() {
+        assert!(!is_dead(false, true));
+        assert!(is_dead(true, true));
+        assert!(is_dead(false, false));
+        assert!(is_dead(true, false));
+    }
+
+    #[test]
     fn status_reads_the_display_line_wherever_it_is() {
-        // An absolute WAYLAND_DISPLAY keeps its own colons-free path intact.
+        // An absolute WAYLAND_DISPLAY path with slashes survives whole, and
+        // the display line is found even when it is not the first line.
         let reordered = "Wayland display:\t/run/user/1000/wayland-3\nSession:\tRUNNING\n";
         assert_eq!(parse_status(reordered), running("/run/user/1000/wayland-3"));
     }

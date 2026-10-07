@@ -3586,8 +3586,16 @@ impl App {
             }
             if let Some(android) = &mut group.android {
                 match android.has_exited() {
-                    Ok(true) => android_dead.push((id, android.boot_id())),
-                    Ok(false) => {}
+                    Ok(exited) => {
+                        if android::is_dead(exited, android.is_running()) {
+                            let reason = if exited {
+                                "the Waydroid session exited."
+                            } else {
+                                "the Android pane's compositor stopped."
+                            };
+                            android_dead.push((id, android.boot_id(), reason));
+                        }
+                    }
                     Err(err) => {
                         eprintln!("kabelsalat: Android in group {id} could not be polled: {err}")
                     }
@@ -3597,12 +3605,10 @@ impl App {
         for id in dead {
             let _ = self.input.send(Msg::BrowserDied(id));
         }
-        for (id, boot) in android_dead {
-            let _ = self.input.send(Msg::AndroidDied(
-                id,
-                boot,
-                "the Waydroid session exited.".to_string(),
-            ));
+        for (id, boot, reason) in android_dead {
+            let _ = self
+                .input
+                .send(Msg::AndroidDied(id, boot, reason.to_string()));
         }
     }
 
