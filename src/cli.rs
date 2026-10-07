@@ -35,6 +35,8 @@ pub const CDP_ENV_KEYS: [&str; 2] = [ENV_CDP, ENV_CDP_PLAYWRIGHT];
 pub const ENV_ANDROID_CTL: &str = "KABELSALAT_ANDROID_CTL";
 /// The adb serial of that Android (`<ip>:5555`).
 pub const ENV_ANDROID_ADB: &str = "KABELSALAT_ANDROID_ADB";
+/// The Android pair: set once Android has booted, unset on stop or death.
+pub const ANDROID_ENV_KEYS: [&str; 2] = [ENV_ANDROID_CTL, ENV_ANDROID_ADB];
 
 /// What an invocation asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1330,6 +1332,24 @@ mod tests {
         assert_eq!(
             android_env_pairs("/tmp/ctl.sock", "10.0.3.9:5555"),
             [
+                (ENV_ANDROID_CTL, "/tmp/ctl.sock".to_string()),
+                (ENV_ANDROID_ADB, "10.0.3.9:5555".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_comes_first_then_the_cdp_pair_then_the_android_pair() {
+        assert_eq!(
+            session_env_pairs(
+                "aaa-111",
+                Some("http://127.0.0.1:40455"),
+                Some(("/tmp/ctl.sock", "10.0.3.9:5555"))
+            ),
+            vec![
+                (ENV_GROUP, "aaa-111".to_string()),
+                (ENV_CDP, "http://127.0.0.1:40455".to_string()),
+                (ENV_CDP_PLAYWRIGHT, "http://127.0.0.1:40455".to_string()),
                 (ENV_ANDROID_CTL, "/tmp/ctl.sock".to_string()),
                 (ENV_ANDROID_ADB, "10.0.3.9:5555".to_string()),
             ]

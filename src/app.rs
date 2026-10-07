@@ -13,10 +13,11 @@ use relm4::gtk::prelude::*;
 use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
 use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 
+use crate::android::{self, Android};
 use crate::autostart;
 use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::claude;
-use crate::cli::CDP_ENV_KEYS;
+use crate::cli::{ANDROID_ENV_KEYS, CDP_ENV_KEYS};
 use crate::control;
 use crate::remote::{self, HostState, RemoteError};
 use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
@@ -76,6 +77,27 @@ const SHORTCUTS: &[(&str, &str, Msg)] = &[
         "Browser pane: open, bring to front, or hide",
         Msg::ToggleBrowser,
     ),
+    (
+        "<Alt>3",
+        "Android pane: open or bring to front",
+        Msg::ToggleAndroid,
+    ),
+    (
+        "<Alt><Shift>3",
+        "Android pane: open or bring to front",
+        Msg::ToggleAndroid,
+    ),
+    // Shift+3 is `#` on US layouts and `§` on German ones.
+    (
+        "<Alt>numbersign",
+        "Android pane: open or bring to front",
+        Msg::ToggleAndroid,
+    ),
+    (
+        "<Alt>section",
+        "Android pane: open or bring to front",
+        Msg::ToggleAndroid,
+    ),
     // Shift is what keeps these off the pty: plain Ctrl-V still reaches the
     // child as 0x16, so `claude`, vim and readline keep their own handling.
     ("<Control><Shift>v", "Paste into the terminal", Msg::Paste),
@@ -97,6 +119,9 @@ const SHORTCUT_ALIASES: &[&str] = &[
     "<Alt><Shift>2",
     "<Alt>at",
     "<Alt>quotedbl",
+    "<Alt><Shift>3",
+    "<Alt>numbersign",
+    "<Alt>section",
 ];
 
 /// How often the hosted Chromium processes are reaped for exit.
@@ -373,6 +398,9 @@ pub struct Group {
     /// The group's browser, if it has one. Dropping it kills Chromium, closes
     /// the pane and removes the profile directory (see `browser::Browser`).
     browser: Option<Browser>,
+    /// The Android pane, in at most one group at a time (one Waydroid per
+    /// machine). Dropping it stops the session and closes the pane.
+    android: Option<Android>,
     /// Whether the pane area is shown rather than hidden. Only meaningful
     /// while a pane is open; hidden panes keep running.
     panes_visible: bool,
@@ -404,6 +432,18 @@ impl Group {
     fn front_widget(&self) -> Option<gtk::Widget> {
         self.panes.page(self.front_pane).map(|page| page.child())
     }
+
+    /// Add `kind`'s page holding `widget` and pick the front pane: an
+    /// interactive open puts it in front, a quiet one (CLI, restore) only
+    /// when no other pane is open (see `state::front_after_open`). Leaves
+    /// the area's visibility to the caller; returns whether another pane
+    /// was already open, which that decision needs.
+    fn add_pane(&mut self, kind: PaneKind, widget: &gtk::Widget, quiet: bool) -> bool {
+        let other_open = self.has_panes();
+        self.panes.add(kind, widget);
+        self.front_pane = state::front_after_open(self.front_pane, kind, other_open, quiet);
+        other_open
+    }
 }
 
 /// A group's pane area: an `adw::TabBar` over an `adw::TabView`, one page
@@ -420,7 +460,9 @@ struct PaneHost {
 }
 
 impl PaneHost {
-    fn new(input: &relm4::Sender<Msg>) -> Self {
+    /// `group` is the owning group's id; the host's selection messages carry
+    /// it, so a notify from a host that is not attached is ignored.
+    fn new(input: &relm4::Sender<Msg>, group: usize) -> Self {
         let view = adw::TabView::new();
         // Alt+digits and Ctrl+PgUp/PgDn belong to the window's shortcuts.
         view.set_shortcuts(adw::TabViewShortcuts::NONE);
@@ -449,10 +491,14 @@ impl PaneHost {
                 // A click on a tab's close button. Refuse it here; the close
                 // path tears the pane down and removes the page itself.
                 view.close_page_finish(page, false);
-                if let Some(PaneKind::Browser) =
-                    PaneKind::from_widget_name(page.child().widget_name().as_str())
-                {
-                    let _ = input.send(Msg::CloseBrowser);
+                match PaneKind::from_widget_name(page.child().widget_name().as_str()) {
+                    Some(PaneKind::Browser) => {
+                        let _ = input.send(Msg::CloseBrowser);
+                    }
+                    Some(PaneKind::Android) => {
+                        let _ = input.send(Msg::StopAndroid);
+                    }
+                    None => {}
                 }
                 gtk::glib::Propagation::Stop
             }
@@ -467,7 +513,7 @@ impl PaneHost {
                 if let Some(kind) = view.selected_page().and_then(|page| {
                     PaneKind::from_widget_name(page.child().widget_name().as_str())
                 }) {
-                    let _ = input.send(Msg::PaneSelected(kind));
+                    let _ = input.send(Msg::PaneSelected(group, kind));
                 }
             }
         });
@@ -562,9 +608,9 @@ pub struct App {
     /// keep the active tab on screen.
     tab_scroller: gtk::ScrolledWindow,
     stack: gtk::Stack,
-    /// Splits the terminal content box (start) from the active group's browser
-    /// pane (end). The end child is attached and detached imperatively — only
-    /// the active group's pane is ever parented.
+    /// Splits the terminal content box (start) from the active group's pane
+    /// area (end). The end child is attached and detached imperatively — only
+    /// the active group's pane host is ever parented.
     browser_paned: gtk::Paned,
     /// Wraps the window content; carries the transient failure notices that do
     /// not deserve a dialog.
@@ -578,8 +624,8 @@ pub struct App {
     /// button.
     cdp_label: gtk::Label,
     cdp_copy: gtk::Button,
-    /// Which group's pane is currently the paned's end child, if any. Tracked
-    /// explicitly so detaching works even after the group was pruned.
+    /// Which group's pane host is currently the paned's end child, if any.
+    /// Tracked explicitly so detaching works even after the group was pruned.
     attached_host: Option<usize>,
     /// Groups still waiting for their browser to be restored after a restart,
     /// active group first. Drained one per idle callback.
@@ -773,16 +819,28 @@ pub enum Msg {
     CdpReady(usize, Option<browser::CdpEndpoint>),
     /// Copy the active group's CDP endpoint URL to the clipboard.
     CopyCdpEndpoint,
-    /// The user picked a tab in the active group's pane area.
-    PaneSelected(PaneKind),
+    /// The user picked a tab in a group's pane area: group id, pane. Acted
+    /// on only while that group's host is the attached one, so a notify from
+    /// a host being disposed (a pruned group) cannot touch another group.
+    PaneSelected(usize, PaneKind),
     /// Show the active group's hidden pane area (the header-bar indicator).
     ShowPanes,
+    /// Alt+3 / primary menu: open Android in the active group, or bring it to
+    /// the front; either way the pane area becomes visible.
+    ToggleAndroid,
+    /// Stop Android wherever it runs: stop the session, close the pane.
+    StopAndroid,
+    /// Android finished booting: group id, boot id, adb serial.
+    AndroidReady(usize, u64, String),
+    /// Android failed to boot or its session exited: group id, boot id,
+    /// reason.
+    AndroidDied(usize, u64, String),
     /// Paste the clipboard into the focused terminal.
     Paste,
     /// Copy the focused terminal's selection to the clipboard — or, with
     /// nothing selected, open a claude tab (both live on Ctrl+Shift+C).
     Copy,
-    /// Capture what the active group's browser shows.
+    /// Capture what the active group's front pane shows.
     Screenshot,
     /// The capture finished: the frame, or why there is none. The id is the
     /// tab that was active when the capture was asked for — the readback can
@@ -938,6 +996,36 @@ impl SimpleComponent for App {
                                 add_css_class: "flat",
                                 connect_clicked[sender, primary_menu] => move |_| {
                                     primary_menu.popdown();
+                                    sender.input(Msg::ToggleAndroid);
+                                },
+
+                                #[wrap(Some)]
+                                set_child = &gtk::Label {
+                                    set_label: "Open Android pane (Alt+3)",
+                                    set_halign: gtk::Align::Start,
+                                },
+                            },
+
+                            gtk::Button {
+                                add_css_class: "flat",
+                                #[watch]
+                                set_sensitive: model.android_running(),
+                                connect_clicked[sender, primary_menu] => move |_| {
+                                    primary_menu.popdown();
+                                    sender.input(Msg::StopAndroid);
+                                },
+
+                                #[wrap(Some)]
+                                set_child = &gtk::Label {
+                                    set_label: "Stop Android",
+                                    set_halign: gtk::Align::Start,
+                                },
+                            },
+
+                            gtk::Button {
+                                add_css_class: "flat",
+                                connect_clicked[sender, primary_menu] => move |_| {
+                                    primary_menu.popdown();
                                     sender.input(Msg::ShowHelp);
                                 },
 
@@ -991,7 +1079,7 @@ impl SimpleComponent for App {
 
                 pack_end = &gtk::Button {
                     set_icon_name: "camera-photo-symbolic",
-                    set_tooltip_text: Some("Screenshot browser → paste into terminal"),
+                    set_tooltip_text: Some("Screenshot the front pane → paste into terminal"),
                     // The point of the button is to leave the user typing a
                     // description next to the pasted image, so it must not
                     // keep the keyboard: with focus on the button, the next
@@ -999,7 +1087,7 @@ impl SimpleComponent for App {
                     // Ctrl-V instead of reaching the terminal.
                     set_focus_on_click: false,
                     #[watch]
-                    set_sensitive: model.active_browser_running(),
+                    set_sensitive: model.active_front_running(),
                     connect_clicked => Msg::Screenshot,
                 },
 
@@ -1623,10 +1711,11 @@ impl SimpleComponent for App {
             }
             // Runtime only, like the CDP messages: the front pane is not
             // persisted, so this skips the save at the bottom.
-            Msg::PaneSelected(kind) => {
-                if let Some(id) = self.active_group()
-                    && let Some(group) = self.groups.iter_mut().find(|g| g.id == id)
-                {
+            Msg::PaneSelected(group_id, kind) => {
+                if self.attached_host != Some(group_id) {
+                    return;
+                }
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) {
                     group.front_pane = kind;
                 }
                 self.focus_panes_or_terminal();
@@ -1642,6 +1731,15 @@ impl SimpleComponent for App {
                 self.sync_pane_host();
                 self.focus_panes_or_terminal();
             }
+            Msg::ToggleAndroid => self.toggle_android(),
+            Msg::StopAndroid => self.stop_android(),
+            // Runtime state only (the owner was persisted at spawn), like
+            // CdpReady.
+            Msg::AndroidReady(group_id, boot, serial) => {
+                self.android_ready(group_id, boot, serial);
+                return;
+            }
+            Msg::AndroidDied(group_id, boot, reason) => self.android_died(group_id, boot, &reason),
             // The shortcut controller is global-scope, so it fires wherever
             // focus sits. Only the terminal that actually has the keyboard may
             // act on it — otherwise a Ctrl-Shift-V aimed at the browser pane
@@ -1673,15 +1771,15 @@ impl SimpleComponent for App {
             // neither is persisted — so both arms return early like the other
             // runtime-only messages.
             Msg::Screenshot => {
-                self.capture_browser(&sender);
+                self.capture_front_pane(&sender);
                 return;
             }
             Msg::ScreenshotCaptured(tab, result) => {
                 match result {
                     Ok(frame) => self.paste_screenshot(tab, frame),
                     Err(detail) => {
-                        eprintln!("kabelsalat: browser screenshot failed: {detail}");
-                        self.show_toast("The browser screenshot failed.");
+                        eprintln!("kabelsalat: pane screenshot failed: {detail}");
+                        self.show_toast("The screenshot failed.");
                     }
                 }
                 return;
@@ -1962,6 +2060,23 @@ impl SimpleComponent for App {
             browser::TERM_GRACE,
             ProfileDisposition::Keep,
         );
+        // Android's display dies with this process, so its session is
+        // stopped too. The `Android` stays on its group, torn down, so the
+        // save below still records the owner and the next start restores it.
+        let android_groups: Vec<usize> = self
+            .groups
+            .iter()
+            .filter(|g| g.android.is_some())
+            .map(|g| g.id)
+            .collect();
+        for id in android_groups {
+            self.android_env_unset(id);
+        }
+        for group in &mut self.groups {
+            if let Some(android) = &mut group.android {
+                android.teardown();
+            }
+        }
         // `update()` does not run on the way out, so persist here: without
         // this, a resize followed by a quit loses the new divider position.
         self.save_state();
@@ -2007,9 +2122,10 @@ impl App {
             css: GROUP_PALETTE[(id - 1) % GROUP_PALETTE.len()],
             last_active: 0,
             browser: None,
+            android: None,
             panes_visible: false,
             front_pane: PaneKind::Browser,
-            panes: PaneHost::new(&self.input),
+            panes: PaneHost::new(&self.input, id),
             browser_split: state::DEFAULT_BROWSER_SPLIT,
             default_url: None,
             host: None,
@@ -2089,11 +2205,12 @@ impl App {
                 css: GROUP_PALETTE[group.palette % GROUP_PALETTE.len()],
                 last_active: 0,
                 browser: None,
+                android: None,
                 // Restored as "wanted"; the actual pane comes up later, one
                 // group at a time, in start_browser_maintenance().
                 panes_visible: group.browser_open,
                 front_pane: PaneKind::Browser,
-                panes: PaneHost::new(&self.input),
+                panes: PaneHost::new(&self.input, group.id),
                 browser_split: group.browser_split,
                 default_url: group.default_url.clone(),
                 host: group.host.clone(),
@@ -2890,41 +3007,48 @@ impl App {
             .is_some_and(|g| g.has_panes() && !g.panes_visible)
     }
 
-    /// Can the active group's browser be captured right now? Drives the
-    /// screenshot button. The pane's compositor is what renders the frame, so
-    /// a browser whose pane has died has nothing left to show — and a hidden
-    /// browser has, which is why this asks "running", not "visible".
-    fn active_browser_running(&self) -> bool {
+    /// Can the active group's front pane be captured right now? Drives the
+    /// screenshot button. The pane's compositor renders the frame, so a pane
+    /// whose compositor died has nothing left to show — and a hidden one has,
+    /// which is why this asks "running", not "visible".
+    fn active_front_running(&self) -> bool {
         self.active_group()
             .and_then(|id| self.groups.iter().find(|g| g.id == id))
-            .and_then(|g| g.browser.as_ref())
-            .is_some_and(Browser::is_running)
+            .is_some_and(|g| match g.front_pane {
+                PaneKind::Browser => g.browser.as_ref().is_some_and(Browser::is_running),
+                PaneKind::Android => g.android.as_ref().is_some_and(Android::is_running),
+            })
     }
 
-    /// Ask the active group's browser for a fresh frame. The pane answers on
-    /// the GTK main context, so the reply comes back as an ordinary message —
-    /// carrying the tab the user asked from, because the answer may take
-    /// seconds and the user is free to switch tabs meanwhile.
-    fn capture_browser(&self, sender: &ComponentSender<Self>) {
+    /// Is Android up anywhere? Drives "Stop Android".
+    fn android_running(&self) -> bool {
+        self.groups.iter().any(|g| g.android.is_some())
+    }
+
+    /// Ask the active group's front pane for a fresh frame. The pane answers
+    /// on the GTK main context, so the reply comes back as an ordinary
+    /// message — carrying the tab the user asked from, because the answer
+    /// may take seconds and the user is free to switch tabs meanwhile.
+    fn capture_front_pane(&self, sender: &ComponentSender<Self>) {
         let Some(tab) = self.active_tab() else {
             return;
         };
         let tab_id = tab.id;
-        let Some(browser) = self
-            .groups
-            .iter()
-            .find(|g| g.id == tab.group)
-            .and_then(|g| g.browser.as_ref())
-        else {
+        let Some(group) = self.groups.iter().find(|g| g.id == tab.group) else {
             return;
         };
         let sender = sender.clone();
-        browser.capture_frame(move |result| {
+        let callback = move |result: Result<CapturedFrame, browser::CaptureError>| {
             sender.input(Msg::ScreenshotCaptured(
                 tab_id,
                 result.map_err(|err| err.to_string()),
             ));
-        });
+        };
+        match (group.front_pane, &group.browser, &group.android) {
+            (PaneKind::Browser, Some(browser), _) => browser.capture_frame(callback),
+            (PaneKind::Android, _, Some(android)) => android.capture_frame(callback),
+            _ => {}
+        }
     }
 
     /// Put a captured frame on the clipboard, then press Ctrl-V in the tab the
@@ -2944,7 +3068,7 @@ impl App {
     fn paste_screenshot(&self, tab: usize, frame: CapturedFrame) {
         if !frame_backs_texture(frame.width, frame.height, frame.stride, frame.rgba.len()) {
             eprintln!("kabelsalat: unusable screenshot frame: {frame:?}");
-            self.show_toast("The browser screenshot failed.");
+            self.show_toast("The screenshot failed.");
             return;
         }
         let Some(display) = gtk::gdk::Display::default() else {
@@ -3108,11 +3232,10 @@ impl App {
         }
     }
 
-    /// Alt-2: no browser → spawn it in front and show the area; browser
-    /// hidden or behind another pane → bring it to the front and show the
-    /// area; browser in front and showing → hide the area (see
-    /// `state::browser_key_step`). Never panics: a failure to spawn leaves
-    /// the group as it was and reports the reason.
+    /// Alt-2: a visible area → hide it, whichever pane is in front; a hidden
+    /// one → show it with the browser in front, spawning one if there is
+    /// none (see `state::browser_key_step`). Never panics: a failure to
+    /// spawn leaves the group as it was and reports the reason.
     fn toggle_browser(&mut self) {
         let Some(id) = self.active_group() else {
             return;
@@ -3128,7 +3251,12 @@ impl App {
             }
             BrowserKeyStep::Front => {
                 if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                    group.front_pane = PaneKind::Browser;
+                    group.front_pane = state::front_after_open(
+                        group.front_pane,
+                        PaneKind::Browser,
+                        group.has_panes(),
+                        false,
+                    );
                     group.panes_visible = true;
                 }
             }
@@ -3142,11 +3270,8 @@ impl App {
                 match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
                     Ok(browser) => {
                         if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                            group
-                                .panes
-                                .add(PaneKind::Browser, browser.widget().upcast_ref());
+                            group.add_pane(PaneKind::Browser, browser.widget().upcast_ref(), false);
                             group.browser = Some(browser);
-                            group.front_pane = PaneKind::Browser;
                             group.panes_visible = true;
                         }
                         self.start_browser_poll();
@@ -3264,10 +3389,53 @@ impl App {
         }
     }
 
+    /// Publish the Android pair to every session in the group, once Android
+    /// has booted. Local groups only; one failing session never stops the
+    /// others, and never Android.
+    fn android_env_set(&self, group_id: usize) {
+        let Some(tmux) = &self.tmux else { return };
+        if self.group_host(group_id).is_some() {
+            return;
+        }
+        let Some(pairs) = self
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.android.as_ref())
+            .and_then(android_env)
+        else {
+            return;
+        };
+        for tab in self.tabs.iter().filter(|t| t.group == group_id) {
+            for (key, value) in &pairs {
+                if let Err(err) = tmux.set_environment(&tab.uuid, key, value) {
+                    eprintln!("kabelsalat: set {key} on {}: {err}", tab.uuid);
+                }
+            }
+        }
+    }
+
+    /// Remove the Android pair from every session in the group, so nothing
+    /// started later inherits a dead control socket.
+    fn android_env_unset(&self, group_id: usize) {
+        let Some(tmux) = &self.tmux else { return };
+        if self.group_host(group_id).is_some() {
+            return;
+        }
+        for tab in self.tabs.iter().filter(|t| t.group == group_id) {
+            for key in ANDROID_ENV_KEYS {
+                if let Err(err) = tmux.unset_environment(&tab.uuid, key) {
+                    eprintln!("kabelsalat: unset {key} on {}: {err}", tab.uuid);
+                }
+            }
+        }
+    }
+
     /// Make one session's environment describe its group: `KABELSALAT_GROUP`
-    /// always (a tab always belongs to some group — never unset), the
-    /// endpoint pair set or unset by whether the group's browser has a live
-    /// endpoint. Used when a session is (re)created and when a tab moves.
+    /// always (a tab always belongs to some group — never unset), the CDP
+    /// pair and the Android pair each set or unset by whether the group has
+    /// a live endpoint / a booted Android. Used when a session is
+    /// (re)created or reattached and when a tab moves.
     fn session_env_refresh(&self, tab_uuid: &str, group_id: usize) {
         let Some(tmux) = &self.tmux else { return };
         // KABELSALAT_GROUP and the endpoint pair stay local (spec).
@@ -3293,6 +3461,24 @@ impl App {
                 eprintln!("kabelsalat: refresh {key} on {tab_uuid}: {err}");
             }
         }
+        match group.android.as_ref().and_then(android_env) {
+            Some(pairs) => {
+                for (key, value) in &pairs {
+                    if let Err(err) = tmux.set_environment(tab_uuid, key, value) {
+                        eprintln!("kabelsalat: refresh {key} on {tab_uuid}: {err}");
+                    }
+                }
+            }
+            // As for CDP: a reattached session may carry a stale pair from a
+            // previous run, and this is where it is cleared.
+            None => {
+                for key in ANDROID_ENV_KEYS {
+                    if let Err(err) = tmux.unset_environment(tab_uuid, key) {
+                        eprintln!("kabelsalat: refresh {key} on {tab_uuid}: {err}");
+                    }
+                }
+            }
+        }
     }
 
     /// The env pairs a session of this group is created with (see
@@ -3301,7 +3487,14 @@ impl App {
     fn group_env_pairs(&self, group_id: usize) -> Option<Vec<(&'static str, String)>> {
         self.groups.iter().find(|g| g.id == group_id).map(|g| {
             let cdp = g.browser.as_ref().and_then(|b| b.cdp_url());
-            crate::cli::session_env_pairs(&g.uuid, cdp.as_deref(), None)
+            let android = g.android.as_ref().and_then(android_env);
+            crate::cli::session_env_pairs(
+                &g.uuid,
+                cdp.as_deref(),
+                android
+                    .as_ref()
+                    .map(|[(_, ctl), (_, adb)]| (ctl.as_str(), adb.as_str())),
+            )
         })
     }
 
@@ -3342,9 +3535,11 @@ impl App {
         });
     }
 
-    /// Reap exited Chromium processes; each one comes back as `BrowserDied`.
+    /// Reap exited Chromium processes and Waydroid sessions; each comes back
+    /// as `BrowserDied` / `AndroidDied`.
     fn poll_browsers(&mut self) {
         let mut dead = Vec::new();
+        let mut android_dead = Vec::new();
         for group in self.groups.iter_mut() {
             let id = group.id;
             if let Some(browser) = &mut group.browser {
@@ -3354,9 +3549,25 @@ impl App {
                     Err(err) => eprintln!("kabelsalat: browser {id} could not be polled: {err}"),
                 }
             }
+            if let Some(android) = &mut group.android {
+                match android.has_exited() {
+                    Ok(true) => android_dead.push((id, android.boot_id())),
+                    Ok(false) => {}
+                    Err(err) => {
+                        eprintln!("kabelsalat: Android in group {id} could not be polled: {err}")
+                    }
+                }
+            }
         }
         for id in dead {
             let _ = self.input.send(Msg::BrowserDied(id));
+        }
+        for (id, boot) in android_dead {
+            let _ = self.input.send(Msg::AndroidDied(
+                id,
+                boot,
+                "the Waydroid session exited.".to_string(),
+            ));
         }
     }
 
@@ -3428,16 +3639,7 @@ impl App {
             match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
                 Ok(browser) => {
                     if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                        let other_open = group.has_panes();
-                        group
-                            .panes
-                            .add(PaneKind::Browser, browser.widget().upcast_ref());
-                        group.front_pane = state::front_after_open(
-                            group.front_pane,
-                            PaneKind::Browser,
-                            other_open,
-                            true,
-                        );
+                        group.add_pane(PaneKind::Browser, browser.widget().upcast_ref(), true);
                         group.browser = Some(browser);
                     }
                     self.start_browser_poll();
@@ -3622,18 +3824,10 @@ impl App {
         match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
             Ok(browser) => {
                 if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                    let other_open = group.has_panes();
-                    group
-                        .panes
-                        .add(PaneKind::Browser, browser.widget().upcast_ref());
                     // Quiet: the front pane and the area only change when this
                     // is the group's first pane (see the state.rs tests).
-                    group.front_pane = state::front_after_open(
-                        group.front_pane,
-                        PaneKind::Browser,
-                        other_open,
-                        true,
-                    );
+                    let other_open =
+                        group.add_pane(PaneKind::Browser, browser.widget().upcast_ref(), true);
                     group.panes_visible =
                         state::quiet_open_visible(group.panes_visible, active, other_open);
                     group.browser = Some(browser);
@@ -3648,6 +3842,167 @@ impl App {
             }
         }
         self.sync_pane_host();
+    }
+
+    /// A group's name for messages, or its uuid when it has none.
+    fn group_label(&self, uuid: &str) -> String {
+        self.groups
+            .iter()
+            .find(|g| g.uuid == uuid && !g.name.is_empty())
+            .map_or_else(|| uuid.to_string(), |g| g.name.clone())
+    }
+
+    /// Bring Android up in group `id` and add its page. Quiet: the front
+    /// pane only changes when Android is the group's first pane (see
+    /// `Group::add_pane`), and the area's visibility is left alone — the
+    /// caller decides those. Already up here is success; up in another
+    /// group, or a remote group, is refused.
+    fn spawn_android(&mut self, id: usize) -> Result<(), String> {
+        if self.group_host(id).is_some() {
+            return Err("Android runs on this computer; a remote group cannot host it.".into());
+        }
+        let Some(requester) = self
+            .groups
+            .iter()
+            .find(|g| g.id == id)
+            .map(|g| g.uuid.clone())
+        else {
+            return Err("That group no longer exists.".into());
+        };
+        let owner = self
+            .groups
+            .iter()
+            .find(|g| g.android.is_some())
+            .map(|g| g.uuid.clone());
+        match android::claim(owner.as_deref(), &requester) {
+            android::Claim::Mine => return Ok(()),
+            android::Claim::Taken(uuid) => {
+                return Err(format!(
+                    "Android is already open in group “{}”. There is one per machine; \
+                     stop it there first (main menu → Stop Android).",
+                    self.group_label(&uuid)
+                ));
+            }
+            android::Claim::Free => {}
+        }
+        let input = self.input.clone();
+        let android = Android::spawn(&self.state_dir, move |boot, result| {
+            let msg = match result {
+                Ok(serial) => Msg::AndroidReady(id, boot, serial),
+                Err(reason) => Msg::AndroidDied(id, boot, reason),
+            };
+            let _ = input.send(msg);
+        })
+        .map_err(|err| err.to_string())?;
+        if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+            group.add_pane(PaneKind::Android, android.widget().upcast_ref(), true);
+            group.android = Some(android);
+        }
+        // The exit poll reaps Android's session too.
+        self.start_browser_poll();
+        Ok(())
+    }
+
+    /// Alt+3: open Android in the active group, or bring it to the front;
+    /// either way the area becomes visible and gets the keyboard.
+    fn toggle_android(&mut self) {
+        let Some(id) = self.active_group() else {
+            return;
+        };
+        if let Err(message) = self.spawn_android(id) {
+            self.show_notice(&message);
+            return;
+        }
+        if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+            group.front_pane = state::front_after_open(
+                group.front_pane,
+                PaneKind::Android,
+                group.has_panes(),
+                false,
+            );
+            group.panes_visible = true;
+        }
+        self.sync_pane_host();
+        self.focus_panes_or_terminal();
+    }
+
+    /// "Stop Android" / the tab's close button: wherever it runs.
+    fn stop_android(&mut self) {
+        if let Some(id) = self
+            .groups
+            .iter()
+            .find(|g| g.android.is_some())
+            .map(|g| g.id)
+        {
+            self.close_android(id);
+        }
+    }
+
+    /// Tear group `id`'s Android down: unset its env, remove its page, stop
+    /// the session, close the pane. A group without one is a no-op.
+    fn close_android(&mut self, id: usize) {
+        if !self
+            .groups
+            .iter()
+            .any(|g| g.id == id && g.android.is_some())
+        {
+            return;
+        }
+        self.android_env_unset(id);
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == id) else {
+            return;
+        };
+        let Some(mut android) = group.android.take() else {
+            return;
+        };
+        group.panes.remove(PaneKind::Android);
+        let other_open = group.has_panes();
+        group.front_pane =
+            state::front_after_close(group.front_pane, PaneKind::Android, other_open);
+        if !other_open {
+            group.panes_visible = false;
+        }
+        self.sync_pane_host();
+        android.teardown();
+        drop(android);
+        self.publish_groups();
+    }
+
+    /// The boot thread's success: record the serial, publish the pair. A
+    /// report from a pane that was stopped meanwhile is ignored.
+    fn android_ready(&mut self, group_id: usize, boot: u64, serial: String) {
+        let Some(android) = self
+            .groups
+            .iter_mut()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.android.as_mut())
+            .filter(|a| a.boot_id() == boot)
+        else {
+            return;
+        };
+        android.set_ready(serial);
+        self.android_env_set(group_id);
+        self.publish_groups();
+    }
+
+    /// Boot failure or session exit: tear down like Stop, and say why. A
+    /// report from a pane that was stopped meanwhile is ignored.
+    fn android_died(&mut self, group_id: usize, boot: u64, reason: &str) {
+        let current = self
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.android.as_ref())
+            .is_some_and(|a| a.boot_id() == boot);
+        if !current {
+            return;
+        }
+        self.close_android(group_id);
+        eprintln!("kabelsalat: Android stopped: {reason}");
+        self.show_notice(&format!(
+            "Android stopped: {reason}\n\nThe Waydroid session log is at {}.",
+            android::log_path(&self.state_dir).display()
+        ));
     }
 
     /// Run `loginctl enable-linger` or `disable-linger` and re-check, off the
@@ -4183,9 +4538,10 @@ impl App {
         self.rebuild_list();
     }
 
-    /// Drop every group that has no tabs left. A pruned group's `Browser` goes
-    /// with it (kill Chromium, close the pane, remove the profile dir), so its
-    /// widget must be unparented first.
+    /// Drop every group that has no tabs left. A pruned group's panes go with
+    /// it — its `Browser` (kill Chromium, close the pane, remove the profile
+    /// dir) and its `Android` (stop the session, close the pane) — so its
+    /// pane host must be unparented first.
     fn prune_empty_groups(&mut self) {
         let live: HashSet<usize> = self.tabs.iter().map(|t| t.group).collect();
         if self.groups.iter().all(|g| live.contains(&g.id)) {
@@ -4248,7 +4604,7 @@ impl App {
         // stamps and reorders.
         arm_later(&tab.armed, tab.armed.disarm());
         self.rebuild_list();
-        // The main funnel for swapping the parented browser pane. Not the
+        // The main funnel for swapping the parented pane host. Not the
         // only one: a tab *move* changes the active group with no tab
         // change, so the move handlers re-sync themselves.
         self.sync_pane_host();
@@ -5417,6 +5773,15 @@ fn reorder_groups(order: &mut Vec<usize>, src: usize, dest: usize) {
         return;
     };
     order.insert(di, id);
+}
+
+/// The Android pair for a booted Android; `None` while it boots.
+fn android_env(android: &Android) -> Option<[(&'static str, String); 2]> {
+    let adb = android.adb()?;
+    Some(crate::cli::android_env_pairs(
+        &android.control_socket_path().to_string_lossy(),
+        adb,
+    ))
 }
 
 /// Should a group be persisted as having its browser open? True while it has a
