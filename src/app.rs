@@ -630,6 +630,10 @@ pub struct App {
     /// Groups still waiting for their browser to be restored after a restart,
     /// active group first. Drained one per idle callback.
     pending_browser_restore: Vec<usize>,
+    /// The group whose Android is waiting to be restored after a restart.
+    /// One per machine, so at most one. Persisted as `android_owner` while
+    /// it waits (see `state::android_owner_desired`).
+    pending_android_restore: Option<usize>,
     /// Whether the try_wait poll timer is running (started with the first
     /// browser, never restarted).
     browser_poll_running: bool,
@@ -814,6 +818,8 @@ pub enum Msg {
     PollBrowsers,
     /// Restart restore: bring up this group's browser, then queue the next.
     RestoreBrowser(usize),
+    /// Restart restore: bring this group's Android back, hidden.
+    RestoreAndroid(usize),
     /// CDP discovery finished for this group's browser: the endpoint, or
     /// `None` when `DevToolsActivePort` never appeared or never parsed.
     CdpReady(usize, Option<browser::CdpEndpoint>),
@@ -1378,6 +1384,7 @@ impl SimpleComponent for App {
                 .build(),
             attached_host: None,
             pending_browser_restore: Vec::new(),
+            pending_android_restore: None,
             browser_poll_running: false,
             browser_restore_error_shown: false,
             window: root.clone(),
@@ -1673,6 +1680,7 @@ impl SimpleComponent for App {
                 return;
             }
             Msg::RestoreBrowser(group) => self.restore_browser(group),
+            Msg::RestoreAndroid(group) => self.restore_android(group),
             // Runtime state only: nothing here is persisted, so return early
             // to skip the save_state() at the bottom (like PollBrowsers).
             Msg::CdpReady(group_id, endpoint) => {
@@ -2333,7 +2341,11 @@ impl App {
         // browser_open (see `browser_open_desired`). Reversing the order would
         // persist browser_open=false for all of them until the first
         // RestoreBrowser save.
+        // Same reasoning as the browsers: filled before the save, so the
+        // state written below still names the owner while the restore waits.
+        self.pending_android_restore = state::android_restore_target(&saved);
         self.start_browser_maintenance();
+        self.queue_android_restore();
         self.save_state();
     }
 
@@ -2396,6 +2408,17 @@ impl App {
             .active
             .and_then(|id| self.tabs.iter().find(|t| t.id == id))
             .map(|t| t.uuid.clone());
+        // The DESIRED owner, like `browser_open`: a restore still queued has
+        // no `Android` yet but must still be written.
+        let live_owner = self
+            .groups
+            .iter()
+            .find(|g| g.android.is_some())
+            .map(|g| g.uuid.as_str());
+        let pending_owner = self
+            .pending_android_restore
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .map(|g| g.uuid.as_str());
         let state = SavedState {
             groups,
             tabs,
@@ -2404,9 +2427,7 @@ impl App {
             linger_warning_dismissed: self.linger_dismissed,
             sidebar_order: self.sidebar_order,
             pending_kills: self.pending_kills.clone(),
-            // No group can hold an Android pane yet; Task 8 of the Android
-            // pane plan persists the real owner here.
-            android_owner: None,
+            android_owner: state::android_owner_desired(live_owner, pending_owner),
         };
         self.persist(&state);
         // Same choke point as the save, so the CLI always sees what was last
@@ -3662,6 +3683,55 @@ impl App {
         }
         self.sync_pane_host();
         self.queue_browser_restore();
+    }
+
+    /// Ask for the pending Android restore on an idle callback, so the window
+    /// is interactive first.
+    fn queue_android_restore(&self) {
+        let Some(id) = self.pending_android_restore else {
+            return;
+        };
+        let input = self.input.clone();
+        gtk::glib::idle_add_local_once(move || {
+            let _ = input.send(Msg::RestoreAndroid(id));
+        });
+    }
+
+    /// Bring a restored group's Android back, hidden: the area's visibility
+    /// is left as restored, and the front pane only changes when Android is
+    /// the group's only pane. A group that vanished or got an Android
+    /// meanwhile is skipped. A failure is reported once and forgets the
+    /// owner, so a broken Waydroid does not nag at every start.
+    fn restore_android(&mut self, id: usize) {
+        if self.pending_android_restore != Some(id) {
+            return;
+        }
+        self.pending_android_restore = None;
+        let Some(other_open) = self
+            .groups
+            .iter()
+            .find(|g| g.id == id && g.android.is_none())
+            .map(Group::has_panes)
+        else {
+            return;
+        };
+        match self.spawn_android(id) {
+            Ok(()) => {
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    group.front_pane = state::front_after_open(
+                        group.front_pane,
+                        PaneKind::Android,
+                        other_open,
+                        true,
+                    );
+                }
+            }
+            Err(message) => {
+                eprintln!("kabelsalat: restoring Android for group {id}: {message}");
+                self.show_notice(&message);
+            }
+        }
+        self.sync_pane_host();
     }
 
     /// Show the "hold Shift to select" icon and (re)arm its hide timer.
