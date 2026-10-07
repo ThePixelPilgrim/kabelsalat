@@ -263,6 +263,20 @@ pub fn boot_completed(output: &str) -> bool {
     output.lines().any(|line| line.trim() == "1")
 }
 
+/// Whether teardown may run the global `waydroid session stop`: only while
+/// our `session start` child still runs and the boot watcher never saw a
+/// session on someone else's display. Otherwise the running session (if
+/// any) is not ours to stop. Pure.
+pub fn should_stop_session(child_alive: bool, saw_foreign: bool) -> bool {
+    child_alive && !saw_foreign
+}
+
+/// The timeout for one command of the boot watcher: its own cap, but never
+/// more than what is left of the boot budget. Pure.
+pub fn command_budget(remaining: Duration, per_command: Duration) -> Duration {
+    remaining.min(per_command)
+}
+
 /// A fresh identity for one spawn. The boot thread reports with it, so a
 /// report from a pane that was stopped meanwhile can never be mistaken for
 /// one from its successor in the same group.
@@ -311,6 +325,8 @@ pub enum AndroidError {
     Log(std::io::Error),
     /// `waydroid session start` or the boot thread could not be started.
     Spawn(std::io::Error),
+    /// `waydroid` was found, but `waydroid status` failed or timed out.
+    StatusUnanswered,
 }
 
 impl fmt::Display for AndroidError {
@@ -320,6 +336,11 @@ impl fmt::Display for AndroidError {
             Self::Compositor(msg) => write!(f, "The Android compositor could not start: {msg}"),
             Self::Log(err) => write!(f, "The Android session log could not be created: {err}"),
             Self::Spawn(err) => write!(f, "Waydroid could not be started: {err}"),
+            Self::StatusUnanswered => write!(
+                f,
+                "Waydroid did not answer `waydroid status`. Check that its container \
+                 service runs, then try again."
+            ),
         }
     }
 }
@@ -336,8 +357,11 @@ pub struct Android {
     boot: u64,
     /// The adb serial, once the boot thread reported success.
     adb: Option<String>,
-    /// Set at teardown; the boot thread stops and reports nothing.
+    /// Set at teardown; the boot thread stops and skips its report.
     cancel: Arc<AtomicBool>,
+    /// Set by the boot thread when it saw a session on another display:
+    /// then the running session is not ours and teardown must not stop it.
+    saw_foreign: Arc<AtomicBool>,
     torn_down: bool,
 }
 
@@ -346,8 +370,10 @@ impl Android {
     ///
     /// The `waydroid status` check runs here, on the caller's (GTK) thread,
     /// bounded by a 3 s timeout. Booting is watched on a worker thread that
-    /// calls `on_boot(boot_id, result)` exactly once — unless the pane was
-    /// torn down first, in which case it reports nothing. On any error the
+    /// calls `on_boot(boot_id, result)` at most once; it skips the call when
+    /// it notices the pane was torn down, but a report already under way can
+    /// still arrive afterwards, so the caller must compare the boot id with
+    /// the current pane's before acting on it. On any error the
     /// pane is closed before returning, so no blank pane is left behind.
     pub fn spawn<F>(state_dir: &Path, on_boot: F) -> Result<Self, AndroidError>
     where
@@ -359,9 +385,11 @@ impl Android {
         };
         // No pane of ours exists yet, so there is no display to call ours:
         // any running session is someone else's.
-        let status = run_capture(Command::new(&binary).args(status_args()), PRECHECK_TIMEOUT)
-            .map(|output| parse_status(&output));
-        match check(status, "") {
+        let Some(output) = run_capture(Command::new(&binary).args(status_args()), PRECHECK_TIMEOUT)
+        else {
+            return Err(AndroidError::StatusUnanswered);
+        };
+        match check(Some(parse_status(&output)), "") {
             Precondition::Ok => {}
             other => return Err(AndroidError::Precondition(other)),
         }
@@ -405,12 +433,14 @@ impl Android {
 
         let boot = next_boot_id();
         let cancel = Arc::new(AtomicBool::new(false));
+        let saw_foreign = Arc::new(AtomicBool::new(false));
         let watch = BootWatch {
             binary: binary.clone(),
             display: socket,
             session_pid: session.id(),
             log,
             cancel: cancel.clone(),
+            saw_foreign: saw_foreign.clone(),
         };
         let spawned = std::thread::Builder::new()
             .name("kabelsalat-android-boot".to_string())
@@ -436,6 +466,7 @@ impl Android {
             boot,
             adb: None,
             cancel,
+            saw_foreign,
             torn_down: false,
         })
     }
@@ -493,14 +524,20 @@ impl Android {
     ///
     /// Order, per the spec: `waydroid session stop` (bounded), then the
     /// session's process group is terminated (`SIGTERM`, `SIGKILL` after
-    /// [`STOP_GRACE`]) and reaped, then the compositor is closed.
+    /// [`STOP_GRACE`]) and reaped, then the compositor is closed. The global
+    /// `session stop` is skipped unless [`should_stop_session`] says the
+    /// running session is ours.
     pub fn teardown(&mut self) {
         if !self.torn_down {
             self.torn_down = true;
             self.cancel.store(true, Ordering::SeqCst);
-            let mut stop = Command::new(&self.binary);
-            stop.args(session_stop_args());
-            let _ = run_capture(&mut stop, STOP_TIMEOUT);
+            let child_alive = matches!(self.session.try_wait(), Ok(None));
+            let saw_foreign = self.saw_foreign.load(Ordering::SeqCst);
+            if should_stop_session(child_alive, saw_foreign) {
+                let mut stop = Command::new(&self.binary);
+                stop.args(session_stop_args());
+                let _ = run_capture(&mut stop, STOP_TIMEOUT);
+            }
             browser::terminate_child(&mut self.session, STOP_GRACE);
         }
         // Idempotent and infallible upstream.
@@ -521,6 +558,7 @@ struct BootWatch {
     session_pid: u32,
     log: File,
     cancel: Arc<AtomicBool>,
+    saw_foreign: Arc<AtomicBool>,
 }
 
 impl BootWatch {
@@ -561,11 +599,16 @@ impl BootWatch {
     fn wait_for_session(&self, deadline: Instant) -> Result<String, String> {
         loop {
             self.check_time(deadline)?;
-            if let Some(output) = run_capture(&mut self.command(status_args()), COMMAND_TIMEOUT) {
+            let budget = command_budget(
+                deadline.saturating_duration_since(Instant::now()),
+                COMMAND_TIMEOUT,
+            );
+            if let Some(output) = run_capture(&mut self.command(status_args()), budget) {
                 match boot_step(&parse_status(&output), &self.display) {
                     BootStep::Up => return Ok(adb_serial(&output)),
                     BootStep::Wait => {}
                     BootStep::Foreign(display) => {
+                        self.saw_foreign.store(true, Ordering::SeqCst);
                         return Err(Precondition::ForeignSession(display).to_string());
                     }
                     BootStep::NotInitialised => {
@@ -610,7 +653,11 @@ impl BootWatch {
     fn wait_for_boot_completed(&self, deadline: Instant) -> Result<(), String> {
         loop {
             self.check_time(deadline)?;
-            if run_capture(&mut self.command(boot_completed_args()), COMMAND_TIMEOUT)
+            let budget = command_budget(
+                deadline.saturating_duration_since(Instant::now()),
+                COMMAND_TIMEOUT,
+            );
+            if run_capture(&mut self.command(boot_completed_args()), budget)
                 .is_some_and(|output| boot_completed(&output))
             {
                 return Ok(());
@@ -869,5 +916,31 @@ mod tests {
         let io = || std::io::Error::other("disk full");
         assert!(AndroidError::Log(io()).to_string().contains("disk full"));
         assert!(AndroidError::Spawn(io()).to_string().contains("disk full"));
+    }
+
+    #[test]
+    fn an_unanswered_status_check_is_not_a_missing_binary() {
+        let msg = AndroidError::StatusUnanswered.to_string();
+        assert!(msg.contains("did not answer `waydroid status`"), "{msg}");
+        assert!(!msg.contains("not installed"), "{msg}");
+    }
+
+    #[test]
+    fn only_our_live_session_is_stopped() {
+        assert!(should_stop_session(true, false));
+        assert!(!should_stop_session(true, true));
+        assert!(!should_stop_session(false, false));
+        assert!(!should_stop_session(false, true));
+    }
+
+    #[test]
+    fn a_command_never_outlives_the_remaining_budget() {
+        let per = Duration::from_secs(10);
+        assert_eq!(
+            command_budget(Duration::from_secs(3), per),
+            Duration::from_secs(3)
+        );
+        assert_eq!(command_budget(Duration::from_secs(30), per), per);
+        assert_eq!(command_budget(Duration::ZERO, per), Duration::ZERO);
     }
 }
