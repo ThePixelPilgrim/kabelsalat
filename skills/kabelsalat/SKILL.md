@@ -216,15 +216,17 @@ watches the pane; act when asked.
   Android has booted and disappear on Stop, tab close, death or app exit. The
   owner is remembered in `state.json`: after a kabelsalat restart the pane
   comes back hidden for that group, and the variables reappear once it has
-  booted. On teardown the pane's compositor and session are killed as one
-  process group, so nothing of kabelsalat's survives a Stop; a crash of
-  kabelsalat can leave the session running, and the "already running" notice
-  then appears at the next start.
+  booted. On teardown kabelsalat runs `waydroid session stop` (when the
+  session is its own), terminates the process group that `waydroid session
+  start` and `show-full-ui` share, then closes the pane's compositor, which
+  is a thread inside the kabelsalat window, not a process. Nothing of
+  kabelsalat's survives a Stop; a crash of kabelsalat can leave the session
+  running, and the "already running" notice then appears at the next start.
 - **Input.** The pane's seat has keyboard and pointer only, no touch: Android
   sees a mouse. Prefer `adb shell input` for input inside Android (step 7).
 
 The blocks below assume one shell: variables set in one step (`CTL`, `ADB`,
-`D`, `PORT`, `V`) are used in later ones. In a fresh shell, re-run the
+`D`, `GECKO_BIN`, `PORT`, `V`) are used in later ones. In a fresh shell, re-run the
 `CTL=`/`ADB=` lines of step 1 first.
 
 ### 1. Bring Android up
@@ -259,6 +261,7 @@ variables there are empty or stale.
 
     CTL=$(tmux show-environment KABELSALAT_ANDROID_CTL | cut -d= -f2-)
     ADB=$(tmux show-environment KABELSALAT_ANDROID_ADB | cut -d= -f2-)
+    ls -l "$CTL"     # srw------- : the socket is yours alone
 
 `kabelsalat android` prints the same two values as its `ctl=` and `adb=`
 lines once Android is up.
@@ -312,12 +315,17 @@ digest GitHub publishes for the asset before running anything from it:
     curl -fL -o "$D/$ASSET" "https://github.com/mozilla/geckodriver/releases/download/$TAG/$ASSET"
     echo "$WANT  $D/$ASSET" | sha256sum -c - && tar -xzf "$D/$ASSET" -C "$D"
 
+Either way, pick the binary to run (the one on `PATH` wins; `$D` may still
+point at the Fenix directory of step 3):
+
+    GECKO_BIN=$(command -v geckodriver || echo "$D/geckodriver")
+
 If the check fails, stop and tell the user. Run geckodriver on a free port —
 never assume 4444, it is often taken — as a background process of yours, not
 in a kabelsalat tab (you need its port, not its output):
 
     PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    "$D/geckodriver" --android-storage internal --port "$PORT" &
+    "$GECKO_BIN" --android-storage internal --port "$PORT" &
 
 `--android-storage internal` is required on Waydroid: its `/storage/emulated`
 is a bind mount geckodriver cannot create its directories on. The flag is
@@ -414,12 +422,14 @@ start it again.
 - **`session.status` is not a health check.** It reports `ready: false`
   whenever a session is open.
 - **Tablet layout by default.** At the pane's size Fenix uses its tablet
-  layout and requests desktop sites. For a phone:
+  layout and requests desktop sites. For a phone layout use
   `adb -s "$ADB" shell wm density 420` (undo with
-  `adb -s "$ADB" shell wm density reset`), or a narrower screen with
-  `kabelsalat android resize 540 1080`.
-- **One Android per machine**, owned by one group; it is not moved between
-  groups.
+  `adb -s "$ADB" shell wm density reset`). Do not use
+  `kabelsalat android resize` for this: the pane re-applies its own size on
+  the next window or group change, so the resize snaps back, and until then
+  the pane's mouse mapping may not match, so clicks can land off target.
+- **One Android per machine**, owned by one group. To use it in another
+  group: Stop, then open it elsewhere.
 
 ### 7. Input
 
