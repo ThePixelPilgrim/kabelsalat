@@ -24,6 +24,17 @@ pub const ENV_GROUP: &str = "KABELSALAT_GROUP";
 /// The variable that carries a group browser's CDP endpoint while it is up
 /// (`http://127.0.0.1:<port>`), alongside `PLAYWRIGHT_MCP_CDP_ENDPOINT`.
 pub const ENV_CDP: &str = "KABELSALAT_CDP";
+/// The same endpoint under the name Playwright's MCP server reads.
+pub const ENV_CDP_PLAYWRIGHT: &str = "PLAYWRIGHT_MCP_CDP_ENDPOINT";
+/// The endpoint pair: set on discovery, unset on browser close. `ENV_GROUP`
+/// is deliberately not in here — it describes the tab, not the browser, and
+/// is never unset.
+pub const CDP_ENV_KEYS: [&str; 2] = [ENV_CDP, ENV_CDP_PLAYWRIGHT];
+/// The Android pane's control socket, while a booted Android is up in the
+/// group (`screenshot`, `click`, `type`, `key`, `resize`; one line each).
+pub const ENV_ANDROID_CTL: &str = "KABELSALAT_ANDROID_CTL";
+/// The adb serial of that Android (`<ip>:5555`).
+pub const ENV_ANDROID_ADB: &str = "KABELSALAT_ANDROID_ADB";
 
 /// What an invocation asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +101,34 @@ pub fn with_default_group(cli: Cli, env_group: Option<&str>) -> Result<Cli, Usag
         },
         other => Ok(other),
     }
+}
+
+/// The Android pair, in the order `ENV_ANDROID_CTL`, `ENV_ANDROID_ADB`.
+pub fn android_env_pairs(ctl: &str, adb: &str) -> [(&'static str, String); 2] {
+    [
+        (ENV_ANDROID_CTL, ctl.to_string()),
+        (ENV_ANDROID_ADB, adb.to_string()),
+    ]
+}
+
+/// The variables a group's session is created with: the group identity
+/// always, the CDP pair while the browser has an endpoint, the Android pair
+/// while a booted Android is up. Pure.
+pub fn session_env_pairs(
+    group_uuid: &str,
+    cdp: Option<&str>,
+    android: Option<(&str, &str)>,
+) -> Vec<(&'static str, String)> {
+    let mut env = vec![(ENV_GROUP, group_uuid.to_string())];
+    if let Some(url) = cdp {
+        for key in CDP_ENV_KEYS {
+            env.push((key, url.to_string()));
+        }
+    }
+    if let Some((ctl, adb)) = android {
+        env.extend(android_env_pairs(ctl, adb));
+    }
+    env
 }
 
 /// One group as the CLI sees it: the stable uuid, the (possibly empty,
@@ -1247,5 +1286,53 @@ mod tests {
         assert!(help_text().contains("kabelsalat browser"));
         assert!(help_text().contains("kabelsalat resume"));
         assert!(help_text().contains(&format!("{EXIT_FAILED} ")));
+    }
+
+    // --- session environment ---
+
+    #[test]
+    fn a_session_always_names_its_group() {
+        assert_eq!(
+            session_env_pairs("aaa-111", None, None),
+            vec![(ENV_GROUP, "aaa-111".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_live_browser_adds_the_cdp_pair() {
+        assert_eq!(
+            session_env_pairs("aaa-111", Some("http://127.0.0.1:40455"), None),
+            vec![
+                (ENV_GROUP, "aaa-111".to_string()),
+                ("KABELSALAT_CDP", "http://127.0.0.1:40455".to_string()),
+                (
+                    "PLAYWRIGHT_MCP_CDP_ENDPOINT",
+                    "http://127.0.0.1:40455".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_booted_android_adds_its_control_socket_and_serial() {
+        assert_eq!(
+            session_env_pairs(
+                "aaa-111",
+                None,
+                Some(("/tmp/ctl.sock", "192.168.240.112:5555"))
+            ),
+            vec![
+                (ENV_GROUP, "aaa-111".to_string()),
+                ("KABELSALAT_ANDROID_CTL", "/tmp/ctl.sock".to_string()),
+                ("KABELSALAT_ANDROID_ADB", "192.168.240.112:5555".to_string()),
+            ]
+        );
+        assert_eq!(
+            android_env_pairs("/tmp/ctl.sock", "10.0.3.9:5555"),
+            [
+                (ENV_ANDROID_CTL, "/tmp/ctl.sock".to_string()),
+                (ENV_ANDROID_ADB, "10.0.3.9:5555".to_string()),
+            ]
+        );
     }
 }

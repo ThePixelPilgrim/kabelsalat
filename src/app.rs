@@ -16,6 +16,7 @@ use vte4::{PtyFlags, Terminal, TerminalExt, TerminalExtManual};
 use crate::autostart;
 use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::claude;
+use crate::cli::CDP_ENV_KEYS;
 use crate::control;
 use crate::remote::{self, HostState, RemoteError};
 use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
@@ -131,14 +132,9 @@ const CDP_POLL_MS: u64 = 100;
 const CDP_POLL_TRIES: u32 = 100;
 
 /// Environment keys published into each tab's tmux session (see
-/// docs/superpowers/specs/2026-07-30-cdp-endpoint-design.md).
-const ENV_CDP: &str = crate::cli::ENV_CDP;
-const ENV_CDP_PLAYWRIGHT: &str = "PLAYWRIGHT_MCP_CDP_ENDPOINT";
+/// docs/superpowers/specs/2026-07-30-cdp-endpoint-design.md); the pair
+/// constants and the builders live in `cli.rs`, where they are tested.
 const ENV_GROUP: &str = crate::cli::ENV_GROUP;
-/// The endpoint pair: set on discovery, unset on browser close. `ENV_GROUP`
-/// is deliberately not in here — it describes the tab, not the browser, and
-/// is never unset.
-const CDP_ENV_KEYS: [&str; 2] = [ENV_CDP, ENV_CDP_PLAYWRIGHT];
 
 /// How long the "hold Shift to select" icon stays up after a bare drag.
 const SELECT_HINT_SECS: u32 = 7;
@@ -1316,16 +1312,9 @@ impl SimpleComponent for App {
                             // list_sessions errored while the session was
                             // actually dead, -A creates a session here, and
                             // these pairs are what it needs.
-                            let group_info = self.group_env_pairs(group);
-                            let mut env: Vec<(&str, &str)> = Vec::new();
-                            if let Some((group_uuid, cdp_url)) = &group_info {
-                                env.push((ENV_GROUP, group_uuid.as_str()));
-                                if let Some(url) = cdp_url {
-                                    for key in CDP_ENV_KEYS {
-                                        env.push((key, url.as_str()));
-                                    }
-                                }
-                            }
+                            let pairs = self.group_env_pairs(group).unwrap_or_default();
+                            let env: Vec<(&str, &str)> =
+                                pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
                             // Likewise for a claude the tab had: ignored by
                             // a genuine reattach, resumed if -A creates.
                             if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
@@ -3099,14 +3088,14 @@ impl App {
         }
     }
 
-    /// The env pairs a session of this group is created with: the group
-    /// identity always, the endpoint pair when the browser already has one.
-    /// Returns None only for a group id that no longer exists.
-    fn group_env_pairs(&self, group_id: usize) -> Option<(String, Option<String>)> {
-        self.groups
-            .iter()
-            .find(|g| g.id == group_id)
-            .map(|g| (g.uuid.clone(), g.browser.as_ref().and_then(|b| b.cdp_url())))
+    /// The env pairs a session of this group is created with (see
+    /// `cli::session_env_pairs`). None only for a group id that no longer
+    /// exists.
+    fn group_env_pairs(&self, group_id: usize) -> Option<Vec<(&'static str, String)>> {
+        self.groups.iter().find(|g| g.id == group_id).map(|g| {
+            let cdp = g.browser.as_ref().and_then(|b| b.cdp_url());
+            crate::cli::session_env_pairs(&g.uuid, cdp.as_deref(), None)
+        })
     }
 
     /// Watch for `DevToolsActivePort` in the group's profile. The file shows
@@ -3793,16 +3782,8 @@ impl App {
                 // identity always, the endpoint pair when the group's browser
                 // already has one. A -A reattach ignores -e; reattached
                 // sessions are refreshed explicitly in restore_or_fresh.
-                let group_info = self.group_env_pairs(group);
-                let mut env: Vec<(&str, &str)> = Vec::new();
-                if let Some((group_uuid, cdp_url)) = &group_info {
-                    env.push((ENV_GROUP, group_uuid.as_str()));
-                    if let Some(url) = cdp_url {
-                        for key in CDP_ENV_KEYS {
-                            env.push((key, url.as_str()));
-                        }
-                    }
-                }
+                let pairs = self.group_env_pairs(group).unwrap_or_default();
+                let env: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
                 spawn_backing(&terminal, &uuid, self.tmux.as_ref(), cwd, command, &env);
                 None
             }
