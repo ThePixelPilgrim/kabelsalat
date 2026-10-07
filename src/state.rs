@@ -682,21 +682,23 @@ pub enum BrowserKeyStep {
     Hide,
 }
 
-/// Alt+2: spawn the browser, bring it to the front, or — when it already is
-/// in front and showing — hide the area. Pure.
-pub fn browser_key_step(has_browser: bool, panes_visible: bool, front: PaneKind) -> BrowserKeyStep {
-    if !has_browser {
-        BrowserKeyStep::Spawn
-    } else if panes_visible && front == PaneKind::Browser {
+/// Alt+2 toggles the pane area as a whole: a visible area hides, whichever
+/// pane is in front and whether or not a browser exists; a hidden one shows
+/// with the browser in front, spawning the browser when there is none. Pure.
+pub fn browser_key_step(has_browser: bool, panes_visible: bool) -> BrowserKeyStep {
+    if panes_visible {
         BrowserKeyStep::Hide
-    } else {
+    } else if has_browser {
         BrowserKeyStep::Front
+    } else {
+        BrowserKeyStep::Spawn
     }
 }
 
 /// The front pane after `opened` joined the area. An interactive open puts it
 /// in front; a quiet one (CLI, restore) leaves the front alone unless there
-/// is no other pane to be in front. Pure.
+/// is no other pane to be in front. The caller guarantees `opened` was not
+/// already open. Pure.
 pub fn front_after_open(
     front: PaneKind,
     opened: PaneKind,
@@ -707,7 +709,8 @@ pub fn front_after_open(
 }
 
 /// The front pane after `closed` left the area: the remaining pane when the
-/// closed one was in front, otherwise unchanged. Pure.
+/// closed one was in front, otherwise unchanged. The caller guarantees
+/// `closed` was open. Pure.
 pub fn front_after_close(front: PaneKind, closed: PaneKind, other_open: bool) -> PaneKind {
     if front == closed && other_open {
         closed.other()
@@ -718,7 +721,8 @@ pub fn front_after_close(front: PaneKind, closed: PaneKind, other_open: bool) ->
 
 /// Whether the area is visible after a quiet open: an existing area keeps its
 /// state; a first pane shows only in the active group, as a CLI-opened
-/// browser always has. Pure.
+/// browser always has. Invariant: a quiet open never hides the area, so
+/// `panes_visible` true always yields true. Pure.
 pub fn quiet_open_visible(panes_visible: bool, group_active: bool, other_open: bool) -> bool {
     panes_visible || (group_active && !other_open)
 }
@@ -1833,17 +1837,15 @@ mod tests {
     }
 
     #[test]
-    fn alt_2_spawns_fronts_or_hides_the_browser() {
+    fn alt_2_toggles_the_pane_area_as_a_whole() {
         use BrowserKeyStep::*;
-        // No browser: spawn one, whatever else is open.
-        assert_eq!(browser_key_step(false, false, PaneKind::Browser), Spawn);
-        assert_eq!(browser_key_step(false, true, PaneKind::Android), Spawn);
-        // Browser in front and showing: hide the area (today's toggle).
-        assert_eq!(browser_key_step(true, true, PaneKind::Browser), Hide);
-        // Area hidden, or the browser behind Android: bring it to the front.
-        assert_eq!(browser_key_step(true, false, PaneKind::Browser), Front);
-        assert_eq!(browser_key_step(true, false, PaneKind::Android), Front);
-        assert_eq!(browser_key_step(true, true, PaneKind::Android), Front);
+        // Area visible: hide it, whichever pane is in front, browser or not.
+        assert_eq!(browser_key_step(true, true), Hide);
+        assert_eq!(browser_key_step(false, true), Hide);
+        // Area hidden with a browser: show it with the browser in front.
+        assert_eq!(browser_key_step(true, false), Front);
+        // Area hidden, no browser: spawn one (Android-only or empty group).
+        assert_eq!(browser_key_step(false, false), Spawn);
     }
 
     #[test]
@@ -1863,6 +1865,18 @@ mod tests {
             front_after_open(PaneKind::Browser, PaneKind::Android, false, true),
             PaneKind::Android
         );
+    }
+
+    #[test]
+    fn a_pane_opened_after_the_last_one_closed_replaces_the_stale_front() {
+        // The Android pane closed last, leaving `front` stale at Android.
+        let front = front_after_close(PaneKind::Android, PaneKind::Android, false);
+        for quiet in [false, true] {
+            assert_eq!(
+                front_after_open(front, PaneKind::Browser, false, quiet),
+                PaneKind::Browser
+            );
+        }
     }
 
     #[test]
@@ -1891,5 +1905,8 @@ mod tests {
         assert!(!quiet_open_visible(false, true, true));
         assert!(quiet_open_visible(true, false, true));
         assert!(quiet_open_visible(true, true, true));
+        // A visible area is visible whatever else is true (first pane, any group).
+        assert!(quiet_open_visible(true, false, false));
+        assert!(quiet_open_visible(true, true, false));
     }
 }
