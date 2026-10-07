@@ -358,6 +358,10 @@ fn parse_android(args: &[String]) -> Result<Cli, UsageError> {
         group = Some(value.clone());
         i += 2;
     }
+    // Only in the verb's place: after it, `--help` is an argument.
+    if matches!(args.get(i).map(String::as_str), Some("-h" | "--help")) {
+        return Ok(Cli::Help);
+    }
     let cmd = parse_android_cmd(&args[i..])?;
     Ok(Cli::Android { group, cmd })
 }
@@ -373,6 +377,19 @@ fn parse_android_cmd(args: &[String]) -> Result<Option<AndroidCmd>, UsageError> 
                 return Err(UsageError("screenshot needs a file path".into()));
             }
             check_one_line("screenshot path", path)?;
+            // The pane trims its command line, and an argument that was not
+            // UTF-8 arrives with U+FFFD in it: either way the pane would
+            // write a file other than the one named.
+            if path.trim() != path {
+                return Err(UsageError(
+                    "the screenshot path cannot start or end with whitespace".into(),
+                ));
+            }
+            if path.contains('\u{FFFD}') {
+                return Err(UsageError(
+                    "the screenshot path is not valid UTF-8; choose another name".into(),
+                ));
+            }
             AndroidCmd::Screenshot(PathBuf::from(path))
         }
         ("tap", [x, y]) => AndroidCmd::Tap(coordinate("tap x", x)?, coordinate("tap y", y)?),
@@ -478,6 +495,24 @@ pub fn control_reply(reply: &str) -> Outcome {
         EXIT_FAILED,
         format!("kabelsalat: android: unexpected reply from the pane: '{line}'\n"),
     )
+}
+
+/// The stderr line for a control-socket round trip that failed with an I/O
+/// error of `kind` (`detail` is its text): a timeout is said as one, with the
+/// bound `timeout_secs`, whatever the platform calls it. Pure.
+pub fn control_error(
+    socket: &str,
+    kind: std::io::ErrorKind,
+    detail: &str,
+    timeout_secs: u64,
+) -> String {
+    let why = match kind {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            format!("timed out after {timeout_secs} s")
+        }
+        _ => detail.to_string(),
+    };
+    format!("kabelsalat: the Android pane did not answer on {socket}: {why}\n")
 }
 
 /// Flags of `run`, up to the mandatory `--`. The separator is required: without
@@ -1747,6 +1782,67 @@ mod tests {
                 cmd: Some(AndroidCmd::Type("-g".into()))
             })
         );
+    }
+
+    #[test]
+    fn a_control_timeout_names_the_bound() {
+        let timed_out = control_error(
+            "/tmp/ctl.sock",
+            std::io::ErrorKind::TimedOut,
+            "connection timed out",
+            10,
+        );
+        assert_eq!(
+            timed_out,
+            "kabelsalat: the Android pane did not answer on /tmp/ctl.sock: timed out after 10 s\n"
+        );
+        let would_block = control_error(
+            "/tmp/ctl.sock",
+            std::io::ErrorKind::WouldBlock,
+            "Resource temporarily unavailable (os error 11)",
+            10,
+        );
+        assert_eq!(would_block, timed_out);
+        assert_eq!(
+            control_error(
+                "/tmp/ctl.sock",
+                std::io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+                10,
+            ),
+            "kabelsalat: the Android pane did not answer on /tmp/ctl.sock: \
+             No such file or directory (os error 2)\n"
+        );
+    }
+
+    #[test]
+    fn android_help_is_help() {
+        for argv in [
+            vec!["android", "-h"],
+            vec!["android", "--help"],
+            vec!["android", "-g", "web", "--help"],
+        ] {
+            assert_eq!(parse(&args(&argv)), Ok(Cli::Help), "{argv:?}");
+        }
+        // Past the verb it is an argument: `type --help` types it.
+        assert_eq!(
+            parse(&args(&["android", "type", "--help"])),
+            Ok(Cli::Android {
+                group: None,
+                cmd: Some(AndroidCmd::Type("--help".into())),
+            })
+        );
+    }
+
+    #[test]
+    fn android_screenshot_paths_the_pane_would_mangle_are_usage_errors() {
+        // The pane trims the line, and a path that was not UTF-8 reaches us
+        // with replacement characters: neither names the file asked for.
+        for path in [" shot.png", "shot.png ", "\tshot.png", "sh\u{FFFD}t.png"] {
+            let err = parse(&args(&["android", "screenshot", path]));
+            assert!(err.is_err(), "{path:?} should be a usage error");
+        }
+        assert!(parse(&args(&["android", "screenshot", "my shot.png"])).is_ok());
     }
 
     #[test]

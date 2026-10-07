@@ -14,7 +14,7 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use relm4::adw;
 use relm4::gtk::gio;
@@ -119,16 +119,25 @@ pub fn request_open_android(group_uuid: String) -> bool {
 
 /// One request to a pane's control socket: write `line` and a newline, shut
 /// the write half (the server serves a connection until EOF), read one reply
-/// line. Bounded by `timeout` per read and write. A pane that closes without
-/// a reply is an error.
+/// line. The write and the read share one deadline, `timeout` from the
+/// connect, so the whole exchange is bounded by `timeout` (plus the connect
+/// itself, immediate on a local socket). A pane that closes without a reply
+/// is an error; running out of time is `TimedOut` or `WouldBlock`.
 pub fn send_control(socket: &Path, line: &str, timeout: Duration) -> std::io::Result<String> {
+    let deadline = Instant::now() + timeout;
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     stream.write_all(line.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     stream.shutdown(std::net::Shutdown::Write)?;
+    // A zero timeout is rejected by the socket API; a spent deadline is a
+    // timeout already.
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    stream.set_read_timeout(Some(left))?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     if reply.is_empty() {
@@ -227,9 +236,11 @@ pub fn handle_command_line(
             let reply = match send_control(&socket, &line, CONTROL_TIMEOUT) {
                 Ok(reply) => reply,
                 Err(err) => {
-                    command_line.printerr_literal(&format!(
-                        "kabelsalat: the Android pane did not answer on {}: {err}\n",
-                        socket.display()
+                    command_line.printerr_literal(&cli::control_error(
+                        &socket.display().to_string(),
+                        err.kind(),
+                        &err.to_string(),
+                        CONTROL_TIMEOUT.as_secs(),
                     ));
                     return glib::ExitCode::new(cli::EXIT_GROUP);
                 }
