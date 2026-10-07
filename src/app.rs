@@ -20,7 +20,9 @@ use crate::cli::CDP_ENV_KEYS;
 use crate::control;
 use crate::remote::{self, HostState, RemoteError};
 use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
-use crate::state::{self, ClaudeSession, SavedGroup, SavedState, SavedTab, SidebarOrder};
+use crate::state::{
+    self, BrowserKeyStep, ClaudeSession, PaneKind, SavedGroup, SavedState, SavedTab, SidebarOrder,
+};
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
 
 pub const GROUP_PALETTE: [&str; 6] = [
@@ -54,10 +56,26 @@ const SHORTCUTS: &[(&str, &str, Msg)] = &[
     ("<Alt>1", "Toggle tab pane", Msg::ToggleSidebar),
     ("<Alt><Shift>1", "Toggle tab pane", Msg::ToggleSidebar),
     ("<Alt>exclam", "Toggle tab pane", Msg::ToggleSidebar),
-    ("<Alt>2", "Toggle browser pane", Msg::ToggleBrowser),
-    ("<Alt><Shift>2", "Toggle browser pane", Msg::ToggleBrowser),
-    ("<Alt>at", "Toggle browser pane", Msg::ToggleBrowser),
-    ("<Alt>quotedbl", "Toggle browser pane", Msg::ToggleBrowser),
+    (
+        "<Alt>2",
+        "Browser pane: open, bring to front, or hide",
+        Msg::ToggleBrowser,
+    ),
+    (
+        "<Alt><Shift>2",
+        "Browser pane: open, bring to front, or hide",
+        Msg::ToggleBrowser,
+    ),
+    (
+        "<Alt>at",
+        "Browser pane: open, bring to front, or hide",
+        Msg::ToggleBrowser,
+    ),
+    (
+        "<Alt>quotedbl",
+        "Browser pane: open, bring to front, or hide",
+        Msg::ToggleBrowser,
+    ),
     // Shift is what keeps these off the pty: plain Ctrl-V still reaches the
     // child as 0x16, so `claude`, vim and readline keep their own handling.
     ("<Control><Shift>v", "Paste into the terminal", Msg::Paste),
@@ -355,9 +373,15 @@ pub struct Group {
     /// The group's browser, if it has one. Dropping it kills Chromium, closes
     /// the pane and removes the profile directory (see `browser::Browser`).
     browser: Option<Browser>,
-    /// Whether the browser is shown rather than hidden. Only meaningful while
-    /// `browser` is `Some`; a hidden browser keeps running.
-    browser_visible: bool,
+    /// Whether the pane area is shown rather than hidden. Only meaningful
+    /// while a pane is open; hidden panes keep running.
+    panes_visible: bool,
+    /// Which pane the area shows on top when it holds more than one. Runtime
+    /// only: a restart brings the browser back in front.
+    front_pane: PaneKind,
+    /// The tab bar and tab view holding this group's panes; parented into
+    /// `browser_paned` only while this is the active group and shows a pane.
+    panes: PaneHost,
     /// Divider position of the terminal/browser split, in pixels.
     browser_split: f64,
     /// Where a freshly launched browser for this group starts, already
@@ -368,6 +392,144 @@ pub struct Group {
     /// The ssh destination this group's tabs run on; `None` = this computer.
     /// Fixed for the group's lifetime: tabs cannot move between hosts.
     host: Option<String>,
+}
+
+impl Group {
+    /// Does the pane area hold at least one pane?
+    fn has_panes(&self) -> bool {
+        !self.panes.is_empty()
+    }
+
+    /// The widget of the pane in front, if that pane is open.
+    fn front_widget(&self) -> Option<gtk::Widget> {
+        self.panes.page(self.front_pane).map(|page| page.child())
+    }
+}
+
+/// A group's pane area: an `adw::TabBar` over an `adw::TabView`, one page
+/// per open pane. Owns no pane: the `Browser`/`Android` on the group do, and
+/// their widgets are only parented here.
+struct PaneHost {
+    root: gtk::Box,
+    view: adw::TabView,
+    /// The open pages by kind; the view itself has no notion of kinds.
+    pages: RefCell<Vec<(PaneKind, adw::TabPage)>>,
+    /// Set while the app adds, removes or selects pages itself, so the view's
+    /// signals do not echo those changes back as messages.
+    syncing: Rc<Cell<bool>>,
+}
+
+impl PaneHost {
+    fn new(input: &relm4::Sender<Msg>) -> Self {
+        let view = adw::TabView::new();
+        // Alt+digits and Ctrl+PgUp/PgDn belong to the window's shortcuts.
+        view.set_shortcuts(adw::TabViewShortcuts::NONE);
+        view.set_hexpand(true);
+        view.set_vexpand(true);
+        let bar = adw::TabBar::new();
+        bar.set_view(Some(&view));
+        // One pane still gets its tab: it says what the pane is and carries
+        // the close button.
+        bar.set_autohide(false);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.set_hexpand(true);
+        root.set_vexpand(true);
+        root.append(&bar);
+        root.append(&view);
+
+        let syncing = Rc::new(Cell::new(false));
+        view.connect_close_page({
+            let syncing = syncing.clone();
+            let input = input.clone();
+            move |view, page| {
+                if syncing.get() {
+                    // The app's own removal: let the default handler finish it.
+                    return gtk::glib::Propagation::Proceed;
+                }
+                // A click on a tab's close button. Refuse it here; the close
+                // path tears the pane down and removes the page itself.
+                view.close_page_finish(page, false);
+                if let Some(PaneKind::Browser) =
+                    PaneKind::from_widget_name(page.child().widget_name().as_str())
+                {
+                    let _ = input.send(Msg::CloseBrowser);
+                }
+                gtk::glib::Propagation::Stop
+            }
+        });
+        view.connect_selected_page_notify({
+            let syncing = syncing.clone();
+            let input = input.clone();
+            move |view| {
+                if syncing.get() {
+                    return;
+                }
+                if let Some(kind) = view.selected_page().and_then(|page| {
+                    PaneKind::from_widget_name(page.child().widget_name().as_str())
+                }) {
+                    let _ = input.send(Msg::PaneSelected(kind));
+                }
+            }
+        });
+
+        Self {
+            root,
+            view,
+            pages: RefCell::new(Vec::new()),
+            syncing,
+        }
+    }
+
+    /// Add a page for `kind` holding `widget`. A kind that already has a page
+    /// is left alone.
+    fn add(&self, kind: PaneKind, widget: &gtk::Widget) {
+        if self.page(kind).is_some() {
+            return;
+        }
+        widget.set_widget_name(kind.widget_name());
+        self.syncing.set(true);
+        let page = self.view.append(widget);
+        page.set_title(kind.title());
+        self.syncing.set(false);
+        self.pages.borrow_mut().push((kind, page));
+    }
+
+    /// Remove `kind`'s page; its widget is unparented, not destroyed — the
+    /// pane that owns it decides that.
+    fn remove(&self, kind: PaneKind) {
+        let page = {
+            let mut pages = self.pages.borrow_mut();
+            let Some(index) = pages.iter().position(|(k, _)| *k == kind) else {
+                return;
+            };
+            pages.remove(index).1
+        };
+        self.syncing.set(true);
+        self.view.close_page(&page);
+        self.syncing.set(false);
+    }
+
+    /// Show `kind`'s page, if there is one.
+    fn select(&self, kind: PaneKind) {
+        let Some(page) = self.page(kind) else {
+            return;
+        };
+        self.syncing.set(true);
+        self.view.set_selected_page(&page);
+        self.syncing.set(false);
+    }
+
+    fn page(&self, kind: PaneKind) -> Option<adw::TabPage> {
+        self.pages
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, page)| page.clone())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pages.borrow().is_empty()
+    }
 }
 
 pub struct App {
@@ -418,7 +580,7 @@ pub struct App {
     cdp_copy: gtk::Button,
     /// Which group's pane is currently the paned's end child, if any. Tracked
     /// explicitly so detaching works even after the group was pruned.
-    attached_browser: Option<usize>,
+    attached_host: Option<usize>,
     /// Groups still waiting for their browser to be restored after a restart,
     /// active group first. Drained one per idle callback.
     pending_browser_restore: Vec<usize>,
@@ -611,6 +773,10 @@ pub enum Msg {
     CdpReady(usize, Option<browser::CdpEndpoint>),
     /// Copy the active group's CDP endpoint URL to the clipboard.
     CopyCdpEndpoint,
+    /// The user picked a tab in the active group's pane area.
+    PaneSelected(PaneKind),
+    /// Show the active group's hidden pane area (the header-bar indicator).
+    ShowPanes,
     /// Paste the clipboard into the focused terminal.
     Paste,
     /// Copy the focused terminal's selection to the clipboard — or, with
@@ -817,10 +983,10 @@ impl SimpleComponent for App {
                 pack_end = &gtk::Button {
                     set_icon_name: "web-browser-symbolic",
                     add_css_class: "browser-hidden",
-                    set_tooltip_text: Some("Browser hidden — click to show it (Alt+2)"),
+                    set_tooltip_text: Some("Panes hidden — click to show them"),
                     #[watch]
-                    set_visible: model.active_browser_hidden(),
-                    connect_clicked => Msg::ToggleBrowser,
+                    set_visible: model.active_panes_hidden(),
+                    connect_clicked => Msg::ShowPanes,
                 },
 
                 pack_end = &gtk::Button {
@@ -1122,7 +1288,7 @@ impl SimpleComponent for App {
                 .css_classes(["flat"])
                 .sensitive(false)
                 .build(),
-            attached_browser: None,
+            attached_host: None,
             pending_browser_restore: Vec::new(),
             browser_poll_running: false,
             browser_restore_error_shown: false,
@@ -1455,6 +1621,27 @@ impl SimpleComponent for App {
                 }
                 return;
             }
+            // Runtime only, like the CDP messages: the front pane is not
+            // persisted, so this skips the save at the bottom.
+            Msg::PaneSelected(kind) => {
+                if let Some(id) = self.active_group()
+                    && let Some(group) = self.groups.iter_mut().find(|g| g.id == id)
+                {
+                    group.front_pane = kind;
+                }
+                self.focus_panes_or_terminal();
+                return;
+            }
+            Msg::ShowPanes => {
+                if let Some(id) = self.active_group()
+                    && let Some(group) = self.groups.iter_mut().find(|g| g.id == id)
+                    && group.has_panes()
+                {
+                    group.panes_visible = true;
+                }
+                self.sync_pane_host();
+                self.focus_panes_or_terminal();
+            }
             // The shortcut controller is global-scope, so it fires wherever
             // focus sits. Only the terminal that actually has the keyboard may
             // act on it — otherwise a Ctrl-Shift-V aimed at the browser pane
@@ -1745,7 +1932,7 @@ impl SimpleComponent for App {
         // clear the attachment so the position notify from unparenting cannot
         // overwrite it with a meaningless value.
         self.on_browser_split_changed();
-        self.attached_browser = None;
+        self.attached_host = None;
         self.browser_paned.set_end_child(gtk::Widget::NONE);
         // Sessions outlive the app; this is the one moment the app knows the
         // endpoints are dying, so unset them before the browsers are killed
@@ -1820,7 +2007,9 @@ impl App {
             css: GROUP_PALETTE[(id - 1) % GROUP_PALETTE.len()],
             last_active: 0,
             browser: None,
-            browser_visible: false,
+            panes_visible: false,
+            front_pane: PaneKind::Browser,
+            panes: PaneHost::new(&self.input),
             browser_split: state::DEFAULT_BROWSER_SPLIT,
             default_url: None,
             host: None,
@@ -1902,7 +2091,9 @@ impl App {
                 browser: None,
                 // Restored as "wanted"; the actual pane comes up later, one
                 // group at a time, in start_browser_maintenance().
-                browser_visible: group.browser_open,
+                panes_visible: group.browser_open,
+                front_pane: PaneKind::Browser,
+                panes: PaneHost::new(&self.input),
                 browser_split: group.browser_split,
                 default_url: group.default_url.clone(),
                 host: group.host.clone(),
@@ -2052,7 +2243,7 @@ impl App {
                     &self.pending_browser_restore,
                     g.id,
                 ),
-                browser_split: if self.attached_browser == Some(g.id) {
+                browser_split: if self.attached_host == Some(g.id) {
                     live_split
                 } else {
                     g.browser_split
@@ -2691,12 +2882,12 @@ impl App {
             .is_some_and(|g| g.browser.is_some())
     }
 
-    /// Does the active group have a browser that is currently hidden? Drives
+    /// Does the active group have panes that are currently hidden? Drives
     /// the header-bar indicator.
-    fn active_browser_hidden(&self) -> bool {
+    fn active_panes_hidden(&self) -> bool {
         self.active_group()
             .and_then(|id| self.groups.iter().find(|g| g.id == id))
-            .is_some_and(|g| g.browser.is_some() && !g.browser_visible)
+            .is_some_and(|g| g.has_panes() && !g.panes_visible)
     }
 
     /// Can the active group's browser be captured right now? Drives the
@@ -2810,44 +3001,43 @@ impl App {
         }
     }
 
-    /// Make the split show exactly the active group's browser, if it has a
-    /// visible one. The outgoing pane's divider position is saved and the pane
-    /// is hidden and unparented — the compositor and Chromium keep running, so
-    /// coming back to the group is instant with page state intact.
-    fn sync_browser_pane(&mut self) {
-        // Refresh before the early return below: that return fires whenever
-        // the *visible* pane isn't changing, but the active group itself may
-        // still have changed (e.g. switching to a tab whose group's browser
-        // is hidden), which the CDP menu must reflect regardless.
+    /// Make the split show exactly the active group's pane area, if it has a
+    /// visible one, with its front pane selected. The outgoing host's divider
+    /// position is saved and the host is unparented — its panes are unmapped,
+    /// which pauses their frame pumps, and keep running, so coming back to
+    /// the group is instant with state intact.
+    fn sync_pane_host(&mut self) {
+        // Before anything else: the active group may have changed even when
+        // the attached host does not (e.g. to a group whose panes are hidden),
+        // and the CDP menu must reflect it regardless.
         self.refresh_cdp_menu();
         let want = self.active_group().filter(|id| {
             self.groups
                 .iter()
-                .any(|g| g.id == *id && g.browser.is_some() && g.browser_visible)
+                .any(|g| g.id == *id && g.has_panes() && g.panes_visible)
         });
-        if self.attached_browser == want {
-            return;
-        }
-        if let Some(previous) = self.attached_browser.take() {
-            let split = self.browser_paned.position() as f64;
-            if let Some(group) = self.groups.iter_mut().find(|g| g.id == previous) {
-                group.browser_split = split;
-                if let Some(browser) = &group.browser {
-                    browser.set_visible(false);
+        if self.attached_host != want {
+            if let Some(previous) = self.attached_host.take() {
+                let split = self.browser_paned.position() as f64;
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == previous) {
+                    group.browser_split = split;
                 }
+                self.browser_paned.set_end_child(gtk::Widget::NONE);
             }
-            self.browser_paned.set_end_child(gtk::Widget::NONE);
+            if let Some(id) = want
+                && let Some(group) = self.groups.iter().find(|g| g.id == id)
+            {
+                let split = group.browser_split as i32;
+                let widget: gtk::Widget = group.panes.root.clone().upcast();
+                self.browser_paned.set_end_child(Some(&widget));
+                self.apply_browser_split(split, widget);
+                self.attached_host = Some(id);
+            }
         }
-        if let Some(id) = want
-            && let Some(group) = self.groups.iter().find(|g| g.id == id)
-            && let Some(browser) = &group.browser
-        {
-            let split = group.browser_split as i32;
-            let widget = browser.widget().clone();
-            browser.set_visible(true);
-            self.browser_paned.set_end_child(Some(&widget));
-            self.apply_browser_split(split, widget.upcast());
-            self.attached_browser = Some(id);
+        // Every host shows its front pane, attached or not, so coming back to
+        // a group lands on the right tab without a flash of the other one.
+        for group in &self.groups {
+            group.panes.select(group.front_pane);
         }
     }
 
@@ -2900,16 +3090,16 @@ impl App {
     /// The pane mirrors its GTK focus onto the nested compositor's seat: losing
     /// GTK focus clears the seat's keyboard focus, and a pane without it
     /// receives no keys at all — the hosted browser goes deaf. Showing the
-    /// browser is an explicit request to work in it, so it gets the keyboard;
+    /// front pane is an explicit request to work in it, so it gets the keyboard;
     /// hiding it gives the keyboard back to the terminal.
-    fn focus_browser_or_terminal(&self) {
-        let browser = self
+    fn focus_panes_or_terminal(&self) {
+        let front = self
             .active_group()
             .and_then(|id| self.groups.iter().find(|g| g.id == id))
-            .filter(|g| g.browser_visible)
-            .and_then(|g| g.browser.as_ref());
-        if let Some(browser) = browser {
-            browser.widget().grab_focus();
+            .filter(|g| g.panes_visible)
+            .and_then(Group::front_widget);
+        if let Some(widget) = front {
+            widget.grab_focus();
         } else if let Some(tab) = self
             .active
             .and_then(|id| self.tabs.iter().find(|t| t.id == id))
@@ -2918,9 +3108,11 @@ impl App {
         }
     }
 
-    /// Alt-2: no browser → spawn and show; hidden → show; shown → hide.
-    /// Never panics: a failure to spawn leaves the group without a browser and
-    /// reports the reason, mirroring how the app degrades without tmux.
+    /// Alt-2: no browser → spawn it in front and show the area; browser
+    /// hidden or behind another pane → bring it to the front and show the
+    /// area; browser in front and showing → hide the area (see
+    /// `state::browser_key_step`). Never panics: a failure to spawn leaves
+    /// the group as it was and reports the reason.
     fn toggle_browser(&mut self) {
         let Some(id) = self.active_group() else {
             return;
@@ -2928,35 +3120,47 @@ impl App {
         let Some(group) = self.groups.iter().find(|g| g.id == id) else {
             return;
         };
-        if group.browser.is_some() {
-            let visible = group.browser_visible;
-            if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                group.browser_visible = !visible;
-            }
-        } else {
-            // Keyed by the group's uuid: ids are reused, so an id-keyed
-            // profile could be one the startup sweep is still deleting.
-            let uuid = group.uuid.clone();
-            // Cloned like the uuid, so no borrow of `self.groups` is alive
-            // across the spawn.
-            let default_url = group.default_url.clone();
-            match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
-                Ok(browser) => {
-                    if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                        group.browser = Some(browser);
-                        group.browser_visible = true;
-                    }
-                    self.start_browser_poll();
-                    self.start_cdp_poll(id);
+        match state::browser_key_step(group.browser.is_some(), group.panes_visible) {
+            BrowserKeyStep::Hide => {
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    group.panes_visible = false;
                 }
-                Err(err) => {
-                    self.show_notice(&err.to_string());
-                    return;
+            }
+            BrowserKeyStep::Front => {
+                if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    group.front_pane = PaneKind::Browser;
+                    group.panes_visible = true;
+                }
+            }
+            BrowserKeyStep::Spawn => {
+                // Keyed by the group's uuid: ids are reused, so an id-keyed
+                // profile could be one the startup sweep is still deleting.
+                let uuid = group.uuid.clone();
+                // Cloned like the uuid, so no borrow of `self.groups` is alive
+                // across the spawn.
+                let default_url = group.default_url.clone();
+                match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
+                    Ok(browser) => {
+                        if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                            group
+                                .panes
+                                .add(PaneKind::Browser, browser.widget().upcast_ref());
+                            group.browser = Some(browser);
+                            group.front_pane = PaneKind::Browser;
+                            group.panes_visible = true;
+                        }
+                        self.start_browser_poll();
+                        self.start_cdp_poll(id);
+                    }
+                    Err(err) => {
+                        self.show_notice(&err.to_string());
+                        return;
+                    }
                 }
             }
         }
-        self.sync_browser_pane();
-        self.focus_browser_or_terminal();
+        self.sync_pane_host();
+        self.focus_panes_or_terminal();
     }
 
     /// Tear a group's browser down: terminate and reap Chromium, close the
@@ -2972,25 +3176,28 @@ impl App {
         let Some(mut browser) = group.browser.take() else {
             return;
         };
-        group.browser_visible = false;
+        // Unparent first, so the compositor is torn down outside the layout.
+        group.panes.remove(PaneKind::Browser);
+        let other_open = group.has_panes();
+        group.front_pane =
+            state::front_after_close(group.front_pane, PaneKind::Browser, other_open);
+        if !other_open {
+            group.panes_visible = false;
+        }
         // NLL: `group` is done; &self calls are fine from here. Runs only
         // when a browser was actually present, so a duplicate BrowserDied
         // (see the doc comment above) stays a true no-op.
         self.cdp_env_unset(id);
-        if self.attached_browser == Some(id) {
-            self.browser_paned.set_end_child(gtk::Widget::NONE);
-            self.attached_browser = None;
-        }
+        self.sync_pane_host();
         browser.teardown(disposition);
         drop(browser);
-        self.sync_browser_pane();
     }
 
     /// Remember the divider position of the split the user just dragged, on
     /// the group it belongs to. Persisting happens with the next layout
     /// mutation or at shutdown, not per drag step.
     fn on_browser_split_changed(&mut self) {
-        let Some(id) = self.attached_browser else {
+        let Some(id) = self.attached_host else {
             return;
         };
         let position = self.browser_paned.position() as f64;
@@ -3181,7 +3388,7 @@ impl App {
         let mut pending: Vec<usize> = self
             .groups
             .iter()
-            .filter(|g| g.browser_visible && g.browser.is_none())
+            .filter(|g| g.panes_visible && g.browser.is_none())
             .map(|g| g.id)
             .collect();
         // The browser the user can actually see becomes usable first.
@@ -3190,7 +3397,7 @@ impl App {
         // and announce themselves with the header-bar icon.
         for group in self.groups.iter_mut() {
             if Some(group.id) != active {
-                group.browser_visible = false;
+                group.panes_visible = false;
             }
         }
         self.pending_browser_restore = pending;
@@ -3221,6 +3428,16 @@ impl App {
             match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
                 Ok(browser) => {
                     if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                        let other_open = group.has_panes();
+                        group
+                            .panes
+                            .add(PaneKind::Browser, browser.widget().upcast_ref());
+                        group.front_pane = state::front_after_open(
+                            group.front_pane,
+                            PaneKind::Browser,
+                            other_open,
+                            true,
+                        );
                         group.browser = Some(browser);
                     }
                     self.start_browser_poll();
@@ -3228,8 +3445,10 @@ impl App {
                 }
                 Err(err) => {
                     eprintln!("kabelsalat: restoring browser for group {id}: {err}");
-                    if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
-                        group.browser_visible = false;
+                    if let Some(group) = self.groups.iter_mut().find(|g| g.id == id)
+                        && !group.has_panes()
+                    {
+                        group.panes_visible = false;
                     }
                     // One dialog, however many groups fail for the same reason.
                     if !self.browser_restore_error_shown {
@@ -3239,7 +3458,7 @@ impl App {
                 }
             }
         }
-        self.sync_browser_pane();
+        self.sync_pane_host();
         self.queue_browser_restore();
     }
 
@@ -3399,12 +3618,25 @@ impl App {
         else {
             return;
         };
-        let visible = self.active_group() == Some(id);
+        let active = self.active_group() == Some(id);
         match Browser::spawn(&uuid, &self.state_dir, default_url.as_deref()) {
             Ok(browser) => {
                 if let Some(group) = self.groups.iter_mut().find(|g| g.id == id) {
+                    let other_open = group.has_panes();
+                    group
+                        .panes
+                        .add(PaneKind::Browser, browser.widget().upcast_ref());
+                    // Quiet: the front pane and the area only change when this
+                    // is the group's first pane (see the state.rs tests).
+                    group.front_pane = state::front_after_open(
+                        group.front_pane,
+                        PaneKind::Browser,
+                        other_open,
+                        true,
+                    );
+                    group.panes_visible =
+                        state::quiet_open_visible(group.panes_visible, active, other_open);
                     group.browser = Some(browser);
-                    group.browser_visible = visible;
                 }
                 self.start_browser_poll();
                 self.start_cdp_poll(id);
@@ -3415,7 +3647,7 @@ impl App {
                 return;
             }
         }
-        self.sync_browser_pane();
+        self.sync_pane_host();
     }
 
     /// Run `loginctl enable-linger` or `disable-linger` and re-check, off the
@@ -3513,7 +3745,7 @@ impl App {
         self.rebuild_list();
         // The active tab changed groups without an activate(), so the pane
         // and CDP menu must reconcile here too.
-        self.sync_browser_pane();
+        self.sync_pane_host();
     }
 
     /// Modal group picker: arrow keys + Enter, or a single click. Esc closes
@@ -3959,11 +4191,11 @@ impl App {
         if self.groups.iter().all(|g| live.contains(&g.id)) {
             return;
         }
-        if let Some(attached) = self.attached_browser
+        if let Some(attached) = self.attached_host
             && !live.contains(&attached)
         {
             self.browser_paned.set_end_child(gtk::Widget::NONE);
-            self.attached_browser = None;
+            self.attached_host = None;
         }
         // A group that lost its browser to an unexpected Chromium exit keeps
         // its profile while the group lives (so the next Alt-2 restores the
@@ -4019,7 +4251,7 @@ impl App {
         // The main funnel for swapping the parented browser pane. Not the
         // only one: a tab *move* changes the active group with no tab
         // change, so the move handlers re-sync themselves.
-        self.sync_browser_pane();
+        self.sync_pane_host();
         true
     }
 
@@ -4205,7 +4437,7 @@ impl App {
         self.prune_empty_groups();
         self.rebuild_list();
         // No-op unless the dragged tab was the active one changing groups.
-        self.sync_browser_pane();
+        self.sync_pane_host();
     }
 
     /// Reorder groups by drag-and-drop: move `src` before `dest`. The render
@@ -4258,7 +4490,7 @@ impl App {
         self.prune_empty_groups();
         self.rebuild_list();
         // No-op unless the dragged tab was the active one changing groups.
-        self.sync_browser_pane();
+        self.sync_pane_host();
     }
 
     /// Jump to the representative tab of the next/previous group, wrapping
