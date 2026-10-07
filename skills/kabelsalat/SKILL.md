@@ -1,6 +1,6 @@
 ---
 name: kabelsalat
-description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess; not for commands whose output you need to capture or read back. Also use to read, screenshot or drive the page in the user's embedded browser pane (CDP/Playwright). Both live in the named groups of the user's running kabelsalat terminal.
+description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess; not for commands whose output you need to capture or read back. Also use to read, screenshot or drive the page in the user's embedded browser pane (CDP/Playwright), or Firefox for Android in the Android pane (Waydroid, WebDriver BiDi over adb). All of these live in the named groups of the user's running kabelsalat terminal.
 ---
 
 # Launching terminals in kabelsalat
@@ -81,7 +81,8 @@ anything.
 | 0 | Tab created | Tell the user which group it went to |
 | 1 | kabelsalat is not running | Report this to the user and stop. Do not retry, and do not try to start it — that is theirs to do |
 | 2 | Usage error | Fix the invocation; check `--` is present |
-| 3 | Group not found, ambiguous, (rename) name already in use, or (browser) a remote group | Re-run `kabelsalat groups` and retry with a uuid, or pick a different name |
+| 3 | Group not found, ambiguous, (rename) name already in use, (browser, android) a remote group, (android) Android owned by another group or not open, or its pane did not answer | Re-run `kabelsalat groups` and retry with a uuid, or pick a different name; for Android, tell the user which group has it |
+| 4 | (android subcommand) the pane refused the request | Read the message; fix the arguments |
 
 ## After launching
 
@@ -175,3 +176,200 @@ failure:
 
 A failed `connect_over_cdp` (connection refused) means the browser restarted:
 re-run the fetch and retry.
+
+## Driving Firefox for Android (Waydroid)
+
+A group can own the machine's one Android: Waydroid running in a pane next
+to the group's browser, shown as an "Android" tab. You drive Firefox for
+Android (Fenix) in it with geckodriver and WebDriver BiDi over adb.
+kabelsalat only starts Android; adb authorisation, Fenix and geckodriver are
+yours to set up, as below. The co-browsing rule is the browser's: the user
+watches the pane; act when asked.
+
+### 1. Bring Android up
+
+Pin `KABELSALAT_GROUP` as for the browser, then:
+
+    tmux show-environment KABELSALAT_ANDROID_CTL   # the pane's control socket
+    tmux show-environment KABELSALAT_ANDROID_ADB   # adb serial, e.g. 192.168.240.112:5555
+
+A leading `-`, or "unknown variable", means no booted Android in your group.
+Ask for one:
+
+    kabelsalat android               # the group is taken from your KABELSALAT_GROUP
+    kabelsalat android -g <name|uuid>
+
+If Android is already up, it prints `ctl=<socket>` and `adb=<serial>` and you
+are done. Otherwise stdout stays empty and Android boots — hidden unless the
+user is looking at that group, without taking their focus. Poll
+`tmux show-environment KABELSALAT_ANDROID_CTL` every two seconds for up to
+90 seconds. Exit 3 means another group owns Android (the message names it;
+there is one per machine — tell the user, do not stop it), a remote group,
+or an unknown group. Exit 1: kabelsalat's window is not running; stop.
+
+If the variables never appear, the user got a notice in the window
+(Waydroid missing, not initialised, or a session already running elsewhere).
+Ask them what it said.
+
+### 2. Authorise adb
+
+    adb connect "$KABELSALAT_ANDROID_ADB"
+    adb -s "$KABELSALAT_ANDROID_ADB" get-state      # "device" once authorised
+
+The first connection comes up `unauthorized`, and Android shows an "Allow USB
+debugging?" dialog in the pane. adb cannot answer it, so use the pane:
+
+    kabelsalat android screenshot /tmp/android.png   # look at the dialog
+    kabelsalat android tap X Y                        # tick "Always allow", then tap "Allow"
+
+Coordinates are pixels of that screenshot. Then
+`adb disconnect "$KABELSALAT_ANDROID_ADB"`, connect again, and re-check
+`get-state`. "Always allow" makes this a one-time step.
+
+### 3. Install Fenix (once)
+
+    adb -s "$KABELSALAT_ANDROID_ADB" shell pm path org.mozilla.firefox
+
+prints `package:…` when Fenix is installed. If it is not, download the
+official x86_64 APK from Mozilla's archive into a fresh, empty directory and
+install it (`adb install` checks the APK's signature):
+
+    V=$(curl -s https://archive.mozilla.org/pub/fenix/releases/ \
+        | grep -o 'releases/[0-9][0-9.]*/"' | sed 's#releases/##; s#/"##' | sort -V | tail -1)
+    D=$(mktemp -d)
+    curl -fL -o "$D/fenix.apk" \
+      "https://archive.mozilla.org/pub/fenix/releases/$V/android/fenix-$V-android-x86_64/fenix-$V.multi.android-x86_64.apk"
+    adb -s "$KABELSALAT_ANDROID_ADB" install "$D/fenix.apk"
+
+### 4. Start geckodriver
+
+Use `geckodriver` from `PATH` if there is one. Otherwise download the linux64
+release into a fresh, empty directory and check its sha256 against the
+digest GitHub publishes for the asset before running anything from it:
+
+    TAG=$(curl -s https://api.github.com/repos/mozilla/geckodriver/releases/latest \
+          | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+    ASSET="geckodriver-$TAG-linux64.tar.gz"
+    WANT=$(curl -s "https://api.github.com/repos/mozilla/geckodriver/releases/tags/$TAG" \
+          | python3 -c "import json,sys; print(next(a['digest'] for a in json.load(sys.stdin)['assets'] if a['name'] == '$ASSET').removeprefix('sha256:'))")
+    D=$(mktemp -d)
+    curl -fL -o "$D/$ASSET" "https://github.com/mozilla/geckodriver/releases/download/$TAG/$ASSET"
+    echo "$WANT  $D/$ASSET" | sha256sum -c - && tar -xzf "$D/$ASSET" -C "$D"
+
+If the check fails, stop and tell the user. Run geckodriver on a free port —
+never assume 4444, it is often taken — as a background process of yours, not
+in a kabelsalat tab (you need its port, not its output):
+
+    PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    "$D/geckodriver" --android-storage internal --port "$PORT" &
+
+`--android-storage internal` is required on Waydroid: its `/storage/emulated`
+is a bind mount geckodriver cannot create its directories on. The flag is
+deprecated upstream and still works.
+
+### 5. A BiDi session from Python
+
+A raw websocket client keeps this to one small dependency
+(`pip install websockets`). Same preamble as for the browser — re-resolve
+the environment and assert the group you pinned:
+
+    import base64, json, subprocess, urllib.request
+    from websockets.sync.client import connect
+
+    PINNED_GROUP = "<uuid from your first fetch>"
+    GECKO = "http://127.0.0.1:<PORT geckodriver listens on>"
+
+    def tmux_env():
+        out = subprocess.run(["tmux", "show-environment"],
+                             capture_output=True, text=True).stdout
+        return dict(line.split("=", 1) for line in out.splitlines()
+                    if "=" in line and not line.startswith("-"))
+
+    env = tmux_env()
+    assert env.get("KABELSALAT_GROUP") == PINNED_GROUP, \
+        f"tab moved (now in {env.get('KABELSALAT_GROUP', 'nowhere')}) — re-orient"
+    serial = env["KABELSALAT_ANDROID_ADB"]     # KeyError = no Android: also loud
+
+    caps = {"capabilities": {"alwaysMatch": {
+        "browserName": "firefox",
+        "webSocketUrl": True,
+        "moz:firefoxOptions": {
+            "androidPackage": "org.mozilla.firefox",
+            "androidDeviceSerial": serial,
+        },
+    }}}
+    request = urllib.request.Request(
+        f"{GECKO}/session", data=json.dumps(caps).encode(),
+        headers={"Content-Type": "application/json"})
+    # Starting Fenix on the device takes a while.
+    session = json.load(urllib.request.urlopen(request, timeout=180))["value"]
+    session_id = session["sessionId"]
+    ws_url = session["capabilities"]["webSocketUrl"]
+
+    next_id = 0
+
+    def bidi(ws, method, **params):
+        global next_id
+        next_id += 1
+        ws.send(json.dumps({"id": next_id, "method": method, "params": params}))
+        while True:
+            msg = json.loads(ws.recv(timeout=120))
+            if msg.get("id") != next_id:
+                continue                       # an event, not our answer
+            if msg.get("type") == "error":
+                raise RuntimeError(f"{method}: {msg['error']}: {msg.get('message')}")
+            return msg["result"]
+
+    try:
+        with connect(ws_url, max_size=None) as ws:
+            tree = bidi(ws, "browsingContext.getTree")
+            context = tree["contexts"][0]["context"]
+            bidi(ws, "browsingContext.navigate", context=context,
+                 url="https://example.org", wait="complete")
+            title = bidi(ws, "script.evaluate", expression="document.title",
+                         target={"context": context}, awaitPromise=False)
+            print(title["result"]["value"])
+            shot = bidi(ws, "browsingContext.captureScreenshot", context=context)
+            with open("/tmp/fenix.png", "wb") as f:
+                f.write(base64.b64decode(shot["data"]))
+    finally:
+        urllib.request.urlopen(urllib.request.Request(
+            f"{GECKO}/session/{session_id}", method="DELETE"), timeout=60)
+
+Keep one session per task and end it (the `DELETE`): every new session wipes
+Fenix, see below. A refused connection to `GECKO` means geckodriver is gone;
+start it again.
+
+### 6. Known behaviours
+
+- **Every session wipes Fenix.** geckodriver runs `pm clear` on it at each
+  new session: no logins, history or settings survive, and the onboarding
+  screens come back every time.
+- **Onboarding blocks screenshots.** While Fenix's first-run overlay covers
+  the tab, `browsingContext.captureScreenshot` fails with "width: 0 and
+  height: 0". Dismiss it first: `kabelsalat android screenshot`, find the
+  button, tap it (with adb, step 7).
+- **`session.status` is not a health check.** It reports `ready: false`
+  whenever a session is open.
+- **Tablet layout by default.** At the pane's size Fenix uses its tablet
+  layout and requests desktop sites. For a phone: `adb -s
+  "$KABELSALAT_ANDROID_ADB" shell wm density 420` (undo with
+  `wm density reset`), or a narrower screen with
+  `kabelsalat android resize 540 1080`.
+- **One Android per machine**, owned by one group; it is not moved between
+  groups.
+
+### 7. Input
+
+Prefer adb for anything inside Android:
+
+    adb -s "$KABELSALAT_ANDROID_ADB" shell input tap X Y
+    adb -s "$KABELSALAT_ANDROID_ADB" shell input text 'hello%sworld'   # %s is a space
+    adb -s "$KABELSALAT_ANDROID_ADB" shell input keyevent KEYCODE_BACK
+
+Use `kabelsalat android tap|type|key` only while adb is not authorised yet
+(step 2). The pane has no touch device — Android sees a mouse — and the
+first click after the pointer enters the pane can register as a swipe from
+the top edge, opening the notification shade: press `kabelsalat android key
+escape` and tap again. For text, use `kabelsalat android type '…'`, never a
+multi-character `key`: key names go through a US keymap.
