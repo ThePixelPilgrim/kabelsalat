@@ -4,6 +4,7 @@ use relm4::gtk::gio;
 use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
+pub mod android;
 mod app;
 pub mod autostart;
 pub mod browser;
