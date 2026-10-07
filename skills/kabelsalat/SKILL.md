@@ -186,6 +186,45 @@ kabelsalat only starts Android; adb authorisation, Fenix and geckodriver are
 yours to set up, as below. The co-browsing rule is the browser's: the user
 watches the pane; act when asked.
 
+### How the Android pane fits with the system
+
+- **The pane is a nested compositor.** kabelsalat hosts a nested Wayland
+  compositor (klamottenkiste) per pane; its Wayland socket lives under
+  `$XDG_RUNTIME_DIR`. A control socket beside it accepts one-line commands
+  (`screenshot`, `click`, `type`, `key`, `resize`) that reach only the client
+  hosted in the pane, never the host seat. `kabelsalat android …` subcommands
+  forward to that socket; `KABELSALAT_ANDROID_CTL` is its path.
+- **Waydroid is split in two.** A root-owned container service
+  (`waydroid-container.service`, started once by the admin after
+  `waydroid init`) and a user session (`waydroid session start`) that binds to
+  exactly one Wayland display when it starts. kabelsalat starts and stops the
+  session with `WAYLAND_DISPLAY` pointed at the pane's socket; the container
+  keeps running. Android renders on the host GPU via dmabuf; no software
+  rendering props are needed.
+- **Hence one Android pane per machine**, owned by one group at a time.
+  `kabelsalat android` from another group exits 3 naming the owner. Moving it
+  means Stop, then open it elsewhere (about 20 s to boot). A Waydroid session
+  started outside kabelsalat (e.g. from a terminal) blocks the pane with a
+  notice; it is stopped with `waydroid session stop`.
+- **adb goes over the container network**, to the serial in
+  `KABELSALAT_ANDROID_ADB` (`192.168.240.112:5555` by default); the first
+  connect needs the "Allow USB debugging" tap. Fenix, geckodriver and the BiDi
+  session are entirely yours; kabelsalat never installs or launches them.
+- **Lifecycle.** The two variables appear in the group's tmux sessions once
+  Android has booted and disappear on Stop, tab close, death or app exit. The
+  owner is remembered in `state.json`: after a kabelsalat restart the pane
+  comes back hidden for that group, and the variables reappear once it has
+  booted. On teardown the pane's compositor and session are killed as one
+  process group, so nothing of kabelsalat's survives a Stop; a crash of
+  kabelsalat can leave the session running, and the "already running" notice
+  then appears at the next start.
+- **Input.** The pane's seat has keyboard and pointer only, no touch: Android
+  sees a mouse. Prefer `adb shell input` for input inside Android (step 7).
+
+The blocks below assume one shell: variables set in one step (`CTL`, `ADB`,
+`D`, `PORT`, `V`) are used in later ones. In a fresh shell, re-run the
+`CTL=`/`ADB=` lines of step 1 first.
+
 ### 1. Bring Android up
 
 Pin `KABELSALAT_GROUP` as for the browser, then:
@@ -211,10 +250,21 @@ If the variables never appear, the user got a notice in the window
 (Waydroid missing, not initialised, or a session already running elsewhere).
 Ask them what it said.
 
+Once polling succeeds, load both values from the live tmux table. Do not
+read `$KABELSALAT_ANDROID_*` from your own environment: your shell started
+before Android booted, so `tmux set-environment` never reached it and the
+variables there are empty or stale.
+
+    CTL=$(tmux show-environment KABELSALAT_ANDROID_CTL | cut -d= -f2-)
+    ADB=$(tmux show-environment KABELSALAT_ANDROID_ADB | cut -d= -f2-)
+
+`kabelsalat android` prints the same two values as its `ctl=` and `adb=`
+lines once Android is up.
+
 ### 2. Authorise adb
 
-    adb connect "$KABELSALAT_ANDROID_ADB"
-    adb -s "$KABELSALAT_ANDROID_ADB" get-state      # "device" once authorised
+    adb connect "$ADB"
+    adb -s "$ADB" get-state      # "device" once authorised
 
 The first connection comes up `unauthorized`, and Android shows an "Allow USB
 debugging?" dialog in the pane. adb cannot answer it, so use the pane:
@@ -222,24 +272,28 @@ debugging?" dialog in the pane. adb cannot answer it, so use the pane:
     kabelsalat android screenshot /tmp/android.png   # look at the dialog
     kabelsalat android tap X Y                        # tick "Always allow", then tap "Allow"
 
-Coordinates are pixels of that screenshot. Then
-`adb disconnect "$KABELSALAT_ANDROID_ADB"`, connect again, and re-check
-`get-state`. "Always allow" makes this a one-time step.
+Coordinates are pixels of that screenshot. The first click after the pointer
+enters the pane can open the notification shade instead (step 7): take a
+screenshot after each tap, and if the shade is open, press
+`kabelsalat android key escape` and send the tap again. Then
+`adb disconnect "$ADB"`, connect again, and re-check `get-state`.
+"Always allow" makes this a one-time step.
 
 ### 3. Install Fenix (once)
 
-    adb -s "$KABELSALAT_ANDROID_ADB" shell pm path org.mozilla.firefox
+    adb -s "$ADB" shell pm path org.mozilla.firefox
 
 prints `package:…` when Fenix is installed. If it is not, download the
-official x86_64 APK from Mozilla's archive into a fresh, empty directory and
-install it (`adb install` checks the APK's signature):
+official x86_64 APK over HTTPS from Mozilla's archive (archive.mozilla.org is
+the provenance) into a fresh, empty directory and install it. `adb install`
+only verifies that the APK's signature is valid, not who signed it:
 
     V=$(curl -s https://archive.mozilla.org/pub/fenix/releases/ \
         | grep -o 'releases/[0-9][0-9.]*/"' | sed 's#releases/##; s#/"##' | sort -V | tail -1)
     D=$(mktemp -d)
     curl -fL -o "$D/fenix.apk" \
       "https://archive.mozilla.org/pub/fenix/releases/$V/android/fenix-$V-android-x86_64/fenix-$V.multi.android-x86_64.apk"
-    adb -s "$KABELSALAT_ANDROID_ADB" install "$D/fenix.apk"
+    adb -s "$ADB" install "$D/fenix.apk"
 
 ### 4. Start geckodriver
 
@@ -273,7 +327,7 @@ A raw websocket client keeps this to one small dependency
 (`pip install websockets`). Same preamble as for the browser — re-resolve
 the environment and assert the group you pinned:
 
-    import base64, json, subprocess, urllib.request
+    import base64, json, subprocess, urllib.error, urllib.request
     from websockets.sync.client import connect
 
     PINNED_GROUP = "<uuid from your first fetch>"
@@ -302,7 +356,11 @@ the environment and assert the group you pinned:
         f"{GECKO}/session", data=json.dumps(caps).encode(),
         headers={"Content-Type": "application/json"})
     # Starting Fenix on the device takes a while.
-    session = json.load(urllib.request.urlopen(request, timeout=180))["value"]
+    try:
+        session = json.load(urllib.request.urlopen(request, timeout=180))["value"]
+    except urllib.error.HTTPError as e:
+        # geckodriver explains a refused session in its JSON body.
+        raise SystemExit(f"new session failed: {e.code} {e.read().decode()}")
     session_id = session["sessionId"]
     ws_url = session["capabilities"]["webSocketUrl"]
 
@@ -328,6 +386,8 @@ the environment and assert the group you pinned:
                  url="https://example.org", wait="complete")
             title = bidi(ws, "script.evaluate", expression="document.title",
                          target={"context": context}, awaitPromise=False)
+            if title["type"] == "exception":       # the page's JS threw
+                raise RuntimeError(f"script.evaluate: {title['exceptionDetails']['text']}")
             print(title["result"]["value"])
             shot = bidi(ws, "browsingContext.captureScreenshot", context=context)
             with open("/tmp/fenix.png", "wb") as f:
@@ -352,9 +412,9 @@ start it again.
 - **`session.status` is not a health check.** It reports `ready: false`
   whenever a session is open.
 - **Tablet layout by default.** At the pane's size Fenix uses its tablet
-  layout and requests desktop sites. For a phone: `adb -s
-  "$KABELSALAT_ANDROID_ADB" shell wm density 420` (undo with
-  `wm density reset`), or a narrower screen with
+  layout and requests desktop sites. For a phone:
+  `adb -s "$ADB" shell wm density 420` (undo with
+  `adb -s "$ADB" shell wm density reset`), or a narrower screen with
   `kabelsalat android resize 540 1080`.
 - **One Android per machine**, owned by one group; it is not moved between
   groups.
@@ -363,9 +423,9 @@ start it again.
 
 Prefer adb for anything inside Android:
 
-    adb -s "$KABELSALAT_ANDROID_ADB" shell input tap X Y
-    adb -s "$KABELSALAT_ANDROID_ADB" shell input text 'hello%sworld'   # %s is a space
-    adb -s "$KABELSALAT_ANDROID_ADB" shell input keyevent KEYCODE_BACK
+    adb -s "$ADB" shell input tap X Y
+    adb -s "$ADB" shell input text 'hello%sworld'   # %s is a space
+    adb -s "$ADB" shell input keyevent KEYCODE_BACK
 
 Use `kabelsalat android tap|type|key` only while adb is not authorised yet
 (step 2). The pane has no touch device — Android sees a mouse — and the
