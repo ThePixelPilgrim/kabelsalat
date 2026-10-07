@@ -190,10 +190,12 @@ watches the pane; act when asked.
 
 - **The pane is a nested compositor.** kabelsalat hosts a nested Wayland
   compositor (klamottenkiste) per pane; its Wayland socket lives under
-  `$XDG_RUNTIME_DIR`. A control socket beside it accepts one-line commands
-  (`screenshot`, `click`, `type`, `key`, `resize`) that reach only the client
-  hosted in the pane, never the host seat. `kabelsalat android …` subcommands
-  forward to that socket; `KABELSALAT_ANDROID_CTL` is its path.
+  `$XDG_RUNTIME_DIR`. Each pane also has a control socket, a per-pane path
+  under the system temp dir (not `$XDG_RUNTIME_DIR`), restricted to your
+  user. It accepts one-line commands (`screenshot`, `click`, `type`, `key`,
+  `resize`) that reach only the client hosted in the pane, never the host
+  seat. `kabelsalat android …` subcommands forward to that socket. Read its
+  path from `KABELSALAT_ANDROID_CTL` only; never guess it.
 - **Waydroid is split in two.** A root-owned container service
   (`waydroid-container.service`, started once by the admin after
   `waydroid init`) and a user session (`waydroid session start`) that binds to

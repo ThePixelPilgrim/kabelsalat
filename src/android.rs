@@ -9,6 +9,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::Read as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -412,6 +413,18 @@ impl Android {
                 return Err(AndroidError::Compositor(msg));
             }
         };
+        // The compositor binds the control socket under the system temp dir
+        // with a predictable name and umask permissions; whoever can connect
+        // can click and type into Android. Owner only.
+        if let Err(err) = std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o600))
+        {
+            pane.close();
+            return Err(AndroidError::Compositor(format!(
+                "the control socket {} could not be restricted to this user: {err}",
+                control.display()
+            )));
+        }
+
         let log = match open_log(state_dir) {
             Ok(log) => log,
             Err(err) => {
