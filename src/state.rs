@@ -55,6 +55,17 @@ pub struct SavedGroup {
     /// host is always its group's.
     #[serde(default)]
     pub host: Option<String>,
+    /// The directory whose `*.md` nodes this group's overview draws. `None` =
+    /// no root set, the overview shows its empty state. The root is local
+    /// even for a remote group. `serde(default)` so older state files load
+    /// with no root.
+    #[serde(default)]
+    pub overview_root: Option<PathBuf>,
+    /// Whether this group shows the overview instead of its terminals.
+    /// `serde(default)` so older state files load every group in terminal
+    /// mode.
+    #[serde(default)]
+    pub overview_mode: bool,
 }
 
 fn default_browser_split() -> f64 {
@@ -73,6 +84,8 @@ impl SavedGroup {
             browser_split: DEFAULT_BROWSER_SPLIT,
             default_url: None,
             host: None,
+            overview_root: None,
+            overview_mode: false,
         }
     }
 }
@@ -814,6 +827,8 @@ mod tests {
                     browser_split: DEFAULT_BROWSER_SPLIT,
                     default_url: None,
                     host: None,
+                    overview_root: None,
+                    overview_mode: false,
                 },
                 SavedGroup {
                     uuid: "g-bbb".into(),
@@ -824,6 +839,8 @@ mod tests {
                     browser_split: 640.0,
                     default_url: Some("http://localhost:3000".into()),
                     host: None,
+                    overview_root: None,
+                    overview_mode: false,
                 },
             ],
             tabs: vec![
@@ -1720,6 +1737,8 @@ mod tests {
             browser_split: DEFAULT_BROWSER_SPLIT,
             default_url: None,
             host: Some("me@box".into()),
+            overview_root: None,
+            overview_mode: false,
         });
         // aaa/bbb/ccc are plain shells. Add a resumable claude, a claude that
         // is still live, and a claude on a remote host.
@@ -1908,5 +1927,46 @@ mod tests {
         // A visible area is visible whatever else is true (first pane, any group).
         assert!(quiet_open_visible(true, false, false));
         assert!(quiet_open_visible(true, true, false));
+    }
+
+    // --- overview mode ---
+
+    #[test]
+    fn old_group_without_overview_fields_loads_with_none_and_false() {
+        // A state.json written before overview mode existed: no root, mode off.
+        let json = r#"{
+            "groups": [{"id": 1, "name": "w", "palette": 0, "host": "me@box"}],
+            "tabs": [], "active": null, "sidebar_visible": true
+        }"#;
+        let state: SavedState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.groups[0].overview_root, None);
+        assert!(!state.groups[0].overview_mode);
+    }
+
+    #[test]
+    fn overview_fields_survive_save_and_load() {
+        let dir = tmp_dir("overview-fields");
+        let path = dir.join("state.json");
+        let mut state = sample_state();
+        state.groups[1].overview_root = Some(PathBuf::from("/home/me/docs"));
+        state.groups[1].overview_mode = true;
+        save(&state, &path).unwrap();
+        let back = load(&path);
+        assert_eq!(
+            back.groups[1].overview_root.as_deref(),
+            Some(Path::new("/home/me/docs"))
+        );
+        assert!(back.groups[1].overview_mode);
+        assert_eq!(back.groups[0].overview_root, None);
+        assert!(!back.groups[0].overview_mode);
+        assert_eq!(back, state);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saved_group_new_has_no_overview() {
+        let group = SavedGroup::new(1, "x".into(), 0);
+        assert_eq!(group.overview_root, None);
+        assert!(!group.overview_mode);
     }
 }

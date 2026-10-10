@@ -420,6 +420,11 @@ pub struct Group {
     /// The ssh destination this group's tabs run on; `None` = this computer.
     /// Fixed for the group's lifetime: tabs cannot move between hosts.
     host: Option<String>,
+    /// The directory whose node files the overview draws; `None` = the
+    /// overview shows its empty state. Set by `kabelsalat overview root`.
+    overview_root: Option<PathBuf>,
+    /// Whether the group shows the overview instead of its terminals.
+    overview_mode: bool,
 }
 
 impl Group {
@@ -887,6 +892,12 @@ pub enum Msg {
     /// group's first pane, and the area only appears for the active group.
     OpenAndroid {
         group_uuid: String,
+    },
+    /// A `kabelsalat overview root` invocation: set or clear the group's
+    /// overview root. It changes no mode, no active group and no focus.
+    SetOverviewRoot {
+        group_uuid: String,
+        root: Option<PathBuf>,
     },
     /// A remote host's worker reported back.
     Remote {
@@ -1990,6 +2001,16 @@ impl SimpleComponent for App {
                 // arm does not return early.
                 self.rebuild_list();
             }
+            Msg::SetOverviewRoot { group_uuid, root } => {
+                // Same race as SpawnCommand: the CLI validated against a copy.
+                let Some(group) = self.groups.iter_mut().find(|g| g.uuid == group_uuid) else {
+                    eprintln!("overview root request for unknown group {group_uuid}");
+                    return;
+                };
+                group.overview_root = root;
+                // save_state() at the bottom of update() persists the root
+                // and republishes the snapshot the CLI reads.
+            }
             Msg::RenameGroup { group_uuid, name } => {
                 // Same race as SpawnCommand: the CLI validated against a copy.
                 let Some(group) = self.groups.iter_mut().find(|g| g.uuid == group_uuid) else {
@@ -2145,6 +2166,8 @@ impl App {
             browser_split: state::DEFAULT_BROWSER_SPLIT,
             default_url: None,
             host: None,
+            overview_root: None,
+            overview_mode: false,
         });
         id
     }
@@ -2230,6 +2253,8 @@ impl App {
                 browser_split: group.browser_split,
                 default_url: group.default_url.clone(),
                 host: group.host.clone(),
+                overview_root: group.overview_root.clone(),
+                overview_mode: group.overview_mode,
             });
         }
         self.next_group_id = saved.groups.iter().map(|g| g.id).max().map_or(1, |m| m + 1);
@@ -2387,6 +2412,8 @@ impl App {
                 },
                 default_url: g.default_url.clone(),
                 host: g.host.clone(),
+                overview_root: g.overview_root.clone(),
+                overview_mode: g.overview_mode,
             })
             .collect();
         let tabs = self
@@ -2462,6 +2489,9 @@ impl App {
                         ctl: a.control_socket_path().to_path_buf(),
                         adb: a.adb().filter(|_| a.is_running()).map(str::to_string),
                     }),
+                    overview_root: g.overview_root.clone(),
+                    // Filled once the overview wiring derives the group's issues.
+                    issues: Vec::new(),
                 })
                 .collect(),
         );

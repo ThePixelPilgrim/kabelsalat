@@ -11,6 +11,7 @@ pub mod browser;
 pub mod claude;
 mod cli;
 mod control;
+pub mod overview;
 pub mod remote;
 pub mod remote_worker;
 mod resume;
@@ -111,6 +112,12 @@ pub fn run() {
             group: Some(group),
             cmd,
         } => cli::android_argv(&args[0], group, cmd.as_ref()),
+        cli::Cli::OverviewRoot {
+            group: Some(group), ..
+        }
+        | cli::Cli::OverviewIssues { group: Some(group) } => {
+            cli::overview_argv(&args[0], group, &parsed)
+        }
         _ => args,
     };
 
