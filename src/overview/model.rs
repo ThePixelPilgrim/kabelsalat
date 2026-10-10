@@ -130,6 +130,7 @@ pub enum Parsed {
     Node(Node),
     /// A `kind: kind` node; `name` is the kind it styles.
     Kind {
+        id: String,
         name: String,
         style: KindStyle,
     },
@@ -217,13 +218,45 @@ fn key<'a>(mapping: &'a Mapping, name: &str) -> Option<&'a Value> {
     mapping.get(name)
 }
 
-/// The first `# ` heading of a Markdown body, trimmed.
+/// The run of fence characters (`` ` `` or `~`, three or more) a line opens
+/// or closes a fenced code block with: the character and the run length.
+fn fence_run(rest: &str) -> Option<(char, usize)> {
+    let first = rest.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let run = rest.chars().take_while(|c| *c == first).count();
+    (run >= 3).then_some((first, run))
+}
+
+/// The first `# ` heading of a Markdown body, trimmed. Lines inside a fenced
+/// code block (`` ``` `` or `~~~`, closed by a run of the same character at
+/// least as long) and indented code (four or more leading spaces) are not
+/// headings; up to three leading spaces are allowed, as in Markdown.
 fn first_heading(body: &str) -> Option<String> {
-    body.lines()
-        .map(str::trim_start)
-        .find_map(|line| line.strip_prefix("# "))
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let indent = line.chars().take_while(|c| *c == ' ').count();
+        let rest = line.trim_start();
+        // A fence line indented four or more spaces is code, not a fence.
+        if indent < 4
+            && let Some((ch, run)) = fence_run(rest)
+        {
+            match fence {
+                None => fence = Some((ch, run)),
+                Some((open_ch, open_run)) if ch == open_ch && run >= open_run => fence = None,
+                Some(_) => {}
+            }
+            continue;
+        }
+        if fence.is_some() || indent >= 4 {
+            continue;
+        }
+        if let Some(heading) = rest.strip_prefix("# ") {
+            let heading = heading.trim();
+            if !heading.is_empty() {
+                return Some(heading.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The links of a node: `links` must be a mapping of edge name to id or list
@@ -303,6 +336,7 @@ pub fn parse_file(file: &Path, text: &str) -> Result<Parsed, String> {
             .unwrap_or_else(|| Color::derived(&title));
         let statuses = parse_statuses(key(&map, "statuses"));
         return Ok(Parsed::Kind {
+            id,
             name: title,
             style: KindStyle { color, statuses },
         });
@@ -416,6 +450,32 @@ pub fn scan_root(root: &Path) -> Vec<Source> {
     out
 }
 
+/// `path` with `.md` added when it has no extension.
+fn with_md(path: &Path) -> PathBuf {
+    if path.extension().is_some() {
+        path.to_path_buf()
+    } else {
+        path.with_extension("md")
+    }
+}
+
+/// `path` with `.` components dropped and `..` components resolved against
+/// what precedes them, lexically (no file system access).
+fn normalise(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// The node graph of one overview root. Built once from the file contents
 /// and queried by the layout, the canvas and the issue list; `with_source`
 /// and `without_source` rebuild it after one file changed.
@@ -458,36 +518,50 @@ impl Graph {
     }
 
     fn read_sources(&mut self) {
+        // Every id seen so far, kind nodes included, with the file that
+        // claimed it. Sources are in path order, so the first file wins.
+        let mut seen: HashMap<String, PathBuf> = HashMap::new();
         for (file, text) in self.sources.clone() {
             let parsed = match text {
                 Err(e) => Err(e),
                 Ok(text) => parse_file(&file, &text),
             };
-            match parsed {
-                Err(detail) => self.report(FormatIssue {
-                    kind: FormatIssueKind::UnreadableFile,
-                    nodes: Vec::new(),
+            let parsed = match parsed {
+                Err(detail) => {
+                    self.report(FormatIssue {
+                        kind: FormatIssueKind::UnreadableFile,
+                        nodes: Vec::new(),
+                        file: Some(file),
+                        detail,
+                    });
+                    continue;
+                }
+                Ok(parsed) => parsed,
+            };
+            let id = match &parsed {
+                Parsed::NotANode => continue,
+                Parsed::Kind { id, .. } => id.clone(),
+                Parsed::Node(node) => node.id.clone(),
+            };
+            if let Some(first) = seen.get(&id) {
+                let detail = format!("'{id}' is also defined in {}", first.display());
+                self.report(FormatIssue {
+                    kind: FormatIssueKind::DuplicateId,
+                    nodes: vec![id],
                     file: Some(file),
                     detail,
-                }),
-                Ok(Parsed::NotANode) => {}
-                Ok(Parsed::Kind { name, style }) => {
+                });
+                continue;
+            }
+            seen.insert(id.clone(), file);
+            match parsed {
+                Parsed::Kind { name, style, .. } => {
                     self.kinds.entry(name).or_insert(style);
                 }
-                Ok(Parsed::Node(node)) => {
-                    if let Some(first) = self.nodes.get(&node.id) {
-                        let detail =
-                            format!("'{}' is also defined in {}", node.id, first.file.display());
-                        self.report(FormatIssue {
-                            kind: FormatIssueKind::DuplicateId,
-                            nodes: vec![node.id],
-                            file: Some(file),
-                            detail,
-                        });
-                    } else {
-                        self.nodes.insert(node.id.clone(), node);
-                    }
+                Parsed::Node(node) => {
+                    self.nodes.insert(id, node);
                 }
+                Parsed::NotANode => {}
             }
         }
     }
@@ -703,12 +777,20 @@ impl Graph {
             || self.edges.contains(&(b.to_string(), a.to_string()))
     }
 
-    /// The node a link in a rendered body points at: `href` is a node id, or
-    /// a path to a node's file — absolute, relative to any ancestor directory
-    /// (a path suffix), or just the file name — with or without the `.md`
-    /// extension, a leading `./`, or a `#fragment`. URLs with a scheme and
-    /// unknown targets give `None`.
+    /// [`Graph::node_for_href_from`] without a linking file: relative paths
+    /// are matched as suffixes only.
     pub fn node_for_href(&self, href: &str) -> Option<&Node> {
+        self.node_for_href_from(href, None)
+    }
+
+    /// The node a link in a rendered body points at: `href` is a node id, or
+    /// a path to a node's file — absolute, relative to the directory of
+    /// `from` (the file whose body holds the link, `..` and `.` resolved
+    /// lexically), relative to any ancestor directory (a path suffix), or
+    /// just the file name — with or without the `.md` extension, a leading
+    /// `./`, or a `#fragment`. URLs with a scheme and unknown targets give
+    /// `None`.
+    pub fn node_for_href_from(&self, href: &str, from: Option<&Path>) -> Option<&Node> {
         let href = href.split(['#', '?']).next().unwrap_or("");
         if href.is_empty() || href.contains("://") {
             return None;
@@ -716,14 +798,17 @@ impl Graph {
         if let Some(node) = self.nodes.get(href) {
             return Some(node);
         }
-        let target = Path::new(href.strip_prefix("./").unwrap_or(href));
-        let with_md = target.with_extension("md");
-        let wanted = if target.extension().is_some() {
-            target
-        } else {
-            with_md.as_path()
-        };
-        self.nodes.values().find(|n| n.file.ends_with(wanted))
+        let target = Path::new(href);
+        if target.is_relative()
+            && let Some(dir) = from.and_then(Path::parent)
+        {
+            let resolved = with_md(&normalise(&dir.join(target)));
+            if let Some(node) = self.nodes.values().find(|n| n.file == resolved) {
+                return Some(node);
+            }
+        }
+        let wanted = with_md(Path::new(href.strip_prefix("./").unwrap_or(href)));
+        self.nodes.values().find(|n| n.file.ends_with(&wanted))
     }
 
     pub fn issues(&self) -> &[FormatIssue] {
@@ -936,6 +1021,34 @@ owner: ops\ntags: [security, access]\n---\n# ADR-118: Emergency access account\n
     }
 
     #[test]
+    fn default_title_skips_headings_inside_fenced_and_indented_code() {
+        // A shell comment inside a fence is not a heading.
+        let n = node("---\nid: a\n---\n```sh\n# install deps\n```\n# Real\n");
+        assert_eq!(n.title, "Real");
+        // Tilde fences too, and a shorter closing run does not close the fence.
+        let n = node("---\nid: a\n---\n~~~~\n~~~\n# still code\n~~~~\n# Real\n");
+        assert_eq!(n.title, "Real");
+        // A fence of one character cannot be closed by the other.
+        let n = node("---\nid: a\n---\n```\n~~~\n# still code\n```\n# Real\n");
+        assert_eq!(n.title, "Real");
+        // Indented code (four or more spaces) is not a heading either.
+        let n = node("---\nid: a\n---\n    # code\n");
+        assert_eq!(n.title, "a");
+        // Up to three leading spaces are still a heading.
+        let n = node("---\nid: a\n---\n   # Indented heading\n");
+        assert_eq!(n.title, "Indented heading");
+        // An unterminated fence swallows the rest of the body.
+        let n = node("---\nid: a\n---\n```\n# code\n");
+        assert_eq!(n.title, "a");
+        // An indented fence opener (up to three spaces) still opens a fence.
+        let n = node("---\nid: a\n---\n  ```\n# code\n  ```\n# Real\n");
+        assert_eq!(n.title, "Real");
+        // A closing run indented four or more spaces is content, not a closer.
+        let n = node("---\nid: a\n---\n```\n    ```\n# code\n```\n# Real\n");
+        assert_eq!(n.title, "Real");
+    }
+
+    #[test]
     fn parse_file_stringifies_non_string_scalars_and_accepts_scalar_or_list() {
         let n = node(
             "---\nid: 42\nparent: 7\nlinks:\n  sees: [1.5, true, x]\n  broken: {a: b}\n  alone: y\nn: 3\ncolor: red\n---\n",
@@ -1010,6 +1123,7 @@ owner: ops\ntags: [security, access]\n---\n# ADR-118: Emergency access account\n
         assert_eq!(
             parse_file(Path::new("/r/k.md"), text),
             Ok(Parsed::Kind {
+                id: "kind-adr".into(),
                 name: "adr".into(),
                 style: KindStyle {
                     color: Color::Amber,
@@ -1027,7 +1141,8 @@ owner: ops\ntags: [security, access]\n---\n# ADR-118: Emergency access account\n
     fn kind_node_without_colour_or_statuses_gets_a_derived_colour() {
         let text = "---\nid: kind-x\nkind: kind\ntitle: epic\ncolor: nope\nstatuses: [a, b]\n---\n";
         match parse_file(Path::new("/r/k.md"), text) {
-            Ok(Parsed::Kind { name, style }) => {
+            Ok(Parsed::Kind { id, name, style }) => {
+                assert_eq!(id, "kind-x");
                 assert_eq!(name, "epic");
                 assert_eq!(style.color, Color::derived("epic"));
                 assert!(style.statuses.is_empty());
@@ -1148,6 +1263,60 @@ owner: ops\ntags: [security, access]\n---\n# ADR-118: Emergency access account\n
         assert_eq!(dups[0].file.as_deref(), Some(Path::new("/r/m-third.md")));
         assert!(dups[0].detail.contains("a-first.md"), "{}", dups[0].detail);
         assert_eq!(dups[1].file.as_deref(), Some(Path::new("/r/z-second.md")));
+    }
+
+    #[test]
+    fn duplicate_ids_between_kind_nodes_and_regular_nodes_are_reported() {
+        // A kind node and a regular node sharing an id: the first by path
+        // (the kind node) wins, the regular node is reported and dropped.
+        let g = Graph::build(vec![
+            src("/r/b-node.md", &fm("kind-adr", "title: pretender\n")),
+            src(
+                "/r/a-kind.md",
+                &fm("kind-adr", "kind: kind\ntitle: adr\ncolor: amber\n"),
+            ),
+        ]);
+        assert_eq!(g.len(), 0);
+        assert_eq!(g.kind_color("adr"), Color::Amber);
+        let dups = issues_of(&g, FormatIssueKind::DuplicateId);
+        assert_eq!(dups.len(), 1, "{dups:?}");
+        assert_eq!(dups[0].nodes, vec!["kind-adr"]);
+        assert_eq!(dups[0].file.as_deref(), Some(Path::new("/r/b-node.md")));
+        assert!(dups[0].detail.contains("a-kind.md"), "{}", dups[0].detail);
+
+        // Two kind nodes sharing an id: the later file is reported and does
+        // not style anything.
+        let g = Graph::build(vec![
+            src(
+                "/r/z-later.md",
+                &fm("kind-x", "kind: kind\ntitle: epic\ncolor: red\n"),
+            ),
+            src(
+                "/r/a-first.md",
+                &fm("kind-x", "kind: kind\ntitle: adr\ncolor: amber\n"),
+            ),
+        ]);
+        assert_eq!(g.kind_color("adr"), Color::Amber);
+        assert_eq!(g.kind_color("epic"), Color::derived("epic"));
+        let dups = issues_of(&g, FormatIssueKind::DuplicateId);
+        assert_eq!(dups.len(), 1, "{dups:?}");
+        assert_eq!(dups[0].nodes, vec!["kind-x"]);
+        assert_eq!(dups[0].file.as_deref(), Some(Path::new("/r/z-later.md")));
+        assert!(dups[0].detail.contains("a-first.md"), "{}", dups[0].detail);
+
+        // A regular node first, a kind node later: the kind node loses.
+        let g = Graph::build(vec![
+            src("/r/a-node.md", &fm("shared", "title: real\n")),
+            src(
+                "/r/b-kind.md",
+                &fm("shared", "kind: kind\ntitle: adr\ncolor: amber\n"),
+            ),
+        ]);
+        assert_eq!(g.node("shared").map(|n| n.title.as_str()), Some("real"));
+        assert_eq!(g.kind_color("adr"), Color::derived("adr"));
+        let dups = issues_of(&g, FormatIssueKind::DuplicateId);
+        assert_eq!(dups.len(), 1, "{dups:?}");
+        assert_eq!(dups[0].file.as_deref(), Some(Path::new("/r/b-kind.md")));
     }
 
     #[test]
@@ -1465,5 +1634,56 @@ owner: ops\ntags: [security, access]\n---\n# ADR-118: Emergency access account\n
         assert_eq!(id(graph.node_for_href("https://example.org/a.md")), None);
         assert_eq!(id(graph.node_for_href("c.md")), None);
         assert_eq!(id(graph.node_for_href("")), None);
+    }
+
+    #[test]
+    fn body_link_targets_resolve_relative_to_the_linking_file() {
+        let graph = Graph::build(vec![
+            src("/r/docs/adr/a.md", &fm("A-1", "")),
+            src("/r/docs/projects/p.md", &fm("P-4", "")),
+            src("/r/docs/adr/sub/p.md", &fm("P-sub", "")),
+        ]);
+        fn id(n: Option<&Node>) -> Option<&str> {
+            n.map(|n| n.id.as_str())
+        }
+        let from = Some(Path::new("/r/docs/adr/a.md"));
+        // `..` is resolved against the linking file's directory.
+        assert_eq!(
+            id(graph.node_for_href_from("../projects/p.md", from)),
+            Some("P-4")
+        );
+        assert_eq!(
+            id(graph.node_for_href_from("../projects/p", from)),
+            Some("P-4")
+        );
+        assert_eq!(
+            id(graph.node_for_href_from("./../projects/./p.md#x", from)),
+            Some("P-4")
+        );
+        // A sibling-directory file wins over a same-named file elsewhere.
+        assert_eq!(
+            id(graph.node_for_href_from("sub/p.md", from)),
+            Some("P-sub")
+        );
+        assert_eq!(
+            id(graph.node_for_href_from("../../docs/adr/sub/p.md", from)),
+            Some("P-sub")
+        );
+        // Ids and absolute paths are unaffected by `from`.
+        assert_eq!(id(graph.node_for_href_from("P-4", from)), Some("P-4"));
+        assert_eq!(
+            id(graph.node_for_href_from("/r/docs/projects/p.md", from)),
+            Some("P-4")
+        );
+        // When the resolved path is not a node, the suffix match still applies.
+        assert_eq!(
+            id(graph.node_for_href_from("a.md", Some(Path::new("/r/docs/projects/p.md")))),
+            Some("A-1")
+        );
+        // Without a linking file, `..` never matches anything.
+        assert_eq!(id(graph.node_for_href_from("../projects/p.md", None)), None);
+        assert_eq!(id(graph.node_for_href("../projects/p.md")), None);
+        assert_eq!(id(graph.node_for_href_from("https://x/p.md", from)), None);
+        assert_eq!(id(graph.node_for_href_from("", from)), None);
     }
 }
