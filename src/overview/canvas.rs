@@ -1607,7 +1607,7 @@ mod imp {
     #[derive(Default)]
     pub struct OverviewCanvas {
         /// The view this canvas draws for; set once by `Inner::wire`.
-        pub view: RefCell<Weak<Inner>>,
+        pub(super) view: RefCell<Weak<Inner>>,
     }
 
     #[glib::object_subclass]
