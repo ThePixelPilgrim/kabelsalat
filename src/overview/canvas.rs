@@ -5,9 +5,9 @@
 //! pure modules (`model`, `layout`, `issues`), which carry the tests.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::f64::consts::{FRAC_PI_2, PI};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
@@ -42,6 +42,10 @@ const PANEL_MIN_W: f64 = 480.0;
 const PANEL_MIN_H: f64 = 320.0;
 const PANEL_MARGIN: f64 = 12.0;
 const ARROW_PX: f64 = 8.0;
+
+/// The node format page the empty state links (the repository's origin).
+const FORMAT_DOC_URL: &str =
+    "https://github.com/ThePixelPilgrim/kabelsalat/blob/main/skills/kabelsalat/overview-format.md";
 
 const AMBER: gdk::RGBA = gdk::RGBA::new(0.90, 0.62, 0.11, 1.0);
 const GREEN: gdk::RGBA = gdk::RGBA::new(0.18, 0.63, 0.36, 1.0);
@@ -758,9 +762,7 @@ impl Inner {
             let mut s = self.state.borrow_mut();
             s.pointer = (x, y);
             let over_chip = s.hits.iter().any(|h| h.rect.contains(x, y));
-            let (wx, wy) = s.viewport.to_world(x, y);
-            let tier = s.viewport.tier();
-            let hover = layout::hit_test(&s.layout, tier, wx, wy)
+            let hover = hit_drawn(&s.layout, &s.drawn, x, y)
                 .filter(|b| s.layout.copies(&b.key.id).len() > 1)
                 .map(|b| b.key.id.clone());
             let changed = hover != s.hover;
@@ -792,25 +794,27 @@ impl Inner {
         }
     }
 
+    /// Zoom to fit the box drawn under the pointer: a row's placed rectangle
+    /// shows it as a card at the next tier.
     fn double_clicked(&self, x: f64, y: f64) {
         let target = {
             let s = self.state.borrow();
-            let (wx, wy) = s.viewport.to_world(x, y);
-            layout::hit_test(&s.layout, s.viewport.tier(), wx, wy).map(|b| b.rect)
+            hit_drawn(&s.layout, &s.drawn, x, y).map(|b| b.rect)
         };
         if let Some(rect) = target {
             self.update_viewport(|vp| vp.fit(&rect, FIT_MARGIN));
         }
     }
 
-    /// A link in the rendered body: a node id or node file pans there,
+    /// A link in the rendered body of the node at `from`: a node id or node
+    /// file (relative paths resolved against `from`'s directory) pans there,
     /// anything else goes to the app.
-    fn follow_link(&self, href: &str) {
+    fn follow_link(&self, href: &str, from: &Path) {
         let node = self
             .state
             .borrow()
             .graph
-            .node_for_href(href)
+            .node_for_href_from(href, Some(from))
             .map(|n| n.id.clone());
         match node {
             Some(id) => self.pan_to(&id),
@@ -837,7 +841,8 @@ impl Inner {
                 };
                 self.empty_page.set_description(Some(&format!(
                     "Set one with  <tt>kabelsalat overview root -g {} DIR</tt>  \u{2014} the node \
-                     format is documented in the kabelsalat skill's overview-format.md",
+                     format is documented in the kabelsalat skill's \
+                     <a href=\"{FORMAT_DOC_URL}\">overview-format.md</a>",
                     glib::markup_escape_text(&group)
                 )));
             }
@@ -1033,6 +1038,7 @@ impl Inner {
         let link_click = gtk::GestureClick::new();
         link_click.set_button(gdk::BUTTON_PRIMARY);
         let weak = self.me.clone();
+        let file = data.node.file.clone();
         link_click.connect_released(move |gesture, _, x, y| {
             let Some(view) = gesture
                 .widget()
@@ -1052,7 +1058,7 @@ impl Inner {
             if let Some(href) = href
                 && let Some(inner) = weak.upgrade()
             {
-                inner.follow_link(&href);
+                inner.follow_link(&href, &file);
             }
         });
         view.add_controller(link_click);
@@ -1889,8 +1895,11 @@ fn draw_scene(widget: &gtk::Widget, snapshot: &gtk::Snapshot, s: &mut State) {
     for b in layout::visible(&layout, ctx.tier) {
         match (ctx.tier, b.level) {
             (_, 0) => draw_container(&ctx, s, &graph, &layout, b),
-            (Tier::Near | Tier::Close, 1) => draw_card(&ctx, s, &graph, &layout, b),
-            // Rows are drawn by their container.
+            (Tier::Near | Tier::Close, 1) | (Tier::Close, 2) => {
+                draw_card(&ctx, s, &graph, &layout, b)
+            }
+            // Rows are drawn by their container or card; anything deeper
+            // (or a level the tier does not show) draws nothing.
             _ => {}
         }
     }
@@ -1936,6 +1945,47 @@ fn rows_of<'a>(layout: &'a Layout, container: &PlacedBox) -> Vec<&'a PlacedBox> 
         .collect();
     rows.sort_by_key(|b| b.child_order);
     rows
+}
+
+/// The container copy a row sits in: the copy of its parent one level up
+/// whose rectangle holds the row's centre (the inverse of [`rows_of`]).
+fn container_of<'a>(layout: &'a Layout, b: &PlacedBox) -> Option<&'a PlacedBox> {
+    let parent = b.key.parent.as_deref()?;
+    let (cx, cy) = b.rect.center();
+    layout
+        .boxes
+        .iter()
+        .find(|c| c.key.id == parent && c.level + 1 == b.level && c.rect.contains(cx, cy))
+}
+
+/// Whether a tier draws a level's boxes at their placed rectangles (as
+/// containers or cards) rather than as list rows inside their parent.
+fn drawn_as_box(tier: Tier, level: usize) -> bool {
+    matches!(
+        (tier, level),
+        (_, 0) | (Tier::Near | Tier::Close, 1) | (Tier::Close, 2)
+    )
+}
+
+/// The deepest box drawn this frame under a screen point: rows at their
+/// drawn positions, not their placed rectangles. Ties (which overlapping
+/// boxes never produce) go to the smaller key, so the answer is stable.
+fn hit_drawn<'a>(
+    layout: &'a Layout,
+    drawn: &HashMap<BoxKey, Rect>,
+    x: f64,
+    y: f64,
+) -> Option<&'a PlacedBox> {
+    drawn
+        .iter()
+        .filter(|(_, r)| r.contains(x, y))
+        .filter_map(|(key, _)| layout.get(key))
+        .fold(None, |best: Option<&PlacedBox>, b| match best {
+            Some(best) if best.level > b.level || (best.level == b.level && best.key <= b.key) => {
+                Some(best)
+            }
+            _ => Some(b),
+        })
 }
 
 fn record_drawn(s: &mut State, b: &PlacedBox, rect: Rect) {
@@ -2119,6 +2169,11 @@ fn draw_container(ctx: &Draw, s: &mut State, graph: &Graph, layout: &Layout, b: 
             }
         }
         Tier::Mid => {
+            let bar_h = (3.0 * sc).max(2.0);
+            if y + bar_h < r.y + r.h - pad {
+                status_bar(ctx, &summary.statuses, x, y, right - x, bar_h);
+                y += bar_h + (4.0 * sc).max(2.0);
+            }
             draw_rows(ctx, s, graph, layout, b, &r, y);
         }
         Tier::Near | Tier::Close => {
@@ -2248,9 +2303,11 @@ fn draw_rows(
     }
 }
 
-/// A level-1 card at Near/Close: title, summary, status chip and tab chips
-/// (collapsed to "● N tabs" on a mirror); with children, a compact header
-/// and the children as rows.
+/// A card (level 1 at Near/Close, level 2 at Close): title, summary, status
+/// chip and tab chips (collapsed to "● N tabs" on a mirror). With children
+/// the header is compact (the card's header height) and the children follow
+/// as rows, unless the tier draws them as cards of their own at their
+/// placed rectangles inside this one.
 fn draw_card(ctx: &Draw, s: &mut State, graph: &Graph, layout: &Layout, b: &PlacedBox) {
     let r = screen_rect(&ctx.vp, &b.rect);
     if !intersects(&r, &ctx.canvas) {
@@ -2267,7 +2324,8 @@ fn draw_card(ctx: &Draw, s: &mut State, graph: &Graph, layout: &Layout, b: &Plac
     if r.h < MIN_TEXT_PX * 2.0 || r.w < MIN_TEXT_PX * 4.0 {
         return;
     }
-    let has_rows = !rows_of(layout, b).is_empty();
+    let has_children = !rows_of(layout, b).is_empty();
+    let as_rows = has_children && !drawn_as_box(ctx.tier, b.level + 1);
     let x = r.x + pad;
     let right = r.x + r.w - pad;
     let mut y = r.y + (8.0 * sc).max(4.0);
@@ -2297,22 +2355,19 @@ fn draw_card(ctx: &Draw, s: &mut State, graph: &Graph, layout: &Layout, b: &Plac
                 .collect()
         })
         .unwrap_or_default();
-    let limit = if has_rows {
+    let limit = if has_children {
         r.y + ctx.header_h * sc
     } else {
         r.y + r.h - pad
     };
 
-    if !has_rows && let Some(summary) = &node.summary {
-        let (_, sh) = ctx.text(
-            summary,
-            x,
-            y,
-            right - x,
-            Font::plain(ctx.text_px(11.0)),
-            &ctx.theme.muted,
-        );
-        y += sh + (4.0 * sc).max(2.0);
+    // One ellipsised summary line whenever it fits above the limit.
+    if let Some(summary) = &node.summary {
+        let font = Font::plain(ctx.text_px(11.0));
+        if y + font.px * 1.3 <= limit {
+            let (_, sh) = ctx.text(summary, x, y, right - x, font, &ctx.theme.muted);
+            y += sh + (4.0 * sc).max(2.0);
+        }
     }
 
     // Status chip and tab chips flow left to right, wrapping while there is
@@ -2365,15 +2420,42 @@ fn draw_card(ctx: &Draw, s: &mut State, graph: &Graph, layout: &Layout, b: &Plac
         }
     }
 
-    if has_rows {
+    if as_rows {
         let top = r.y + ctx.header_h * sc + (4.0 * sc).max(2.0);
         draw_rows(ctx, s, graph, layout, b, &r, top);
     }
 }
 
+/// Where an edge ends on screen, with the key of the box it ends at: the
+/// box's drawn rectangle; its placed rectangle when it is a box the tier
+/// draws but culled off-screen; else (a row cut by "+ N more", or in a box
+/// too short for rows) the nearest enclosing box, drawn or culled, as the
+/// spec routes hidden endpoints to the nearest visible ancestor.
+fn edge_end(ctx: &Draw, s: &State, layout: &Layout, key: &BoxKey) -> Option<(BoxKey, Rect)> {
+    let mut b = layout.get(key)?;
+    loop {
+        if let Some(r) = s.drawn.get(&b.key) {
+            return Some((b.key.clone(), *r));
+        }
+        if drawn_as_box(ctx.tier, b.level) {
+            return Some((b.key.clone(), screen_rect(&ctx.vp, &b.rect)));
+        }
+        b = container_of(layout, b)?;
+    }
+}
+
+/// The edges between one pair of resolved boxes, drawn as one curve.
+struct Bundle {
+    from: Rect,
+    to: Rect,
+    names: BTreeSet<String>,
+    count: usize,
+}
+
 /// Curves between the drawn boxes: bundled links (arrowheads and label
 /// pills from Near on) and dashed amber warning edges (Near on, no
-/// arrowhead).
+/// arrowhead, never labelled). Edges whose ends resolve to the same box
+/// pair after [`edge_end`] are re-bundled so the count stays right.
 fn draw_edges(ctx: &Draw, s: &State, graph: &Graph, layout: &Layout) {
     let edges = layout::edges(graph, layout, ctx.tier, &s.warning_pairs);
     if edges.is_empty() {
@@ -2381,21 +2463,41 @@ fn draw_edges(ctx: &Draw, s: &State, graph: &Graph, layout: &Layout) {
     }
     let near = ctx.tier >= Tier::Near;
     let sc = ctx.scale();
-    let cr = ctx.cairo(&ctx.canvas);
-    cr.set_line_cap(cairo::LineCap::Round);
-    let mut labels: Vec<(String, (f64, f64))> = Vec::new();
+    let mut bundles: BTreeMap<(BoxKey, BoxKey, bool), Bundle> = BTreeMap::new();
     for e in &edges {
         if e.warning && !near {
             continue;
         }
-        let (Some(a), Some(b)) = (s.drawn.get(&e.from), s.drawn.get(&e.to)) else {
+        let (Some((from, a)), Some((to, b))) = (
+            edge_end(ctx, s, layout, &e.from),
+            edge_end(ctx, s, layout, &e.to),
+        ) else {
             continue;
         };
-        let [p0, p1, p2, p3] = edge_curve(a, b);
+        if from == to {
+            continue;
+        }
+        let bundle = bundles
+            .entry((from, to, e.warning))
+            .or_insert_with(|| Bundle {
+                from: a,
+                to: b,
+                names: BTreeSet::new(),
+                count: 0,
+            });
+        bundle.names.extend(e.labels.iter().cloned());
+        bundle.count += e.count;
+    }
+    let cr = ctx.cairo(&ctx.canvas);
+    cr.set_line_cap(cairo::LineCap::Round);
+    let mut labels: Vec<(String, (f64, f64))> = Vec::new();
+    for ((_, _, warning), bundle) in &bundles {
+        let warning = *warning;
+        let [p0, p1, p2, p3] = edge_curve(&bundle.from, &bundle.to);
         cr.new_path();
         cr.move_to(p0.0, p0.1);
         cr.curve_to(p1.0, p1.1, p2.0, p2.1, p3.0, p3.1);
-        if e.warning {
+        if warning {
             set_source(&cr, &alpha(&AMBER, 0.9));
             cr.set_line_width(1.5);
             cr.set_dash(&[6.0, 4.0], 0.0);
@@ -2409,7 +2511,7 @@ fn draw_edges(ctx: &Draw, s: &State, graph: &Graph, layout: &Layout) {
             cr.set_dash(&[], 0.0);
         }
         let _ = cr.stroke();
-        if near && !e.warning {
+        if near && !warning {
             let (dx, dy) = (p3.0 - p2.0, p3.1 - p2.1);
             let len = (dx * dx + dy * dy).sqrt();
             if len > 0.001 {
@@ -2424,12 +2526,12 @@ fn draw_edges(ctx: &Draw, s: &State, graph: &Graph, layout: &Layout) {
                 let _ = cr.fill();
             }
         }
-        let label = if e.warning || ctx.tier == Tier::Mid {
+        let label = if warning || !near {
             None
-        } else if e.count == 1 {
-            e.labels.first().cloned()
+        } else if bundle.count == 1 {
+            bundle.names.iter().next().cloned()
         } else {
-            Some(format!("{} links", e.count))
+            Some(format!("{} links", bundle.count))
         };
         if let Some(text) = label.filter(|t| !t.is_empty()) {
             labels.push((text, bezier_mid(p0, p1, p2, p3)));

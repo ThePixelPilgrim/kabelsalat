@@ -428,12 +428,15 @@ pub fn layout(graph: &Graph, m: &Metrics) -> Layout {
 }
 
 /// How many nesting levels a tier shows: Far the top level only, Mid one
-/// level of rows below it, Near and Close two (cards and their rows).
+/// level of rows below it, Near two (cards and their rows), Close three (the
+/// spec's "Deeper: as Near": the cards' children take Near's card form and
+/// their own children are rows).
 pub fn visible_levels(tier: Tier) -> usize {
     match tier {
         Tier::Far => 1,
         Tier::Mid => 2,
-        Tier::Near | Tier::Close => 3,
+        Tier::Near => 3,
+        Tier::Close => 4,
     }
 }
 
@@ -592,8 +595,10 @@ pub fn hit_test(layout: &Layout, tier: Tier, x: f64, y: f64) -> Option<&PlacedBo
         })
 }
 
-/// The visible box below the top level whose centre is nearest `(cx, cy)`:
-/// the card the Close tier opens. `None` when the tier shows no such box.
+/// The visible level-1 box (the ones drawn as cards) whose centre is nearest
+/// `(cx, cy)`: the card the Close tier opens. Deeper boxes are drawn as rows
+/// inside their card, so they are never the focus. `None` when the tier
+/// shows no level-1 box.
 pub fn focused(layout: &Layout, tier: Tier, cx: f64, cy: f64) -> Option<&PlacedBox> {
     let distance = |b: &PlacedBox| {
         let (x, y) = b.rect.center();
@@ -601,7 +606,7 @@ pub fn focused(layout: &Layout, tier: Tier, cx: f64, cy: f64) -> Option<&PlacedB
     };
     visible(layout, tier)
         .into_iter()
-        .filter(|b| b.level >= 1)
+        .filter(|b| b.level == 1)
         .fold(None, |best: Option<&PlacedBox>, b| match best {
             Some(best) if distance(best) <= distance(b) => Some(best),
             _ => Some(b),
@@ -1048,6 +1053,19 @@ mod tests {
         ])
     }
 
+    /// [`nested`] plus a level-3 node: deep{deeper}.
+    fn nested_deeper() -> Graph {
+        graph(&[
+            ("p", ""),
+            ("q", ""),
+            ("a", "parent: p\nlinks:\n  related: c\n  uses: c\n"),
+            ("deep", "parent: a\nlinks:\n  sees: c\n"),
+            ("deeper", "parent: deep\n"),
+            ("b", "parent: p\nlinks:\n  blocks: a\n"),
+            ("c", "parent: q\n"),
+        ])
+    }
+
     fn ids_of(boxes: &[&PlacedBox]) -> Vec<String> {
         let mut ids: Vec<String> = boxes.iter().map(|b| b.key.id.clone()).collect();
         ids.sort();
@@ -1059,7 +1077,7 @@ mod tests {
         assert_eq!(visible_levels(Tier::Far), 1);
         assert_eq!(visible_levels(Tier::Mid), 2);
         assert_eq!(visible_levels(Tier::Near), 3);
-        assert_eq!(visible_levels(Tier::Close), 3);
+        assert_eq!(visible_levels(Tier::Close), 4);
         assert_eq!(MID_ROWS, 12);
         let l = layout(&nested(), &Metrics::default());
         assert_eq!(ids_of(&visible(&l, Tier::Far)), vec!["p", "q"]);
@@ -1072,6 +1090,18 @@ mod tests {
             vec!["a", "b", "c", "deep", "p", "q"]
         );
         assert_eq!(visible(&l, Tier::Close).len(), 6);
+        // A level-3 box (deeper, in deep) shows at Close only: Near's
+        // children at Close take Near's form, so their own children are rows.
+        let l = layout(&nested_deeper(), &Metrics::default());
+        assert_eq!(l.get(&key("deeper", Some("deep"))).unwrap().level, 3);
+        assert_eq!(
+            ids_of(&visible(&l, Tier::Near)),
+            vec!["a", "b", "c", "deep", "p", "q"]
+        );
+        assert_eq!(
+            ids_of(&visible(&l, Tier::Close)),
+            vec!["a", "b", "c", "deep", "deeper", "p", "q"]
+        );
     }
 
     #[test]
@@ -1217,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_is_the_nearest_visible_card_below_the_top_level() {
+    fn focused_is_the_nearest_level_one_card_never_a_deeper_box() {
         let g = nested();
         let l = layout(&g, &Metrics::default());
         let c = rect_of(&l, "c", Some("q"));
@@ -1232,17 +1262,21 @@ mod tests {
         );
         // Nothing below the top level is visible at Far.
         assert_eq!(focused(&l, Tier::Far, x, y), None);
-        // Far outside, the nearest card still wins.
+        // Only level-1 boxes are drawn as cards: with the centre on deep's
+        // placed centre (nearer deep than its card a), the card a still wins,
+        // at every tier that shows deep.
         let deep = rect_of(&l, "deep", Some("a"));
+        let a = rect_of(&l, "a", Some("p"));
         let (dx, dy) = deep.center();
-        assert_eq!(
-            focused(&l, Tier::Near, dx, dy).unwrap().key,
-            key("deep", Some("a"))
-        );
-        assert_eq!(
-            focused(&l, Tier::Mid, dx, dy).unwrap().key,
-            key("a", Some("p"))
-        );
+        let (ax, ay) = a.center();
+        assert!((dx - ax).abs() + (dy - ay).abs() > 1.0, "{deep:?} vs {a:?}");
+        for tier in [Tier::Mid, Tier::Near, Tier::Close] {
+            assert_eq!(
+                focused(&l, tier, dx, dy).unwrap().key,
+                key("a", Some("p")),
+                "{tier:?}"
+            );
+        }
         assert_eq!(focused(&Layout::default(), Tier::Near, 0.0, 0.0), None);
     }
 
