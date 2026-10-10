@@ -468,12 +468,13 @@ Overview" toggle in the header bar themselves, so tell them the root is set.
 Remote groups have no overview (exit 3).
 
 `issues` prints the group's current data issues, one per line, tab-separated:
-issue kind, node ids joined by `,`, file (empty when the issue is not about
-one file), detail. No output and exit 0 means the data is clean. The kinds
-are `unreadable-file`, `duplicate-id`, `unknown-node`, `parent-cycle` and
-`missing-link`; what each means and how to fix it is in the format page.
+issue kind, node ids joined by `,`, the file's absolute path (empty when the
+issue is not about one file), detail. No output and exit 0 means the data is
+clean. The kinds are `unreadable-file`, `duplicate-id`, `unknown-node`,
+`parent-cycle` and `missing-link`; what each means and how to fix it is in the
+format page.
 
-    unknown-node	adr-118,adr-999	docs/adr/adr-118.md	links target 'adr-999' does not exist
+    unknown-node	adr-118,adr-999	/home/you/project/docs/adr/adr-118.md	'adr-118' links to unknown node 'adr-999' under 'builds-on'
     missing-link	adr-064,adr-118		tab 'recovery flow' links both; no edge between them
 
 Which tab works on which node is inferred by kabelsalat from the tab's recent

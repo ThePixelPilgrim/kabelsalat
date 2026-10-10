@@ -119,7 +119,7 @@ that is probably how you got here.
 
 | Issue | Rule | Fix |
 |---|---|---|
-| `unreadable-file` | the frontmatter does not parse, or the `id` is missing or uses other characters | fix the YAML; one bad file never hides the others |
+| `unreadable-file` | the frontmatter does not parse, or its `id` is not a plain value or uses other characters (a block with no `id` is not a node and raises no issue) | fix the YAML; one bad file never hides the others |
 | `duplicate-id` | two files share an `id` | rename one; until then the first file by path keeps the id |
 | `unknown-node` | a `parent` or `links` target names an id no file has | create the node or correct the id |
 | `parent-cycle` | following `parent` leads back to the start | remove one `parent` entry; until then the closing one is ignored |
@@ -131,13 +131,13 @@ Check your work without the GUI:
     kabelsalat overview issues -g <name|uuid>
 
 One line per issue, tab-separated: the issue kind as in the table, the node
-ids involved joined by `,`, the file (empty when the issue is not about one
-file), and a detail sentence for humans — read it, do not parse it. No
-output and exit 0 means the data is clean. Exit 1 means kabelsalat is not
-running; exit 3 an unknown, ambiguous or remote group — remote groups have
-no overview.
+ids involved joined by `,`, the file as an absolute path (empty when the issue
+is not about one file), and a detail sentence for humans — read it, do not
+parse it. No output and exit 0 means the data is clean. Exit 1 means
+kabelsalat is not running; exit 3 an unknown, ambiguous or remote group —
+remote groups have no overview.
 
-    unknown-node	adr-118,adr-999	docs/adr/adr-118.md	links target 'adr-999' does not exist
+    unknown-node	adr-118,adr-999	/home/you/project/docs/adr/adr-118.md	'adr-118' links to unknown node 'adr-999' under 'builds-on'
     missing-link	adr-064,adr-118		tab 'recovery flow' links both; no edge between them
 
 Run it after every batch of edits; a file watcher re-reads changed files, so
