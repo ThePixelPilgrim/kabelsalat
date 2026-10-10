@@ -732,7 +732,7 @@ impl Layout {
 }
 pub fn layout(graph: &Graph, m: &Metrics) -> Layout;
 
-pub fn visible_levels(tier: Tier) -> usize;   // Far: 1 (level 0 only), Mid: 2, Near: 3, Close: 3
+pub fn visible_levels(tier: Tier) -> usize;   // Far: 1 (level 0 only), Mid: 2, Near: 3, Close: 4 (the spec's "Deeper: as Near": cards' children take the card form, their own children are rows)
 pub fn visible<'a>(layout: &'a Layout, tier: Tier) -> Vec<&'a PlacedBox>;
 pub fn visible_ancestor<'a>(layout: &'a Layout, graph: &Graph, key: &BoxKey, tier: Tier) -> Option<&'a PlacedBox>; // the box itself when visible, else nearest visible container copy
 pub const MID_ROWS: usize = 12;  // rows shown per container at Mid before "+ N more"
@@ -994,7 +994,7 @@ In `view!` (`:923`), add `#[wrap(Some)] set_title_widget = &gtk::Box { add_css_c
 
 - [ ] **Step 4: Loading and watching the root**
 
-`fn load_overview(&mut self, group: usize)`: `scan_root(&root)` → `Graph::build` → `layout(&graph, &Metrics::default())` → `issues::derive(&graph, &self.tagged_tabs(group))`; an unreadable root (`!root.is_dir()`) sets `error`. Called on group activation (first time), from `SetOverviewRoot` (Task 5's handler now also reloads and rewatches when the group is active, and clears monitors on `--clear`), and from `Msg::OverviewFileChanged`: a `.md` `Created`/`Changed`/`ChangesDoneHint` → `graph.with_source((path, fs::read_to_string(..).map_err(|e| e.to_string())))`; `Deleted` → `without_source`; a created directory → new monitor; then re-layout, re-derive issues, refeed the view, `publish_groups()`, `return` (no save). Monitors follow the pattern at `:1468-1491`: `gio::File::for_path(dir).monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)`, `connect_changed(move |_, file, _, event| …send(Msg::OverviewFileChanged{..}))`, one per directory below the root (skipping dot dirs), stored in `overview_monitors`.
+`fn load_overview(&mut self, group: usize)`: `scan_root(&root)` → `Graph::build` → `layout(&graph, &Metrics::default())` → `issues::derive(&graph, &self.tagged_tabs(group))`; an unreadable root (`!root.is_dir()`, or a directory `read_dir` cannot list) sets `error`. Called for every local rooted group when the state is restored and again on group activation whenever the group has no data or an error state — whatever its mode, so `kabelsalat overview issues` and the tagger see the data without the map being shown — from `SetOverviewRoot` (Task 5's handler now also reloads and rewatches when the group is active, and clears monitors on `--clear`), and from `Msg::OverviewFileChanged`: a `.md` `Created`/`Changed`/`ChangesDoneHint` → `graph.with_source((path, fs::read_to_string(..).map_err(|e| e.to_string())))`; `Deleted` → `without_source`; a created directory → new monitor; then re-layout, re-derive issues, refeed the view, `publish_groups()`, `return` (no save). Monitors follow the pattern at `:1468-1491`: `gio::File::for_path(dir).monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)` (so renamed or moved directories are followed), `connect_changed(move |_, file, _, event| …send(Msg::OverviewFileChanged{..}))`, one per directory below the root (skipping dot dirs), stored in `overview_monitors`.
 
 - [ ] **Step 5: Tagger scheduling**
 
