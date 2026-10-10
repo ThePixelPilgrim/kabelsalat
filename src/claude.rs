@@ -64,11 +64,48 @@ pub fn sessions_dir() -> Option<PathBuf> {
 /// `sessions_dir` over explicit `$CLAUDE_CONFIG_DIR` and `$HOME` values; an
 /// empty config dir counts as unset, as it does for claude itself.
 pub fn sessions_dir_from(config_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    let config = match config_dir {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(home?).join(".claude"),
-    };
-    Some(config.join("sessions"))
+    Some(config_root(config_dir, home)?.join("sessions"))
+}
+
+/// Where Claude Code keeps its transcripts: `$CLAUDE_CONFIG_DIR/projects`,
+/// or `~/.claude/projects`.
+pub fn projects_dir() -> Option<PathBuf> {
+    projects_dir_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// `projects_dir` over explicit `$CLAUDE_CONFIG_DIR` and `$HOME` values; the
+/// same root rule as `sessions_dir_from`.
+pub fn projects_dir_from(config_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    Some(config_root(config_dir, home)?.join("projects"))
+}
+
+/// The config root both directories hang off: `$CLAUDE_CONFIG_DIR` unless
+/// unset or empty, else `~/.claude`.
+fn config_root(config_dir: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    match config_dir {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => Some(PathBuf::from(home?).join(".claude")),
+    }
+}
+
+/// The directory name Claude Code files a project's transcripts under:
+/// every character of the working directory outside `[A-Za-z0-9]` becomes
+/// `-`, so `/home/user/kabelsalat` is `-home-user-kabelsalat`.
+pub fn escape_cwd(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The transcript of a session: `<projects_dir>/<escaped cwd>/<id>.jsonl`.
+pub fn transcript_path(projects_dir: &Path, session: &ClaudeSession) -> PathBuf {
+    projects_dir
+        .join(escape_cwd(&session.cwd))
+        .join(format!("{}.jsonl", session.id))
 }
 
 /// What a tab knows after a discovery tick: the claude found under its pane
@@ -314,6 +351,51 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn projects_dir_mirrors_sessions_dir_root() {
+        let cfg = OsStr::new("/cfg");
+        let home = OsStr::new("/home/me");
+        assert_eq!(
+            projects_dir_from(Some(cfg), Some(home)),
+            Some(PathBuf::from("/cfg/projects"))
+        );
+        assert_eq!(
+            projects_dir_from(None, Some(home)),
+            Some(PathBuf::from("/home/me/.claude/projects"))
+        );
+        // An empty CLAUDE_CONFIG_DIR counts as unset, as for the registry.
+        assert_eq!(
+            projects_dir_from(Some(OsStr::new("")), Some(home)),
+            Some(PathBuf::from("/home/me/.claude/projects"))
+        );
+        assert_eq!(projects_dir_from(None, None), None);
+    }
+
+    #[test]
+    fn escape_cwd_replaces_every_non_alphanumeric_char() {
+        assert_eq!(
+            escape_cwd(Path::new("/home/user/kabelsalat")),
+            "-home-user-kabelsalat"
+        );
+        assert_eq!(
+            escape_cwd(Path::new("/tmp/my_proj.v2 ü/")),
+            "-tmp-my-proj-v2---"
+        );
+        assert_eq!(escape_cwd(Path::new("")), "");
+    }
+
+    #[test]
+    fn transcript_path_is_projects_escaped_cwd_id_jsonl() {
+        let session = ClaudeSession {
+            id: "abc-123".into(),
+            cwd: PathBuf::from("/home/user/kabelsalat"),
+        };
+        assert_eq!(
+            transcript_path(Path::new("/home/me/.claude/projects"), &session),
+            PathBuf::from("/home/me/.claude/projects/-home-user-kabelsalat/abc-123.jsonl")
+        );
     }
 
     #[test]

@@ -914,6 +914,60 @@ impl TmuxCtl {
         self.run(&Self::unset_environment_args(uuid, key))
     }
 
+    /// Argv tail for reading one variable back from a tab's session
+    /// environment: `show-environment -t ks-<uuid> KEY`.
+    fn show_environment_args(uuid: &str, key: &str) -> [String; 4] {
+        [
+            "show-environment".into(),
+            "-t".into(),
+            format!("{SESSION_PREFIX}{uuid}"),
+            key.into(),
+        ]
+    }
+
+    /// Interpret a finished `show-environment KEY`. tmux prints `KEY=value`
+    /// (the value may contain `=` itself; only the first one separates), or
+    /// `-KEY` for a variable marked for removal, and exits non-zero with
+    /// "unknown variable: KEY" when the session never had it. Both absent
+    /// forms are `Ok(None)`; any other failure is an error. Only the trailing
+    /// newline is stripped from the value — inner whitespace is data.
+    pub fn show_environment_from_output(
+        code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<Option<String>, TmuxError> {
+        if code != Some(0) {
+            let stderr = stderr.trim();
+            if stderr.starts_with("unknown variable") {
+                return Ok(None);
+            }
+            return Err(TmuxError::Command(stderr.to_string()));
+        }
+        let line = stdout.strip_suffix('\n').unwrap_or(stdout);
+        if let Some((_key, value)) = line.split_once('=') {
+            return Ok(Some(value.to_string()));
+        }
+        if line.len() > 1 && line.starts_with('-') {
+            return Ok(None);
+        }
+        Err(TmuxError::Parse(format!(
+            "show-environment printed {line:?}"
+        )))
+    }
+
+    /// Read `key` from a tab session's environment table: `Some(value)` when
+    /// set, `None` when unset or never set.
+    pub fn show_environment(&self, uuid: &str, key: &str) -> Result<Option<String>, TmuxError> {
+        let output = self
+            .command(&Self::show_environment_args(uuid, key))?
+            .output()?;
+        Self::show_environment_from_output(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        )
+    }
+
     fn run(&self, args: &[String]) -> Result<(), TmuxError> {
         let output = self.command(args)?.output()?;
         if output.status.success() {
@@ -1212,6 +1266,73 @@ mod tests {
                 "KABELSALAT_CDP"
             ]
         );
+    }
+
+    #[test]
+    fn show_environment_argv_shape() {
+        let args = TmuxCtl::show_environment_args("1234-abcd", "KABELSALAT_LINKS");
+        assert_eq!(
+            args,
+            ["show-environment", "-t", "ks-1234-abcd", "KABELSALAT_LINKS"]
+        );
+    }
+
+    #[test]
+    fn show_environment_output_yields_value_after_first_equals() {
+        // The value may itself contain '=' (a JSON object, a URL query);
+        // only the first one separates key from value.
+        let got = TmuxCtl::show_environment_from_output(
+            Some(0),
+            "KABELSALAT_LINKS={\"links\":[],\"topic\":\"a=b\"}\n",
+            "",
+        )
+        .unwrap();
+        assert_eq!(got.as_deref(), Some("{\"links\":[],\"topic\":\"a=b\"}"));
+    }
+
+    #[test]
+    fn show_environment_output_strips_trailing_newline_only() {
+        let got = TmuxCtl::show_environment_from_output(Some(0), "K= a b \n", "").unwrap();
+        assert_eq!(got.as_deref(), Some(" a b "));
+        let got = TmuxCtl::show_environment_from_output(Some(0), "K=", "").unwrap();
+        assert_eq!(got.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn show_environment_output_unset_marker_is_none() {
+        // `-KEY` is how tmux reports a variable marked for removal.
+        let got =
+            TmuxCtl::show_environment_from_output(Some(0), "-KABELSALAT_LINKS\n", "").unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn show_environment_output_unknown_variable_is_none() {
+        let got = TmuxCtl::show_environment_from_output(
+            Some(1),
+            "",
+            "unknown variable: KABELSALAT_LINKS\n",
+        )
+        .unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn show_environment_output_other_failures_are_errors() {
+        let err = TmuxCtl::show_environment_from_output(
+            Some(1),
+            "",
+            "no server running on /run/user/1000/kabelsalat/tmux.sock",
+        )
+        .unwrap_err();
+        assert!(matches!(err, TmuxError::Command(msg) if msg.starts_with("no server running")));
+        let err = TmuxCtl::show_environment_from_output(None, "", "").unwrap_err();
+        assert!(matches!(err, TmuxError::Command(_)));
+        // Exit 0 with a reply that is neither `KEY=value` nor `-KEY`.
+        let err = TmuxCtl::show_environment_from_output(Some(0), "garbage\n", "").unwrap_err();
+        assert!(matches!(err, TmuxError::Parse(_)));
+        let err = TmuxCtl::show_environment_from_output(Some(0), "", "").unwrap_err();
+        assert!(matches!(err, TmuxError::Parse(_)));
     }
 
     #[test]
