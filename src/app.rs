@@ -443,8 +443,11 @@ pub struct Group {
     /// Whether the group shows the overview instead of its terminals.
     overview_mode: bool,
     /// The loaded overview: graph, layout, monitors and issues. Runtime
-    /// only, built lazily the first time the group's overview is needed and
-    /// dropped (monitors included) when the root is cleared.
+    /// only: loaded at restore for every local group with a root and on
+    /// `SetOverviewRoot`, re-read on activation while it holds an error,
+    /// and dropped (monitors included) when the root is cleared. The CLI
+    /// snapshot's issues come from here, so it must not wait for the map to
+    /// be shown.
     overview: Option<OverviewData>,
 }
 
@@ -979,6 +982,13 @@ pub enum Msg {
     /// A directory appeared below a group's overview root: watch it and
     /// take its files into the graph.
     OverviewDirCreated {
+        group_id: usize,
+        path: PathBuf,
+    },
+    /// Something that is not a `*.md` file went away below a group's
+    /// overview root. The handler acts only when it was a watched
+    /// directory: its monitors and every source below it go.
+    OverviewDirRemoved {
         group_id: usize,
         path: PathBuf,
     },
@@ -1733,7 +1743,7 @@ impl SimpleComponent for App {
             }
         });
         // The tagger's periodic trigger (the other is a title change). A tick
-        // with nothing due only stats a transcript per tab.
+        // with nothing due stats a transcript per tab and reads its tail.
         let input = sender.input_sender().clone();
         gtk::glib::timeout_add_seconds_local(tagger::SCAN_SECS, move || {
             match input.send(Msg::OverviewScan) {
@@ -2297,6 +2307,10 @@ impl SimpleComponent for App {
                 self.overview_dir_created(group_id, &path);
                 return;
             }
+            Msg::OverviewDirRemoved { group_id, path } => {
+                self.overview_dir_removed(group_id, &path);
+                return;
+            }
             // Like the other ticks: starting a run writes nothing.
             Msg::OverviewScan => {
                 self.overview_scan();
@@ -2640,6 +2654,20 @@ impl App {
         // Tags survive a GUI restart on the tmux server: read them back from
         // every reattached session. Anything unreadable simply starts untagged.
         self.restore_tags(&reattached);
+        // Every local group with a root reads it now, whatever its mode and
+        // whether or not it is active: `kabelsalat overview issues` reads the
+        // published snapshot, and the tagger only works on loaded data. The
+        // tags came back first, so the issues derived here include them. The
+        // save_state() at the end publishes the snapshot.
+        let rooted: Vec<usize> = self
+            .groups
+            .iter()
+            .filter(|g| g.host.is_none() && g.overview_root.is_some())
+            .map(|g| g.id)
+            .collect();
+        for id in rooted {
+            self.load_overview(id);
+        }
 
         // Seed the ages from the state file — the only source that survives a
         // restart. A tab whose entry predates the field (or an adopted orphan,
@@ -4569,13 +4597,16 @@ impl App {
         }
         // A moved tab's session must describe its new home; the old group's
         // endpoint may still point at a live browser — just not one visible
-        // from here (see the spec's "Tab moved between groups").
+        // from here (see the spec's "Tab moved between groups"). Its tags
+        // named the old group's overview and go the same way.
         self.session_env_refresh(&moved_uuid, target);
+        self.clear_tags(&moved_uuid, src_group);
         self.prune_empty_groups();
         self.rebuild_list();
         // The active tab changed groups without an activate(), so the pane
         // and CDP menu must reconcile here too.
         self.sync_pane_host();
+        self.tab_moved_between(src_group, target);
     }
 
     /// Modal group picker: arrow keys + Enter, or a single click. Esc closes
@@ -5267,11 +5298,15 @@ impl App {
         }
         if moved_group != old_group {
             self.session_env_refresh(&moved_uuid, moved_group);
+            self.clear_tags(&moved_uuid, old_group);
         }
         self.prune_empty_groups();
         self.rebuild_list();
         // No-op unless the dragged tab was the active one changing groups.
         self.sync_pane_host();
+        if moved_group != old_group {
+            self.tab_moved_between(old_group, moved_group);
+        }
     }
 
     /// Reorder groups by drag-and-drop: move `src` before `dest`. The render
@@ -5320,11 +5355,15 @@ impl App {
         }
         if group != old_group {
             self.session_env_refresh(&moved_uuid, group);
+            self.clear_tags(&moved_uuid, old_group);
         }
         self.prune_empty_groups();
         self.rebuild_list();
         // No-op unless the dragged tab was the active one changing groups.
         self.sync_pane_host();
+        if group != old_group {
+            self.tab_moved_between(old_group, group);
+        }
     }
 
     /// Jump to the representative tab of the next/previous group, wrapping
@@ -6906,6 +6945,24 @@ impl App {
     /// switch path restores the new group's mode. Coming back to the
     /// terminals hands focus to the active terminal, as `activate` does.
     fn sync_overview(&mut self) {
+        // The root is read on activation whatever the group's mode: a group
+        // whose data is missing (opened since the restore) or in an error
+        // state (the root was absent or unreadable then) is read again, so a
+        // root that appeared later recovers. Only the drawing stays lazy.
+        let unloaded = self.active_group().filter(|id| {
+            self.groups.iter().any(|g| {
+                g.id == *id
+                    && g.host.is_none()
+                    && g.overview_root.is_some()
+                    && g.overview.as_ref().is_none_or(|data| data.error.is_some())
+            })
+        });
+        if let Some(group_id) = unloaded {
+            self.load_overview(group_id);
+            // Not every path here ends in a save: the snapshot the CLI reads
+            // must carry the issues now.
+            self.publish_groups();
+        }
         let showing = self
             .mode_stack
             .visible_child_name()
@@ -6924,14 +6981,6 @@ impl App {
             }
             return;
         };
-        // Loaded lazily: the first time a group with a root shows its map.
-        let unloaded = self
-            .groups
-            .iter()
-            .any(|g| g.id == group_id && g.overview.is_none() && g.overview_root.is_some());
-        if unloaded {
-            self.load_overview(group_id);
-        }
         self.feed_overview(group_id);
         if !showing {
             self.mode_stack.set_visible_child_name(MODE_OVERVIEW);
@@ -6992,9 +7041,9 @@ impl App {
 
     /// Build (or rebuild) a group's overview from its root: the graph, its
     /// layout, one monitor per directory, the issues. A root that is not a
-    /// readable directory gives the error state (an empty graph, no
-    /// monitors). No root, or a remote group, drops the data and with it the
-    /// monitors.
+    /// directory, or a directory that cannot be listed, gives the error
+    /// state (an empty graph, no monitors). No root, or a remote group,
+    /// drops the data and with it the monitors.
     fn load_overview(&mut self, group_id: usize) {
         let root = self
             .groups
@@ -7008,7 +7057,13 @@ impl App {
             return;
         };
         let (error, sources) = match std::fs::metadata(&root) {
-            Ok(meta) if meta.is_dir() => (None, scan_root(&root)),
+            // A directory that exists but cannot be listed is as unreadable
+            // as a missing one: the empty state with the error, not a blank
+            // map with an "unreadable file" issue naming the root.
+            Ok(meta) if meta.is_dir() => match std::fs::read_dir(&root) {
+                Ok(_) => (None, scan_root(&root)),
+                Err(err) => (Some(err.to_string()), Vec::new()),
+            },
             Ok(_) => (Some("not a directory".to_string()), Vec::new()),
             Err(err) => (Some(err.to_string()), Vec::new()),
         };
@@ -7122,6 +7177,44 @@ impl App {
         {
             data.monitors.extend(fresh);
         }
+        self.overview_changed(group_id);
+    }
+
+    /// Something below the root went away without being a `*.md` file. The
+    /// path is gone, so only the monitor set can tell what it was: a watched
+    /// directory (moved out or renamed away) loses its monitors and every
+    /// source below it; anything else is not the overview's business. The
+    /// root itself going away is a reload, which gives the error state.
+    fn overview_dir_removed(&mut self, group_id: usize, dir: &Path) {
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+            return;
+        };
+        if group.overview_root.as_deref() == Some(dir) {
+            self.load_overview(group_id);
+            self.overview_changed(group_id);
+            return;
+        }
+        let Some(data) = self
+            .groups
+            .iter_mut()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.overview.as_mut())
+        else {
+            return;
+        };
+        if !data.monitors.contains_key(dir) {
+            return;
+        }
+        // Dropping a monitor stops it.
+        data.monitors.retain(|path, _| !path.starts_with(dir));
+        let sources: Vec<Source> = data
+            .graph
+            .sources()
+            .iter()
+            .filter(|(path, _)| !path.starts_with(dir))
+            .cloned()
+            .collect();
+        self.set_overview_graph(group_id, Graph::build(sources), None, None);
         self.overview_changed(group_id);
     }
 
@@ -7385,6 +7478,40 @@ impl App {
         tab.tags = Some(tags);
     }
 
+    /// Forget a tab's tags when it leaves `old_group`: they name that
+    /// group's nodes, and overviews of different groups never link to each
+    /// other. The mark goes too, so the next scan tags the tab against its
+    /// new group's nodes; with tmux, for a local group, the session's copy
+    /// goes as well, or a restart would bring the stale tags back.
+    fn clear_tags(&mut self, tab_uuid: &str, old_group: usize) {
+        let local = self.group_host(old_group).is_none();
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.uuid == tab_uuid) else {
+            return;
+        };
+        tab.tags = None;
+        tab.tag_mark = None;
+        tab.last_tag_run = None;
+        if let Some(tmux) = &self.tmux
+            && local
+        {
+            for key in [ENV_LINKS, ENV_TAG_MARK] {
+                if let Err(err) = tmux.unset_environment(tab_uuid, key) {
+                    eprintln!("kabelsalat: unset {key} on {tab_uuid}: {err}");
+                }
+            }
+        }
+    }
+
+    /// A tab changed groups: both groups' issues are derived from their
+    /// tagged tabs, so both are re-derived, redrawn and republished. A
+    /// group that was pruned meanwhile has nothing left to recompute.
+    fn tab_moved_between(&mut self, old_group: usize, new_group: usize) {
+        for group in [old_group, new_group] {
+            self.recompute_issues(group);
+            self.overview_changed(group);
+        }
+    }
+
     /// Seed the tags of reattached local tabs from their tmux sessions,
     /// where the previous run left them. Anything unreadable starts untagged.
     fn restore_tags(&mut self, reattached: &[(String, usize)]) {
@@ -7451,8 +7578,11 @@ fn overview_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// What a directory monitor event means for the overview: a `*.md` file
-/// changed or went away, a directory appeared, or nothing of interest. On
-/// a rename `file` is the old name and `other` the new one.
+/// changed or went away, a directory appeared (created, moved in or
+/// renamed to), something other than a `*.md` file went away (the handler
+/// checks whether it was a watched directory, since the path is gone by
+/// then), or nothing of interest. On a rename `file` is the old name and
+/// `other` the new one.
 fn overview_events(
     group_id: usize,
     file: Option<PathBuf>,
@@ -7471,15 +7601,22 @@ fn overview_events(
         path,
         removed: true,
     };
+    let dir_created = |path: PathBuf| Msg::OverviewDirCreated { group_id, path };
+    // The path no longer exists, so whether it was a directory is decided
+    // by the handler against the monitor set.
+    let gone = |path: PathBuf| {
+        if is_md(&path) {
+            removed(path)
+        } else {
+            Msg::OverviewDirRemoved { group_id, path }
+        }
+    };
     let Some(file) = file else {
         return Vec::new();
     };
     match event {
-        gio::FileMonitorEvent::Created if is_dir(&file) => {
-            vec![Msg::OverviewDirCreated {
-                group_id,
-                path: file,
-            }]
+        gio::FileMonitorEvent::Created | gio::FileMonitorEvent::MovedIn if is_dir(&file) => {
+            vec![dir_created(file)]
         }
         gio::FileMonitorEvent::Created
         | gio::FileMonitorEvent::Changed
@@ -7491,20 +7628,15 @@ fn overview_events(
                 Vec::new()
             }
         }
-        gio::FileMonitorEvent::Deleted | gio::FileMonitorEvent::MovedOut => {
-            if is_md(&file) {
-                vec![removed(file)]
-            } else {
-                Vec::new()
-            }
-        }
+        gio::FileMonitorEvent::Deleted | gio::FileMonitorEvent::MovedOut => vec![gone(file)],
         gio::FileMonitorEvent::Renamed => {
-            let mut out = Vec::new();
-            if is_md(&file) {
-                out.push(removed(file));
-            }
-            if let Some(new) = other.filter(|path| is_md(path)) {
-                out.push(changed(new));
+            let mut out = vec![gone(file)];
+            if let Some(new) = other {
+                if is_dir(&new) {
+                    out.push(dir_created(new));
+                } else if is_md(&new) {
+                    out.push(changed(new));
+                }
             }
             out
         }
@@ -7524,9 +7656,22 @@ fn tagger_input(tab: &Tab) -> Option<(Watermark, String)> {
         // A transcript that is not there yet falls through to the title; one
         // that cannot be read waits for the next scan.
         if let Ok(meta) = std::fs::metadata(&path) {
+            let size = meta.len();
+            // The cheap check (spec section 5, step 2), on the GTK thread on
+            // every scan and title change: a size that matches the mark reads
+            // only the tail for the last uuid, and the whole transcript —
+            // tens of MB for a long session — is read only when something
+            // changed, or when the tail cannot decide.
+            if let Some(Watermark::Transcript { uuid, offset }) = &tab.tag_mark
+                && *offset == size
+                && let Some(tail) = transcript_tail(&path, size)
+                && tagger::last_uuid(&tail).as_deref() == Some(uuid.as_str())
+            {
+                return None;
+            }
             let text = std::fs::read_to_string(&path).ok()?;
             let last = tagger::last_uuid(&text);
-            if tagger::unchanged(tab.tag_mark.as_ref(), meta.len(), last.as_deref()) {
+            if tagger::unchanged(tab.tag_mark.as_ref(), size, last.as_deref()) {
                 return None;
             }
             let delta = tagger::delta_since(&text, tab.tag_mark.as_ref());
@@ -7554,16 +7699,43 @@ fn tagger_input(tab: &Tab) -> Option<(Watermark, String)> {
     Some((mark, text))
 }
 
+/// How much of a transcript's end the cheap check reads to find its last
+/// message uuid: well beyond one line, even one carrying a large tool
+/// result, so the tail nearly always decides without the whole file.
+const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The last `TRANSCRIPT_TAIL_BYTES` of the `size`-byte file at `path` (all
+/// of it when shorter), lossily decoded; `None` when it cannot be read. A
+/// cut first line (or character) fails to parse and is skipped by
+/// `tagger::last_uuid`, which searches from the end.
+fn transcript_tail(path: &Path, size: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(size.saturating_sub(TRANSCRIPT_TAIL_BYTES)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// How often the tagger thread checks whether its child exited.
 const TAGGER_POLL: Duration = Duration::from_millis(200);
 
 /// Run the tagger command with `prompt` on stdin and return its stdout.
-/// Shaped like `android::run_capture`, but with a piped stdin and a reader
-/// thread for stdout, so neither a long prompt nor a long answer can stall
-/// the child on a full pipe. Kills the child after `tagger::TIMEOUT_SECS`.
+/// Shaped like `android::run_capture`, but with a piped stdin and a thread
+/// each for writing the prompt and reading the answer, so neither a long
+/// prompt nor a long answer can stall the child on a full pipe — nor stall
+/// this thread: the clock starts at spawn, and a child that never reads is
+/// killed after `tagger::TIMEOUT_SECS` like one that never exits.
 fn run_tagger(argv: &[String], prompt: &str) -> Result<String, String> {
+    run_tagger_within(argv, prompt, Duration::from_secs(tagger::TIMEOUT_SECS))
+}
+
+/// `run_tagger` with the limit as a parameter, so a test can use a short one.
+fn run_tagger_within(argv: &[String], prompt: &str, timeout: Duration) -> Result<String, String> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     let Some((program, args)) = argv.split_first() else {
         return Err("the tagger command is empty".to_string());
     };
@@ -7574,35 +7746,42 @@ fn run_tagger(argv: &[String], prompt: &str) -> Result<String, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("{program}: {err}"))?;
+    // Writing the prompt counts against the limit too.
+    let deadline = Instant::now() + timeout;
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
         return Err("the tagger has no stdout".to_string());
     };
-    let reader = std::thread::spawn(move || {
+    // Both threads report through channels rather than being joined: a
+    // descendant that inherited a pipe can hold it open after the child
+    // exited, and a join would wait for it without limit.
+    let (answer_tx, answer) = mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = String::new();
         let _ = stdout.read_to_string(&mut out);
-        out
+        let _ = answer_tx.send(out);
     });
-    if let Some(mut stdin) = child.stdin.take() {
-        let written = stdin.write_all(prompt.as_bytes());
-        // Dropped here: the child sees EOF.
-        drop(stdin);
-        if let Err(err) = written {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("writing the prompt: {err}"));
-        }
-    }
-    let deadline = Instant::now() + Duration::from_secs(tagger::TIMEOUT_SECS);
+    let written = child.stdin.take().map(|mut stdin| {
+        let (tx, rx) = mpsc::channel();
+        let prompt = prompt.to_owned();
+        std::thread::spawn(move || {
+            let result = stdin.write_all(prompt.as_bytes());
+            // Dropped here: the child sees EOF.
+            drop(stdin);
+            let _ = tx.send(result);
+        });
+        rx
+    });
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(TAGGER_POLL),
             Ok(None) => {
+                // The kill also breaks the pipe a writer may be blocked on.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("timed out after {} s", tagger::TIMEOUT_SECS));
+                return Err(format!("timed out after {} s", timeout.as_secs()));
             }
             Err(err) => {
                 let _ = child.kill();
@@ -7611,7 +7790,22 @@ fn run_tagger(argv: &[String], prompt: &str) -> Result<String, String> {
             }
         }
     };
-    let out = reader.join().unwrap_or_default();
+    let remaining = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1))
+    };
+    // A child that exited before reading the whole prompt broke the
+    // writer's pipe; that is only worth reporting when it also failed.
+    if let Some(rx) = written
+        && let Ok(Err(err)) = rx.recv_timeout(remaining())
+        && !status.success()
+    {
+        return Err(format!("writing the prompt: {err}"));
+    }
+    let Ok(out) = answer.recv_timeout(remaining()) else {
+        return Err("the tagger's output did not close".to_string());
+    };
     if status.success() {
         Ok(out)
     } else {
@@ -7717,6 +7911,156 @@ mod tests {
                 Msg::OverviewFileChanged { removed: false, .. },
             ]
         ));
+    }
+
+    #[test]
+    fn a_directory_moved_or_renamed_into_the_root_is_a_new_directory() {
+        // WATCH_MOVES reports `mv /tmp/x root/` as MovedIn, never Created.
+        let dir = PathBuf::from("/r/moved-in");
+        let moved_in = overview_events(
+            3,
+            Some(dir.clone()),
+            None,
+            gio::FileMonitorEvent::MovedIn,
+            |_| true,
+        );
+        assert!(matches!(
+            &moved_in[..],
+            [Msg::OverviewDirCreated { group_id: 3, path }] if *path == dir
+        ));
+        // A rename inside the root: the old path is gone (a directory, as
+        // far as the handler can tell), the new one is a directory.
+        let old = PathBuf::from("/r/adr");
+        let new = PathBuf::from("/r/decisions");
+        let renamed = overview_events(
+            3,
+            Some(old.clone()),
+            Some(new.clone()),
+            gio::FileMonitorEvent::Renamed,
+            |path| path == new,
+        );
+        assert!(matches!(
+            &renamed[..],
+            [
+                Msg::OverviewDirRemoved { group_id: 3, path: gone },
+                Msg::OverviewDirCreated { group_id: 3, path: came },
+            ] if *gone == old && *came == new
+        ));
+    }
+
+    #[test]
+    fn a_non_md_path_that_went_away_is_offered_as_a_removed_directory() {
+        // The path is gone, so `is_dir` cannot tell; the handler checks the
+        // monitor set, and a plain non-md file is ignored there.
+        let dir = PathBuf::from("/r/adr");
+        for event in [
+            gio::FileMonitorEvent::MovedOut,
+            gio::FileMonitorEvent::Deleted,
+        ] {
+            let gone = overview_events(3, Some(dir.clone()), None, event, |_| false);
+            assert!(matches!(
+                &gone[..],
+                [Msg::OverviewDirRemoved { group_id: 3, path }] if *path == dir
+            ));
+        }
+        // A directory renamed to a `*.md` name: the old side is still a
+        // directory candidate, the new side a file change.
+        let renamed = overview_events(
+            3,
+            Some(dir.clone()),
+            Some(PathBuf::from("/r/n.md")),
+            gio::FileMonitorEvent::Renamed,
+            |_| false,
+        );
+        assert!(matches!(
+            &renamed[..],
+            [
+                Msg::OverviewDirRemoved { .. },
+                Msg::OverviewFileChanged { removed: false, .. },
+            ]
+        ));
+    }
+
+    // --- the tagger child -----------------------------------------------
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), script.to_string()]
+    }
+
+    #[test]
+    fn the_tagger_round_trips_a_prompt_longer_than_a_pipe_buffer() {
+        // Both pipes fill at once: the writer and the reader must not wait
+        // for each other.
+        let prompt = "x".repeat(300_000);
+        let out = run_tagger_within(&sh("cat"), &prompt, Duration::from_secs(20)).unwrap();
+        assert_eq!(out.len(), prompt.len());
+    }
+
+    #[test]
+    fn the_tagger_timeout_covers_a_child_that_never_reads_the_prompt() {
+        // The regression: `write_all` blocked before the deadline existed, so
+        // a hung child kept `tagger_running` set for the whole session.
+        let prompt = "x".repeat(300_000);
+        let started = Instant::now();
+        let result = run_tagger_within(&sh("exec sleep 30"), &prompt, Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the writer was never unblocked"
+        );
+        assert!(result.unwrap_err().starts_with("timed out"));
+    }
+
+    #[test]
+    fn the_tagger_gives_up_on_an_answer_whose_pipe_never_closes() {
+        // A descendant holding stdout after the child exited.
+        let started = Instant::now();
+        let result = run_tagger_within(&sh("sleep 3 & exit 0"), "p", Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            result.unwrap_err(),
+            "the tagger's output did not close".to_string()
+        );
+    }
+
+    #[test]
+    fn a_failing_tagger_reports_its_status_and_a_prompt_it_did_not_read() {
+        let result = run_tagger_within(&sh("exit 3"), "p", Duration::from_secs(5)).unwrap_err();
+        assert!(result.starts_with("exited with"), "{result}");
+        // A child that quit without reading a long prompt: the broken pipe
+        // is the reported failure.
+        let prompt = "x".repeat(300_000);
+        let result = run_tagger_within(&sh("exit 3"), &prompt, Duration::from_secs(5)).unwrap_err();
+        assert!(
+            result.starts_with("writing the prompt") || result.starts_with("exited with"),
+            "{result}"
+        );
+        // ...and one that succeeded without reading it all is still a
+        // success: the answer is what counts.
+        let ok = run_tagger_within(&sh("echo done"), &prompt, Duration::from_secs(5)).unwrap();
+        assert_eq!(ok.trim(), "done");
+    }
+
+    // --- the transcript tail -------------------------------------------
+
+    #[test]
+    fn the_transcript_tail_is_the_last_256_kib_or_the_whole_short_file() {
+        let dir =
+            std::env::temp_dir().join(format!("kabelsalat-app-test-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let long = dir.join("long.jsonl");
+        let mut body = "a".repeat(300_000);
+        body.push_str("\nlast line");
+        std::fs::write(&long, &body).unwrap();
+        let size = std::fs::metadata(&long).unwrap().len();
+        let tail = transcript_tail(&long, size).unwrap();
+        assert_eq!(tail.len() as u64, TRANSCRIPT_TAIL_BYTES);
+        assert!(tail.ends_with("\nlast line"));
+        let short = dir.join("short.jsonl");
+        std::fs::write(&short, "one\ntwo").unwrap();
+        assert_eq!(transcript_tail(&short, 7).as_deref(), Some("one\ntwo"));
+        assert_eq!(transcript_tail(&dir.join("missing"), 7), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- sidebar selection echo -------------------------------------------
