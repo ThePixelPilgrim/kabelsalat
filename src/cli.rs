@@ -116,6 +116,21 @@ pub enum Cli {
         /// The new name, already trimmed and known to be non-empty.
         name: String,
     },
+    /// Set or clear the directory a group's overview is built from.
+    OverviewRoot {
+        /// A group uuid or name; `None` until `with_default_group` fills it
+        /// from the caller's `KABELSALAT_GROUP`.
+        group: Option<String>,
+        /// The directory verbatim, still possibly relative to the caller's;
+        /// `None` is `--clear`.
+        root: Option<PathBuf>,
+    },
+    /// Print a group's current overview data issues, one per line.
+    OverviewIssues {
+        /// A group uuid or name; `None` until `with_default_group` fills it
+        /// from the caller's `KABELSALAT_GROUP`.
+        group: Option<String>,
+    },
 }
 
 impl Cli {
@@ -129,6 +144,8 @@ impl Cli {
                 | Cli::Rename { .. }
                 | Cli::Browser { .. }
                 | Cli::Android { .. }
+                | Cli::OverviewRoot { .. }
+                | Cli::OverviewIssues { .. }
         )
     }
 }
@@ -157,8 +174,26 @@ pub fn with_default_group(cli: Cli, env_group: Option<&str>) -> Result<Cli, Usag
                 "android needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)"
             ))),
         },
+        Cli::OverviewRoot { group: None, root } => match env_group.filter(|g| !g.is_empty()) {
+            Some(group) => Ok(Cli::OverviewRoot {
+                group: Some(group.to_string()),
+                root,
+            }),
+            None => Err(UsageError(overview_group_missing())),
+        },
+        Cli::OverviewIssues { group: None } => match env_group.filter(|g| !g.is_empty()) {
+            Some(group) => Ok(Cli::OverviewIssues {
+                group: Some(group.to_string()),
+            }),
+            None => Err(UsageError(overview_group_missing())),
+        },
         other => Ok(other),
     }
+}
+
+/// The one wording for an `overview` command with no group anywhere.
+fn overview_group_missing() -> String {
+    format!("overview needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)")
 }
 
 /// The Android pair, in the order `ENV_ANDROID_CTL`, `ENV_ANDROID_ADB`.
@@ -192,8 +227,9 @@ pub fn session_env_pairs(
 /// One group as the CLI sees it: the stable uuid, the (possibly empty,
 /// possibly duplicated) name, how many tabs it holds, for a remote group
 /// the ssh destination its tabs run on, the live CDP endpoint of its
-/// browser when it has one, and its Android pane when it owns it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// browser when it has one, its Android pane when it owns it, and its
+/// overview root and current overview issues.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GroupInfo {
     pub uuid: String,
     pub name: String,
@@ -201,6 +237,24 @@ pub struct GroupInfo {
     pub host: Option<String>,
     pub cdp: Option<String>,
     pub android: Option<AndroidInfo>,
+    /// The directory the group's overview is built from, absolute.
+    pub overview_root: Option<PathBuf>,
+    /// The overview's current data issues, as `overview issues` prints them.
+    pub issues: Vec<IssueLine>,
+}
+
+/// One overview data issue as the CLI sees it: already reduced to text, so
+/// this module stays independent of the overview's own types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueLine {
+    /// `unreadable-file`, `duplicate-id`, `unknown-node`, `parent-cycle`,
+    /// `missing-link`.
+    pub kind: String,
+    /// The node ids involved.
+    pub nodes: Vec<String>,
+    /// The file at fault, when there is one.
+    pub file: Option<PathBuf>,
+    pub detail: String,
 }
 
 /// A group's Android pane as the CLI sees it: its control socket from the
@@ -266,6 +320,15 @@ Usage:
                                                caller's KABELSALAT_GROUP
   kabelsalat android [-g <group>] screenshot PATH | tap X Y | type TEXT | key NAME | resize W H
                                                Drive <group>'s Android pane
+  kabelsalat overview root [-g <group>] DIR    Build <group>'s overview from the *.md files
+                                               below DIR (resolved against the caller's
+                                               directory; must exist); <group> defaults to
+                                               the caller's KABELSALAT_GROUP
+  kabelsalat overview root [-g <group>] --clear
+                                               Unset <group>'s overview root
+  kabelsalat overview issues [-g <group>]      Print <group>'s overview data issues, one per
+                                               line: kind, node ids, file, detail (tab-
+                                               separated); nothing and exit 0 when there are none
   kabelsalat resume                            Recreate saved claude sessions on the tmux
                                                server without a GUI (what the boot unit runs)
 
@@ -280,9 +343,9 @@ Options for run:
       --                    Required. Everything after it is the command.
 
 Exit codes:
-  0 success   1 kabelsalat not running   2 usage error
-  3 group not found, ambiguous, remote (browser, android), the new name is already
-    taken, Android owned by another group or not open, or its pane did not answer
+  0 success   1 kabelsalat not running   2 usage error (also an overview DIR that does not exist)
+  3 group not found, ambiguous, remote (browser, android, overview), the new name is
+    already taken, Android owned by another group or not open, or its pane did not answer
   4 resume could not reach tmux, or the Android pane refused a request
 "
 }
@@ -309,6 +372,7 @@ pub fn parse(args: &[String]) -> Result<Cli, UsageError> {
         "rename" => parse_rename(&rest[1..]),
         "browser" => parse_browser(&rest[1..]),
         "android" => parse_android(&rest[1..]),
+        "overview" => parse_overview(&rest[1..]),
         "resume" => {
             if rest.len() > 1 {
                 return Err(UsageError(format!(
@@ -463,6 +527,113 @@ pub fn android_argv(argv0: &str, group: &str, cmd: Option<&AndroidCmd>) -> Vec<S
     ];
     if let Some(cmd) = cmd {
         argv.extend(cmd.args());
+    }
+    argv
+}
+
+/// `overview root [-g <group>] DIR | --clear` and `overview issues [-g <group>]`.
+fn parse_overview(args: &[String]) -> Result<Cli, UsageError> {
+    let Some((verb, rest)) = args.split_first() else {
+        return Err(UsageError("overview needs root or issues".into()));
+    };
+    match verb.as_str() {
+        "-h" | "--help" => Ok(Cli::Help),
+        "root" => parse_overview_root(rest),
+        "issues" => {
+            let mut group: Option<String> = None;
+            let mut i = 0;
+            while let Some(arg) = rest.get(i) {
+                match arg.as_str() {
+                    "--group" | "-g" => {
+                        group = Some(group_value(rest, i)?);
+                        i += 2;
+                    }
+                    other => return Err(UsageError(format!("unknown argument '{other}'"))),
+                }
+            }
+            Ok(Cli::OverviewIssues { group })
+        }
+        other => Err(UsageError(format!("unknown overview command '{other}'"))),
+    }
+}
+
+/// `root`'s arguments: the group flag anywhere, then exactly one of a
+/// directory and `--clear`.
+fn parse_overview_root(args: &[String]) -> Result<Cli, UsageError> {
+    let mut group: Option<String> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut clear = false;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        match arg.as_str() {
+            "--group" | "-g" => {
+                group = Some(group_value(args, i)?);
+                i += 2;
+                continue;
+            }
+            "--clear" => {
+                if clear {
+                    return Err(UsageError("--clear was given twice".into()));
+                }
+                clear = true;
+            }
+            other if other.starts_with('-') && other.len() > 1 => {
+                return Err(UsageError(format!("unknown option '{other}'")));
+            }
+            "" => {
+                return Err(UsageError(
+                    "overview root needs a non-empty directory".into(),
+                ));
+            }
+            path => {
+                if let Some(first) = &dir {
+                    return Err(UsageError(format!(
+                        "overview root takes one directory (got '{}' and '{path}')",
+                        first.display()
+                    )));
+                }
+                dir = Some(PathBuf::from(path));
+            }
+        }
+        i += 1;
+    }
+    match (dir, clear) {
+        (Some(root), false) => Ok(Cli::OverviewRoot {
+            group,
+            root: Some(root),
+        }),
+        (None, true) => Ok(Cli::OverviewRoot { group, root: None }),
+        _ => Err(UsageError(
+            "overview root takes a directory or --clear".into(),
+        )),
+    }
+}
+
+/// The value of the group flag at `args[i]`: the next argument, non-empty.
+fn group_value(args: &[String], i: usize) -> Result<String, UsageError> {
+    args.get(i + 1)
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .ok_or_else(|| UsageError(format!("{} needs a value", args[i])))
+}
+
+/// The argv a caller forwards to the running GUI once its group is known:
+/// `overview root|issues -g <group>` plus the directory or `--clear`. For
+/// any other `cli` it is `argv0` alone, which parses as the GUI.
+pub fn overview_argv(argv0: &str, group: &str, cli: &Cli) -> Vec<String> {
+    let mut argv = vec![argv0.to_string(), "overview".to_string()];
+    match cli {
+        Cli::OverviewRoot { root, .. } => {
+            argv.extend(["root".to_string(), "-g".to_string(), group.to_string()]);
+            match root {
+                Some(dir) => argv.push(dir.to_string_lossy().into_owned()),
+                None => argv.push("--clear".to_string()),
+            }
+        }
+        Cli::OverviewIssues { .. } => {
+            argv.extend(["issues".to_string(), "-g".to_string(), group.to_string()]);
+        }
+        _ => argv.truncate(1),
     }
     argv
 }
@@ -654,6 +825,14 @@ pub enum Action {
     Control {
         socket: PathBuf,
         line: String,
+    },
+    /// Set this group's overview root, or clear it with `None`. Inert like
+    /// the others: no mode change, no focus, no raise, no active-group
+    /// change.
+    SetOverviewRoot {
+        group_uuid: String,
+        /// Already absolute: resolved against the caller's directory.
+        root: Option<PathBuf>,
     },
 }
 
@@ -901,6 +1080,89 @@ pub fn dispatch(cli: &Cli, groups: &[GroupInfo], caller_cwd: &Path) -> Outcome {
                 }),
             }
         }
+        // lib.rs fills the default before forwarding, as for browser.
+        Cli::OverviewRoot { group: None, .. } | Cli::OverviewIssues { group: None } => {
+            Outcome::fail(EXIT_USAGE, format!("{}\n", overview_group_missing()))
+        }
+        Cli::OverviewRoot {
+            group: Some(group),
+            root,
+        } => {
+            let target = match resolve_group(groups, group) {
+                Ok(found) => found,
+                Err(err) => return resolve_failure(group, err),
+            };
+            if let Some(refused) = overview_remote_refusal(group, target) {
+                return refused;
+            }
+            Outcome {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: EXIT_OK,
+                action: Some(Action::SetOverviewRoot {
+                    group_uuid: target.uuid.clone(),
+                    // `join` with an absolute path replaces the base, so this
+                    // handles both absolute and relative directories.
+                    root: root.as_ref().map(|dir| caller_cwd.join(dir)),
+                }),
+            }
+        }
+        // Answered from the snapshot: the GUI publishes its issues with the
+        // rest of the group, so there is nothing to ask for.
+        Cli::OverviewIssues { group: Some(group) } => {
+            let target = match resolve_group(groups, group) {
+                Ok(found) => found,
+                Err(err) => return resolve_failure(group, err),
+            };
+            if let Some(refused) = overview_remote_refusal(group, target) {
+                return refused;
+            }
+            Outcome::ok(target.issues.iter().map(issue_line).collect())
+        }
+    }
+}
+
+/// The overview is drawn locally from a local directory, and a remote
+/// group has none (spec §2): the refusal both `overview` commands share.
+fn overview_remote_refusal(group: &str, target: &GroupInfo) -> Option<Outcome> {
+    let host = target.host.as_ref()?;
+    Some(Outcome::fail(
+        EXIT_GROUP,
+        format!("the overview is local, but '{group}' runs on {host}\n"),
+    ))
+}
+
+/// One `overview issues` line: kind, node ids joined by `,`, file or
+/// nothing, detail — tab-separated, newline-terminated. A tab or newline
+/// inside a field would break the format, so they become spaces.
+fn issue_line(issue: &IssueLine) -> String {
+    let field = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+    format!(
+        "{}\t{}\t{}\t{}\n",
+        field(&issue.kind),
+        field(&issue.nodes.join(",")),
+        issue
+            .file
+            .as_ref()
+            .map(|f| field(&f.to_string_lossy()))
+            .unwrap_or_default(),
+        field(&issue.detail)
+    )
+}
+
+/// The one check `dispatch` cannot make: the overview root must exist. The
+/// caller passes the filesystem (`Path::is_dir`); tests pass a closure.
+/// `Some` is the outcome to print and exit with instead of acting; `None`
+/// means go ahead. Only a `SetOverviewRoot` with a directory is checked.
+pub fn check_overview_root(action: &Action, is_dir: impl Fn(&Path) -> bool) -> Option<Outcome> {
+    match action {
+        Action::SetOverviewRoot {
+            root: Some(root), ..
+        } if !is_dir(root) => Some(Outcome::fail(
+            EXIT_USAGE,
+            format!("kabelsalat: no such directory: {}\n", root.display()),
+        )),
+        _ => None,
     }
 }
 
@@ -1059,6 +1321,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "bbb-222".into(),
@@ -1067,6 +1330,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "ccc-333".into(),
@@ -1075,6 +1339,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "ddd-444".into(),
@@ -1083,6 +1348,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
         ]
     }
@@ -1133,6 +1399,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "qqq".into(),
@@ -1141,6 +1408,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
         ];
         assert_eq!(resolve_group(&groups, "xyz").unwrap().uuid, "xyz");
@@ -1416,6 +1684,7 @@ mod tests {
                 host: Some("me@box".into()),
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "lll-666".into(),
@@ -1424,6 +1693,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
         ]
     }
@@ -1561,6 +1831,7 @@ mod tests {
                 host: None,
                 cdp: Some("http://127.0.0.1:40455".into()),
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "bbb-222".into(),
@@ -1569,6 +1840,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "rrr-555".into(),
@@ -1577,6 +1849,7 @@ mod tests {
                 host: Some("me@box".into()),
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
         ]
     }
@@ -1972,6 +2245,7 @@ mod tests {
                     ctl: PathBuf::from("/tmp/ctl.sock"),
                     adb: Some("192.168.240.112:5555".into()),
                 }),
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "bbb-222".into(),
@@ -1980,6 +2254,7 @@ mod tests {
                 host: None,
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
             GroupInfo {
                 uuid: "rrr-555".into(),
@@ -1988,6 +2263,7 @@ mod tests {
                 host: Some("me@box".into()),
                 cdp: None,
                 android: None,
+                ..Default::default()
             },
         ]
     }
@@ -2109,5 +2385,377 @@ mod tests {
     fn help_lists_android() {
         assert!(help_text().contains("kabelsalat android [-g <group>]"));
         assert!(help_text().contains("screenshot PATH"));
+    }
+
+    // --- overview ---
+
+    fn overview_root(group: &str, root: Option<&str>) -> Cli {
+        Cli::OverviewRoot {
+            group: Some(group.into()),
+            root: root.map(PathBuf::from),
+        }
+    }
+
+    fn overview_issues(group: &str) -> Cli {
+        Cli::OverviewIssues {
+            group: Some(group.into()),
+        }
+    }
+
+    #[test]
+    fn overview_root_parses_a_directory_with_or_without_a_group() {
+        assert_eq!(
+            parse(&args(&["overview", "root", "docs/plan"])),
+            Ok(Cli::OverviewRoot {
+                group: None,
+                root: Some(PathBuf::from("docs/plan")),
+            })
+        );
+        assert_eq!(
+            parse(&args(&["overview", "root", "-g", "web", "/abs"])),
+            Ok(overview_root("web", Some("/abs")))
+        );
+        // The group flag may follow the directory too.
+        assert_eq!(
+            parse(&args(&["overview", "root", "/abs", "--group", "web"])),
+            Ok(overview_root("web", Some("/abs")))
+        );
+    }
+
+    #[test]
+    fn overview_root_clear_unsets_the_root() {
+        assert_eq!(
+            parse(&args(&["overview", "root", "--clear"])),
+            Ok(Cli::OverviewRoot {
+                group: None,
+                root: None,
+            })
+        );
+        assert_eq!(
+            parse(&args(&["overview", "root", "-g", "web", "--clear"])),
+            Ok(overview_root("web", None))
+        );
+    }
+
+    #[test]
+    fn overview_issues_parses_with_or_without_a_group() {
+        assert_eq!(
+            parse(&args(&["overview", "issues"])),
+            Ok(Cli::OverviewIssues { group: None })
+        );
+        assert_eq!(
+            parse(&args(&["overview", "issues", "-g", "web"])),
+            Ok(overview_issues("web"))
+        );
+    }
+
+    #[test]
+    fn overview_help_is_help() {
+        assert_eq!(parse(&args(&["overview", "-h"])), Ok(Cli::Help));
+        assert_eq!(parse(&args(&["overview", "--help"])), Ok(Cli::Help));
+    }
+
+    #[test]
+    fn overview_rejects_bad_forms() {
+        let bad: Vec<Vec<&str>> = vec![
+            vec!["overview"],
+            vec!["overview", "frobnicate"],
+            vec!["overview", "root"],
+            vec!["overview", "root", ""],
+            vec!["overview", "root", "a", "b"],
+            vec!["overview", "root", "a", "--clear"],
+            vec!["overview", "root", "--clear", "--clear"],
+            vec!["overview", "root", "-g"],
+            vec!["overview", "root", "-g", "", "a"],
+            vec!["overview", "root", "--bogus", "a"],
+            vec!["overview", "issues", "extra"],
+            vec!["overview", "issues", "-g"],
+            vec!["overview", "issues", "-g", ""],
+            vec!["overview", "issues", "--clear"],
+        ];
+        for argv in bad {
+            assert!(
+                parse(&args(&argv)).is_err(),
+                "{argv:?} should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn overview_needs_an_instance() {
+        assert!(
+            Cli::OverviewRoot {
+                group: None,
+                root: None
+            }
+            .needs_instance()
+        );
+        assert!(Cli::OverviewIssues { group: None }.needs_instance());
+    }
+
+    #[test]
+    fn the_callers_group_variable_fills_overview_too() {
+        assert_eq!(
+            with_default_group(
+                Cli::OverviewRoot {
+                    group: None,
+                    root: Some(PathBuf::from("docs")),
+                },
+                Some("aaa-111"),
+            ),
+            Ok(overview_root("aaa-111", Some("docs")))
+        );
+        assert_eq!(
+            with_default_group(Cli::OverviewIssues { group: None }, Some("aaa-111")),
+            Ok(overview_issues("aaa-111"))
+        );
+        // An explicit --group wins over the environment.
+        assert_eq!(
+            with_default_group(overview_issues("web"), Some("aaa-111")),
+            Ok(overview_issues("web"))
+        );
+        // Outside a kabelsalat tab there is nothing to default to.
+        let unset = with_default_group(Cli::OverviewIssues { group: None }, None);
+        assert_eq!(
+            unset,
+            Err(UsageError(format!(
+                "overview needs --group outside a kabelsalat tab ({ENV_GROUP} is unset)"
+            )))
+        );
+        assert!(
+            with_default_group(
+                Cli::OverviewRoot {
+                    group: None,
+                    root: None
+                },
+                Some("")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn overview_argv_round_trips_through_parse() {
+        let clis = [
+            overview_root("aaa-111", Some("docs/plan")),
+            overview_root("aaa-111", Some("/abs/with space")),
+            overview_root("aaa-111", None),
+            overview_issues("aaa-111"),
+        ];
+        for cli in clis {
+            let argv = overview_argv("kabelsalat", "aaa-111", &cli);
+            assert_eq!(argv[0], "kabelsalat");
+            assert_eq!(parse(&argv), Ok(cli));
+        }
+    }
+
+    fn overview_groups() -> Vec<GroupInfo> {
+        vec![
+            GroupInfo {
+                uuid: "aaa-111".into(),
+                name: "web".into(),
+                tabs: 2,
+                overview_root: Some(PathBuf::from("/home/u/web/docs")),
+                issues: vec![
+                    IssueLine {
+                        kind: "unknown-node".into(),
+                        nodes: vec!["P-001".into(), "P-404".into()],
+                        file: Some(PathBuf::from("/home/u/web/docs/p1.md")),
+                        detail: "parent 'P-404' does not exist".into(),
+                    },
+                    IssueLine {
+                        kind: "missing-link".into(),
+                        nodes: vec!["A".into(), "B".into()],
+                        file: None,
+                        detail: "tab 'claude' links both;\tno edge\nbetween them".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            GroupInfo {
+                uuid: "bbb-222".into(),
+                name: "api".into(),
+                tabs: 1,
+                ..Default::default()
+            },
+            GroupInfo {
+                uuid: "rrr-555".into(),
+                name: "box".into(),
+                tabs: 1,
+                host: Some("me@box".into()),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn an_overview_command_without_any_group_is_a_usage_error_at_dispatch_too() {
+        let groups = overview_groups();
+        let root = dispatch(
+            &Cli::OverviewRoot {
+                group: None,
+                root: Some(PathBuf::from("docs")),
+            },
+            &groups,
+            Path::new("/w"),
+        );
+        assert_eq!(root.code, EXIT_USAGE);
+        assert!(root.action.is_none());
+        assert!(
+            root.stderr.contains(ENV_GROUP),
+            "stderr was: {}",
+            root.stderr
+        );
+        let issues = dispatch(
+            &Cli::OverviewIssues { group: None },
+            &groups,
+            Path::new("/w"),
+        );
+        assert_eq!(issues.code, EXIT_USAGE);
+        assert!(issues.action.is_none());
+    }
+
+    #[test]
+    fn overview_root_resolves_a_relative_directory_against_the_caller() {
+        let out = dispatch(
+            &overview_root("web", Some("docs/plan")),
+            &overview_groups(),
+            Path::new("/home/u/proj"),
+        );
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "");
+        assert_eq!(
+            out.action,
+            Some(Action::SetOverviewRoot {
+                group_uuid: "aaa-111".into(),
+                root: Some(PathBuf::from("/home/u/proj/docs/plan")),
+            })
+        );
+    }
+
+    #[test]
+    fn overview_root_keeps_an_absolute_directory() {
+        let out = dispatch(
+            &overview_root("bbb-222", Some("/srv/notes")),
+            &overview_groups(),
+            Path::new("/home/u/proj"),
+        );
+        assert_eq!(
+            out.action,
+            Some(Action::SetOverviewRoot {
+                group_uuid: "bbb-222".into(),
+                root: Some(PathBuf::from("/srv/notes")),
+            })
+        );
+    }
+
+    #[test]
+    fn overview_root_clear_asks_the_gui_to_unset() {
+        let out = dispatch(
+            &overview_root("web", None),
+            &overview_groups(),
+            Path::new("/w"),
+        );
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(
+            out.action,
+            Some(Action::SetOverviewRoot {
+                group_uuid: "aaa-111".into(),
+                root: None,
+            })
+        );
+    }
+
+    #[test]
+    fn overview_refuses_a_remote_group() {
+        for cli in [overview_root("box", Some("docs")), overview_issues("box")] {
+            let out = dispatch(&cli, &overview_groups(), Path::new("/w"));
+            assert_eq!(out.code, EXIT_GROUP);
+            assert!(out.action.is_none());
+            assert_eq!(
+                out.stderr,
+                "the overview is local, but 'box' runs on me@box\n"
+            );
+        }
+    }
+
+    #[test]
+    fn overview_on_an_unknown_group_fails_like_run() {
+        for cli in [overview_root("nope", Some("docs")), overview_issues("nope")] {
+            let out = dispatch(&cli, &overview_groups(), Path::new("/w"));
+            assert_eq!(out.code, EXIT_GROUP);
+            assert!(out.action.is_none());
+            assert!(out.stderr.contains("nope"), "stderr was: {}", out.stderr);
+        }
+    }
+
+    #[test]
+    fn overview_issues_prints_tab_separated_lines_from_the_snapshot() {
+        let out = dispatch(&overview_issues("web"), &overview_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert!(out.action.is_none());
+        assert_eq!(out.stderr, "");
+        assert_eq!(
+            out.stdout,
+            "unknown-node\tP-001,P-404\t/home/u/web/docs/p1.md\tparent 'P-404' does not exist\n\
+             missing-link\tA,B\t\ttab 'claude' links both; no edge between them\n"
+        );
+    }
+
+    #[test]
+    fn overview_issues_with_none_prints_nothing_and_succeeds() {
+        let out = dispatch(&overview_issues("api"), &overview_groups(), Path::new("/w"));
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(out.stdout, "");
+        assert_eq!(out.stderr, "");
+        assert!(out.action.is_none());
+    }
+
+    #[test]
+    fn check_overview_root_rejects_a_missing_directory() {
+        let action = Action::SetOverviewRoot {
+            group_uuid: "aaa-111".into(),
+            root: Some(PathBuf::from("/nope/docs")),
+        };
+        let refused = check_overview_root(&action, |_| false).expect("an outcome");
+        assert_eq!(refused.code, EXIT_USAGE);
+        assert_eq!(
+            refused.stderr,
+            "kabelsalat: no such directory: /nope/docs\n"
+        );
+        assert_eq!(refused.stdout, "");
+        assert!(refused.action.is_none());
+    }
+
+    #[test]
+    fn check_overview_root_passes_an_existing_directory_and_other_actions() {
+        let action = Action::SetOverviewRoot {
+            group_uuid: "aaa-111".into(),
+            root: Some(PathBuf::from("/home/u/docs")),
+        };
+        assert_eq!(
+            check_overview_root(&action, |p| p == Path::new("/home/u/docs")),
+            None
+        );
+        // --clear names no directory, so there is nothing to check.
+        let clear = Action::SetOverviewRoot {
+            group_uuid: "aaa-111".into(),
+            root: None,
+        };
+        assert_eq!(check_overview_root(&clear, |_| false), None);
+        let rename = Action::Rename {
+            group_uuid: "aaa-111".into(),
+            name: "x".into(),
+        };
+        assert_eq!(check_overview_root(&rename, |_| false), None);
+    }
+
+    #[test]
+    fn help_lists_overview() {
+        assert!(help_text().contains("kabelsalat overview root [-g <group>]"));
+        assert!(help_text().contains("--clear"));
+        assert!(help_text().contains("kabelsalat overview issues [-g <group>]"));
+        assert!(help_text().contains("overview"));
     }
 }

@@ -117,6 +117,19 @@ pub fn request_open_android(group_uuid: String) -> bool {
     control.sender.send(Msg::OpenAndroid { group_uuid }).is_ok()
 }
 
+/// Ask the component to set (or, with `None`, clear) a group's overview
+/// root. Returns false when there is no component to ask, or when it has
+/// already shut down.
+pub fn request_set_overview_root(group_uuid: String, root: Option<std::path::PathBuf>) -> bool {
+    let Some(control) = CONTROL.get() else {
+        return false;
+    };
+    control
+        .sender
+        .send(Msg::SetOverviewRoot { group_uuid, root })
+        .is_ok()
+}
+
 /// One request to a pane's control socket: write `line` and a newline, shut
 /// the write half (the server serves a connection until EOF), read one reply
 /// line. The write and the read share one deadline, `timeout` from the
@@ -254,6 +267,21 @@ pub fn handle_command_line(
             }
             return glib::ExitCode::new(answer.code);
         }
+        // The directory must exist, and `dispatch` has no filesystem: the
+        // check happens here, with the real one. Setting prints nothing on
+        // success, like Rename.
+        Some(action @ Action::SetOverviewRoot { .. }) => {
+            if let Some(refused) = cli::check_overview_root(&action, Path::is_dir) {
+                command_line.printerr_literal(&refused.stderr);
+                return glib::ExitCode::new(refused.code);
+            }
+            if let Action::SetOverviewRoot { group_uuid, root } = action
+                && !request_set_overview_root(group_uuid, root)
+            {
+                command_line.printerr_literal("kabelsalat: no window to set the overview in\n");
+                return glib::ExitCode::new(cli::EXIT_NOT_RUNNING);
+            }
+        }
         None => {}
     }
 
@@ -377,5 +405,14 @@ mod tests {
     #[test]
     fn an_open_android_request_without_a_gui_is_refused() {
         assert!(!request_open_android("aaa-111".into()));
+    }
+
+    #[test]
+    fn a_set_overview_root_request_without_a_gui_is_refused() {
+        assert!(!request_set_overview_root(
+            "aaa-111".into(),
+            Some(std::path::PathBuf::from("/tmp/docs"))
+        ));
+        assert!(!request_set_overview_root("aaa-111".into(), None));
     }
 }
