@@ -318,10 +318,6 @@ mod tests {
         }
     }
 
-    fn of_kind(issues: &[Issue], kind: IssueKind) -> Vec<&Issue> {
-        issues.iter().filter(|i| i.kind == kind).collect()
-    }
-
     // --- kinds ---
 
     #[test]
