@@ -19,6 +19,11 @@ use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::claude;
 use crate::cli::{ANDROID_ENV_KEYS, CDP_ENV_KEYS};
 use crate::control;
+use crate::overview::canvas::{Callbacks, EmptyState, OverviewView, TabChip, Unmapped};
+use crate::overview::issues::{self, Issue, TaggedTab};
+use crate::overview::layout::{self, Layout, Metrics};
+use crate::overview::model::{Graph, Source, scan_root};
+use crate::overview::tagger::{self, ENV_LINKS, ENV_TAG_MARK, NodeSummary, Tags, Watermark};
 use crate::remote::{self, HostState, RemoteError};
 use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
 use crate::state::{
@@ -126,6 +131,10 @@ const SHORTCUT_ALIASES: &[&str] = &[
 
 /// How often the hosted Chromium processes are reaped for exit.
 const BROWSER_POLL_SECS: u32 = 2;
+
+/// Pages of the mode stack: the terminal area, or the overview.
+const MODE_TERMINALS: &str = "terminals";
+const MODE_OVERVIEW: &str = "overview";
 
 /// How often the tab age prefixes are recomputed. The display has minute
 /// granularity, so a 30 s tick shows a stale "now" for at most 89 s.
@@ -384,6 +393,14 @@ pub struct Tab {
     /// The claude session last seen in this tab (see `claude.rs`): what a
     /// respawn of the tab brings back instead of a shell.
     claude: Option<ClaudeSession>,
+    /// What the tagger last said this tab works on (overview mode). Mirrored
+    /// into the tab's tmux session as `KABELSALAT_LINKS`, never persisted
+    /// here; without tmux it lives only in memory.
+    tags: Option<Tags>,
+    /// Where the last tagger run left off (`KABELSALAT_TAG_MARK`).
+    tag_mark: Option<Watermark>,
+    /// When the tagger last ran for this tab; drives the per-tab rate limit.
+    last_tag_run: Option<Instant>,
 }
 
 pub struct Group {
@@ -425,6 +442,27 @@ pub struct Group {
     overview_root: Option<PathBuf>,
     /// Whether the group shows the overview instead of its terminals.
     overview_mode: bool,
+    /// The loaded overview: graph, layout, monitors and issues. Runtime
+    /// only, built lazily the first time the group's overview is needed and
+    /// dropped (monitors included) when the root is cleared.
+    overview: Option<OverviewData>,
+}
+
+/// A group's overview as loaded from its root. `monitors` must stay stored:
+/// dropping a `gio::FileMonitor` stops it.
+struct OverviewData {
+    graph: Rc<Graph>,
+    layout: Rc<Layout>,
+    /// Why the root could not be read (the empty state's text); the graph is
+    /// empty then.
+    error: Option<String>,
+    /// One directory monitor per directory below the root, by path.
+    monitors: HashMap<PathBuf, gio::FileMonitor>,
+    /// The current data issues, as the tray and `overview issues` show them.
+    issues: Vec<Issue>,
+    /// Bumped on every graph change; the view is re-fed when it differs from
+    /// what it last got (see `App::fed_overview`).
+    generation: u64,
 }
 
 impl Group {
@@ -705,6 +743,24 @@ pub struct App {
     /// the key is `local` or an index into this list, so a `:` in a
     /// destination cannot break the payload. Rebuilt by `rebuild_list`.
     host_keys: RefCell<Vec<String>>,
+    /// Pages `MODE_TERMINALS` (the tab bar and terminal stack) and
+    /// `MODE_OVERVIEW` (the shared overview view); `sync_overview` picks.
+    mode_stack: gtk::Stack,
+    /// One overview view for every group, re-fed on each switch.
+    overview_view: OverviewView,
+    /// Which group's data the view currently holds, and that data's
+    /// generation; `sync_overview` only re-feeds when either differs.
+    fed_overview: Option<(usize, u64)>,
+    /// Source of `OverviewData::generation`: app-wide, so a group whose id
+    /// is reused after a delete can never match a stale `fed_overview`.
+    overview_gen: u64,
+    /// Whether a tagger process is running; one at a time.
+    tagger_running: bool,
+    /// `$XDG_CONFIG_HOME/kabelsalat/overview.json`, read once at startup.
+    tagger_config: tagger::Config,
+    /// Whether the tagger command's binary was found on PATH at startup; when
+    /// not, the overview works without tab links and the panels say so.
+    tagging_available: bool,
 }
 
 /// Decide whether a sidebar `row-selected` event is a user action that
@@ -899,6 +955,43 @@ pub enum Msg {
         group_uuid: String,
         root: Option<PathBuf>,
     },
+    /// The header toggle: show the active group's overview (`true`) or its
+    /// terminals. A no-op when the active group is remote or already in that
+    /// mode — `#[watch] set_active` echoes every switch back through here.
+    SetOverviewMode(bool),
+    /// A tab chip or tabs-panel row was clicked in the overview: switch that
+    /// tab's group to Terminals and make the tab (by uuid) active.
+    ShowTab(String),
+    /// The Resolve button of the active group's data issue at this index
+    /// (into the list the view was last given). Spawns a `claude` tab the way
+    /// `kabelsalat run` does: no focus change, no group switch.
+    ResolveIssue(usize),
+    /// A link in a rendered node body that names no node: open it with the
+    /// default handler.
+    OpenOverviewUri(String),
+    /// A directory monitor saw a `*.md` file below a group's overview root
+    /// change (`removed: false`) or go away (`removed: true`).
+    OverviewFileChanged {
+        group_id: usize,
+        path: PathBuf,
+        removed: bool,
+    },
+    /// A directory appeared below a group's overview root: watch it and
+    /// take its files into the graph.
+    OverviewDirCreated {
+        group_id: usize,
+        path: PathBuf,
+    },
+    /// Periodic scan for tabs whose transcript grew enough to re-tag.
+    OverviewScan,
+    /// The off-thread tagger finished for a tab: its uuid, the watermark the
+    /// run covered (rendered), and stdout or the failure. A failure keeps the
+    /// tab's previous tags and mark.
+    TaggerDone {
+        tab_uuid: String,
+        mark: String,
+        result: Result<String, String>,
+    },
     /// A remote host's worker reported back.
     Remote {
         host: String,
@@ -939,6 +1032,52 @@ impl SimpleComponent for App {
                     set_active: model.sidebar_visible,
                     connect_toggled[sender] => move |button| {
                         sender.input(Msg::SetSidebar(button.is_active()));
+                    },
+                },
+
+                // "Terminals | Overview": the active group's mode. Two linked
+                // toggle buttons rather than adw::ToggleGroup, which needs
+                // libadwaita 1.7. `#[watch] set_active` echoes a toggled
+                // signal back as Msg::SetOverviewMode, which is therefore a
+                // no-op when the mode is unchanged. Remote groups have no
+                // overview: both segments go insensitive with a tooltip.
+                #[wrap(Some)]
+                set_title_widget = &gtk::Box {
+                    add_css_class: "linked",
+                    set_valign: gtk::Align::Center,
+
+                    append: terminals_button = &gtk::ToggleButton {
+                        set_label: "Terminals",
+                        #[watch]
+                        set_active: !model.active_overview_mode(),
+                        #[watch]
+                        set_sensitive: !model.active_group_is_remote(),
+                        #[watch]
+                        set_tooltip_text: model
+                            .active_group_is_remote()
+                            .then_some("Remote groups have no overview"),
+                        connect_toggled[sender] => move |button| {
+                            if button.is_active() {
+                                sender.input(Msg::SetOverviewMode(false));
+                            }
+                        },
+                    },
+                    append = &gtk::ToggleButton {
+                        set_label: "Overview",
+                        set_group: Some(&terminals_button),
+                        #[watch]
+                        set_active: model.active_overview_mode(),
+                        #[watch]
+                        set_sensitive: !model.active_group_is_remote(),
+                        #[watch]
+                        set_tooltip_text: model
+                            .active_group_is_remote()
+                            .then_some("Remote groups have no overview"),
+                        connect_toggled[sender] => move |button| {
+                            if button.is_active() {
+                                sender.input(Msg::SetOverviewMode(true));
+                            }
+                        },
                     },
                 },
 
@@ -1242,32 +1381,41 @@ impl SimpleComponent for App {
                         set_resize_end_child: false,
                         set_shrink_end_child: false,
 
+                    // The mode stack: the terminal area, or the active group's
+                    // overview (`sync_overview` picks the page). The terminal
+                    // box is never re-parented — unparenting VTE disturbs its
+                    // focus and size — so the overview is a sibling page.
                     #[wrap(Some)]
-                    set_start_child = &gtk::Box {
-                        set_orientation: gtk::Orientation::Vertical,
+                    set_start_child = &mode_stack.clone() {
                         set_hexpand: true,
+                        set_vexpand: true,
 
-                        // The scroller is what lets the bar have a small minimum
-                        // width: past the point where inactive tabs hit their
-                        // character floor, the overflow scrolls instead of forcing
-                        // the window wider.
-                        append = &tab_scroller.clone() {
-                            set_hscrollbar_policy: gtk::PolicyType::External,
-                            set_vscrollbar_policy: gtk::PolicyType::Never,
-                            set_propagate_natural_height: true,
-                            set_visible: false,
-
-                            #[wrap(Some)]
-                            set_child = &tab_bar.clone() {
-                                set_orientation: gtk::Orientation::Horizontal,
-                                set_spacing: 2,
-                                set_margin_all: 4,
-                            },
-                        },
-
-                        append = &stack.clone() {
+                        add_named[Some(MODE_TERMINALS)] = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
                             set_hexpand: true,
-                            set_vexpand: true,
+
+                            // The scroller is what lets the bar have a small minimum
+                            // width: past the point where inactive tabs hit their
+                            // character floor, the overflow scrolls instead of forcing
+                            // the window wider.
+                            append = &tab_scroller.clone() {
+                                set_hscrollbar_policy: gtk::PolicyType::External,
+                                set_vscrollbar_policy: gtk::PolicyType::Never,
+                                set_propagate_natural_height: true,
+                                set_visible: false,
+
+                                #[wrap(Some)]
+                                set_child = &tab_bar.clone() {
+                                    set_orientation: gtk::Orientation::Horizontal,
+                                    set_spacing: 2,
+                                    set_margin_all: 4,
+                                },
+                            },
+
+                            append = &stack.clone() {
+                                set_hexpand: true,
+                                set_vexpand: true,
+                            },
                         },
                     },
                     },
@@ -1369,6 +1517,39 @@ impl SimpleComponent for App {
         let ssh = remote_worker::detect_ssh();
         let auth = remote::auth_mode(|key| std::env::var(key).ok(), remote_worker::is_executable);
 
+        // The tagger configuration, read once like everything else here; a
+        // command whose binary is not on PATH leaves the overview without
+        // tab links rather than failing a run every minute.
+        let tagger_config = autostart::config_home()
+            .map(|home| tagger::load_config(&tagger::config_path(&home)))
+            .unwrap_or_default();
+        let tagging_available = tagger_config
+            .tagger_command
+            .first()
+            .is_some_and(|program| on_path(program, std::env::var_os("PATH").as_deref()));
+        // The overview's callbacks only queue messages: the view never
+        // touches the model, and every switch goes through `update`.
+        let overview_view = OverviewView::new(Callbacks {
+            open_tab: Rc::new({
+                let input = sender.input_sender().clone();
+                move |uuid: String| {
+                    let _ = input.send(Msg::ShowTab(uuid));
+                }
+            }),
+            resolve: Rc::new({
+                let input = sender.input_sender().clone();
+                move |index: usize| {
+                    let _ = input.send(Msg::ResolveIssue(index));
+                }
+            }),
+            open_uri: Rc::new({
+                let input = sender.input_sender().clone();
+                move |uri: String| {
+                    let _ = input.send(Msg::OpenOverviewUri(uri));
+                }
+            }),
+        });
+
         let mut model = App {
             tabs: Vec::new(),
             groups: Vec::new(),
@@ -1428,9 +1609,17 @@ impl SimpleComponent for App {
             reselecting: Rc::new(Cell::new(false)),
             drag_handle_icon,
             host_keys: RefCell::new(Vec::new()),
+            mode_stack: gtk::Stack::new(),
+            overview_view,
+            fed_overview: None,
+            overview_gen: 0,
+            tagger_running: false,
+            tagger_config,
+            tagging_available,
         };
 
         let tab_list = model.tab_list.clone();
+        let mode_stack = model.mode_stack.clone();
         let reselecting = model.reselecting.clone();
         let list_scroller = model.list_scroller.clone();
         let tab_bar = model.tab_bar.clone();
@@ -1457,6 +1646,12 @@ impl SimpleComponent for App {
             }
         });
         let widgets = view_output!();
+        // The overview page sits next to the terminal box built in `view!`;
+        // the stack starts on the terminals and `sync_overview` switches it.
+        model
+            .mode_stack
+            .add_named(&model.overview_view.widget(), Some(MODE_OVERVIEW));
+        model.mode_stack.set_visible_child_name(MODE_TERMINALS);
 
         // The divider lives in the widget; mirror it into the active group as
         // it moves so quitting right after a resize keeps the new position.
@@ -1537,6 +1732,15 @@ impl SimpleComponent for App {
                 Err(_) => gtk::glib::ControlFlow::Break,
             }
         });
+        // The tagger's periodic trigger (the other is a title change). A tick
+        // with nothing due only stats a transcript per tab.
+        let input = sender.input_sender().clone();
+        gtk::glib::timeout_add_seconds_local(tagger::SCAN_SECS, move || {
+            match input.send(Msg::OverviewScan) {
+                Ok(()) => gtk::glib::ControlFlow::Continue,
+                Err(_) => gtk::glib::ControlFlow::Break,
+            }
+        });
         ComponentParts { model, widgets }
     }
 
@@ -1550,9 +1754,19 @@ impl SimpleComponent for App {
                 self.open_tab(group, &sender);
             }
             Msg::NewGroup => self.open_group(&sender),
+            // Picking a tab in the sidebar or tab bar shows that tab: its
+            // group leaves overview mode (spec: activating a tab switches the
+            // group to Terminals). Keyboard navigation and the group jump go
+            // through `activate` directly and keep each group's own mode.
             Msg::Select(id) => {
+                let left_overview = self.leave_overview_for(id);
                 if !self.activate(id) {
-                    return; // already active: nothing changed, nothing to save
+                    if !left_overview {
+                        return; // already active: nothing changed, nothing to save
+                    }
+                    // Already the active tab, but its group just switched to
+                    // Terminals: activate() skipped the funnel, so sync here.
+                    self.sync_overview();
                 }
             }
             Msg::CloseTab(id) => self.close_tab(id),
@@ -1832,6 +2046,8 @@ impl SimpleComponent for App {
             Msg::AgeTick => {
                 self.refresh_ages();
                 self.resort_if_stale();
+                // The chips on the map carry the same ages.
+                self.refresh_overview_tabs();
                 return;
             }
             // Like the age tick: starting a retry writes nothing; its result
@@ -2008,8 +2224,93 @@ impl SimpleComponent for App {
                     return;
                 };
                 group.overview_root = root;
+                let group_id = group.id;
+                // Reload now (or drop the data and its monitors on --clear),
+                // and redraw if the group's overview is on screen. Never a
+                // mode change: the user flips the header toggle themselves.
+                self.load_overview(group_id);
+                if self.active_group() == Some(group_id) {
+                    self.sync_overview();
+                }
                 // save_state() at the bottom of update() persists the root
-                // and republishes the snapshot the CLI reads.
+                // and republishes the snapshot (issues included) the CLI reads.
+            }
+            Msg::SetOverviewMode(on) => {
+                let Some(group_id) = self.active_group() else {
+                    return;
+                };
+                if self.group_host(group_id).is_some() {
+                    return; // remote groups have no overview
+                }
+                let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) else {
+                    return;
+                };
+                if group.overview_mode == on {
+                    return; // the #[watch] echo of a switch: nothing changed
+                }
+                group.overview_mode = on;
+                self.sync_overview();
+                // The mode is persisted per group: fall through to the save.
+            }
+            Msg::ShowTab(uuid) => {
+                let Some(id) = self.tabs.iter().find(|t| t.uuid == uuid).map(|t| t.id) else {
+                    return; // the tab closed since the chip was drawn
+                };
+                self.leave_overview_for(id);
+                if !self.activate(id) {
+                    // Already active: activate() skipped the funnel.
+                    self.sync_overview();
+                }
+            }
+            Msg::ResolveIssue(index) => {
+                // Hands the prepared prompt to the SpawnCommand arm, the
+                // exact `kabelsalat run` path: no activate, no raise, no
+                // active-group change. That arm saves; this one changed nothing.
+                if let Some(msg) = self.resolve_issue_command(index) {
+                    sender.input(msg);
+                }
+                return;
+            }
+            Msg::OpenOverviewUri(uri) => {
+                gtk::UriLauncher::new(&uri).launch(
+                    Some(&self.window),
+                    gio::Cancellable::NONE,
+                    move |result| {
+                        if let Err(err) = result {
+                            eprintln!("failed to open {uri}: {err}");
+                        }
+                    },
+                );
+                return;
+            }
+            // Node files are the repository's, not the state file's: a
+            // change redraws and republishes the issues, never saves.
+            Msg::OverviewFileChanged {
+                group_id,
+                path,
+                removed,
+            } => {
+                self.overview_file_changed(group_id, &path, removed);
+                return;
+            }
+            Msg::OverviewDirCreated { group_id, path } => {
+                self.overview_dir_created(group_id, &path);
+                return;
+            }
+            // Like the other ticks: starting a run writes nothing.
+            Msg::OverviewScan => {
+                self.overview_scan();
+                return;
+            }
+            // Tags live on the tmux session (or in memory), never in the
+            // state file: no save here either.
+            Msg::TaggerDone {
+                tab_uuid,
+                mark,
+                result,
+            } => {
+                self.tagger_done(&tab_uuid, &mark, result);
+                return;
             }
             Msg::RenameGroup { group_uuid, name } => {
                 // Same race as SpawnCommand: the CLI validated against a copy.
@@ -2168,6 +2469,7 @@ impl App {
             host: None,
             overview_root: None,
             overview_mode: false,
+            overview: None,
         });
         id
     }
@@ -2255,6 +2557,7 @@ impl App {
                 host: group.host.clone(),
                 overview_root: group.overview_root.clone(),
                 overview_mode: group.overview_mode,
+                overview: None,
             });
         }
         self.next_group_id = saved.groups.iter().map(|g| g.id).max().map_or(1, |m| m + 1);
@@ -2334,6 +2637,9 @@ impl App {
         for (uuid, group) in &reattached {
             self.session_env_refresh(uuid, *group);
         }
+        // Tags survive a GUI restart on the tmux server: read them back from
+        // every reattached session. Anything unreadable simply starts untagged.
+        self.restore_tags(&reattached);
 
         // Seed the ages from the state file — the only source that survives a
         // restart. A tab whose entry predates the field (or an adopted orphan,
@@ -2490,8 +2796,21 @@ impl App {
                         adb: a.adb().filter(|_| a.is_running()).map(str::to_string),
                     }),
                     overview_root: g.overview_root.clone(),
-                    // Filled once the overview wiring derives the group's issues.
-                    issues: Vec::new(),
+                    issues: g
+                        .overview
+                        .as_ref()
+                        .map(|data| {
+                            data.issues
+                                .iter()
+                                .map(|issue| crate::cli::IssueLine {
+                                    kind: issue.kind.label().to_string(),
+                                    nodes: issue.nodes.clone(),
+                                    file: issue.file.clone(),
+                                    detail: issue.detail.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
                 .collect(),
         );
@@ -3228,6 +3547,9 @@ impl App {
         for group in &self.groups {
             group.panes.select(group.front_pane);
         }
+        // Every switch path funnels through here, so this is where the new
+        // active group's overview mode is restored.
+        self.sync_overview();
     }
 
     /// Restore a split, waiting for an allocation that can actually hold it.
@@ -4637,6 +4959,9 @@ impl App {
             pending,
             spawned_at: None,
             claude: None,
+            tags: None,
+            tag_mark: None,
+            last_tag_run: None,
         });
         if let Some(host) = &host {
             if let Some(tab) = self.tabs.last() {
@@ -5281,6 +5606,9 @@ impl App {
         self.refresh_sidebar_label(tab);
         self.refresh_tab_bar_label(tab);
         self.resort_if_stale();
+        // A real title change is one of the tagger's two triggers; the rate
+        // limits inside keep animation-rate titles from running it.
+        self.maybe_tag(id);
     }
 
     /// A group's tabs in display order. Manual keeps the vec order (which
@@ -6537,9 +6865,859 @@ fn spawn_shell(terminal: &Terminal, cwd: Option<&Path>, command: Option<&[String
     );
 }
 
+// ---------------------------------------------------------------------------
+// Overview mode: the mode stack, each group's data and its monitors, the
+// tagger, the data issues. Wiring only — the rules are in
+// `overview::{model, layout, tagger, issues}` and tested there.
+impl App {
+    /// Whether the active group shows its overview; drives the header
+    /// toggle. Remote groups never do.
+    fn active_overview_mode(&self) -> bool {
+        self.active_group()
+            .and_then(|id| self.groups.iter().find(|g| g.id == id))
+            .is_some_and(|g| g.overview_mode && g.host.is_none())
+    }
+
+    /// Whether the active group runs on another host. Such groups have no
+    /// overview in this version: the toggle is insensitive.
+    fn active_group_is_remote(&self) -> bool {
+        self.active_group()
+            .and_then(|id| self.group_host(id))
+            .is_some()
+    }
+
+    /// Take `id`'s group out of overview mode because one of its tabs was
+    /// picked. Returns whether the mode changed.
+    fn leave_overview_for(&mut self, id: usize) -> bool {
+        let Some(group_id) = self.tabs.iter().find(|t| t.id == id).map(|t| t.group) else {
+            return false;
+        };
+        match self.groups.iter_mut().find(|g| g.id == group_id) {
+            Some(group) if group.overview_mode => {
+                group.overview_mode = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Show the page the active group's mode asks for and, for the
+    /// overview, feed the view. Reached from `sync_pane_host`, so every
+    /// switch path restores the new group's mode. Coming back to the
+    /// terminals hands focus to the active terminal, as `activate` does.
+    fn sync_overview(&mut self) {
+        let showing = self
+            .mode_stack
+            .visible_child_name()
+            .is_some_and(|name| name.as_str() == MODE_OVERVIEW);
+        let wanted = self.active_group().filter(|id| {
+            self.groups
+                .iter()
+                .any(|g| g.id == *id && g.overview_mode && g.host.is_none())
+        });
+        let Some(group_id) = wanted else {
+            if showing {
+                self.mode_stack.set_visible_child_name(MODE_TERMINALS);
+                if let Some(tab) = self.active_tab() {
+                    tab.terminal.grab_focus();
+                }
+            }
+            return;
+        };
+        // Loaded lazily: the first time a group with a root shows its map.
+        let unloaded = self
+            .groups
+            .iter()
+            .any(|g| g.id == group_id && g.overview.is_none() && g.overview_root.is_some());
+        if unloaded {
+            self.load_overview(group_id);
+        }
+        self.feed_overview(group_id);
+        if !showing {
+            self.mode_stack.set_visible_child_name(MODE_OVERVIEW);
+        }
+    }
+
+    /// Hand the view a group's state: its name, the data (only when the
+    /// group or its generation differs from the last feed, so the viewport
+    /// survives a redraw), the tab chips, the issues and the selected tab —
+    /// or the empty page when there is no root or it cannot be read.
+    fn feed_overview(&mut self, group_id: usize) {
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+            return;
+        };
+        let view = &self.overview_view;
+        view.set_group_name(&overview_group_name(group));
+        let (Some(root), Some(data)) = (&group.overview_root, &group.overview) else {
+            view.set_empty(Some(EmptyState::NoRoot));
+            self.fed_overview = None;
+            return;
+        };
+        if let Some(error) = &data.error {
+            view.set_empty(Some(EmptyState::Unreadable {
+                root: root.clone(),
+                error: error.clone(),
+            }));
+            self.fed_overview = None;
+            return;
+        }
+        if self.fed_overview != Some((group_id, data.generation)) {
+            view.set_data(data.graph.clone(), data.layout.clone());
+            self.fed_overview = Some((group_id, data.generation));
+        }
+        view.set_issues(data.issues.clone());
+        let (chips, unmapped) = self.overview_chips(group_id);
+        view.set_tabs(chips, unmapped, self.tagging_available);
+        view.set_selected_tab(self.active_tab().map(|t| t.uuid.clone()));
+        view.set_empty(None);
+    }
+
+    /// Re-feed the tab chips alone (names, ages) while the overview is on
+    /// screen; the age tick calls this.
+    fn refresh_overview_tabs(&self) {
+        let Some(group_id) = self.active_group() else {
+            return;
+        };
+        let showing = self
+            .mode_stack
+            .visible_child_name()
+            .is_some_and(|name| name.as_str() == MODE_OVERVIEW);
+        if !showing {
+            return;
+        }
+        let (chips, unmapped) = self.overview_chips(group_id);
+        self.overview_view
+            .set_tabs(chips, unmapped, self.tagging_available);
+    }
+
+    /// Build (or rebuild) a group's overview from its root: the graph, its
+    /// layout, one monitor per directory, the issues. A root that is not a
+    /// readable directory gives the error state (an empty graph, no
+    /// monitors). No root, or a remote group, drops the data and with it the
+    /// monitors.
+    fn load_overview(&mut self, group_id: usize) {
+        let root = self
+            .groups
+            .iter()
+            .find(|g| g.id == group_id && g.host.is_none())
+            .and_then(|g| g.overview_root.clone());
+        let Some(root) = root else {
+            if let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) {
+                group.overview = None;
+            }
+            return;
+        };
+        let (error, sources) = match std::fs::metadata(&root) {
+            Ok(meta) if meta.is_dir() => (None, scan_root(&root)),
+            Ok(_) => (Some("not a directory".to_string()), Vec::new()),
+            Err(err) => (Some(err.to_string()), Vec::new()),
+        };
+        let monitors = if error.is_none() {
+            self.watch_overview_dirs(group_id, &root)
+        } else {
+            HashMap::new()
+        };
+        self.set_overview_graph(group_id, Graph::build(sources), error, Some(monitors));
+    }
+
+    /// Install `graph` as a group's overview: lay it out, bump the
+    /// generation, derive the issues from it and the group's tags.
+    /// `monitors` replaces the group's set when given and keeps it otherwise
+    /// (a file change watches nothing new).
+    fn set_overview_graph(
+        &mut self,
+        group_id: usize,
+        graph: Graph,
+        error: Option<String>,
+        monitors: Option<HashMap<PathBuf, gio::FileMonitor>>,
+    ) {
+        let tabs = self.tagged_tabs(group_id);
+        self.overview_gen += 1;
+        let generation = self.overview_gen;
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) else {
+            return;
+        };
+        let issues = issues::derive(&graph, &tabs);
+        let placed = layout::layout(&graph, &Metrics::default());
+        let monitors = match (monitors, group.overview.take()) {
+            (Some(fresh), _) => fresh,
+            (None, Some(old)) => old.monitors,
+            (None, None) => HashMap::new(),
+        };
+        group.overview = Some(OverviewData {
+            graph: Rc::new(graph),
+            layout: Rc::new(placed),
+            error,
+            monitors,
+            issues,
+            generation,
+        });
+    }
+
+    /// After a group's graph or tags changed: redraw when it is on screen,
+    /// and republish the snapshot so `kabelsalat overview issues` sees the
+    /// new issues. No state save: nothing here is the state file's.
+    fn overview_changed(&mut self, group_id: usize) {
+        if self.active_group() == Some(group_id) {
+            self.sync_overview();
+        }
+        self.publish_groups();
+    }
+
+    /// A monitored `*.md` file changed or went away: rebuild the graph with
+    /// that one source replaced or removed.
+    fn overview_file_changed(&mut self, group_id: usize, path: &Path, removed: bool) {
+        let Some(data) = self
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.overview.as_ref())
+        else {
+            return;
+        };
+        let graph = if removed || !path.is_file() {
+            data.graph.without_source(path)
+        } else {
+            let text = std::fs::read_to_string(path).map_err(|e| e.to_string());
+            data.graph.with_source((path.to_path_buf(), text))
+        };
+        self.set_overview_graph(group_id, graph, None, None);
+        self.overview_changed(group_id);
+    }
+
+    /// A directory appeared below the root: watch it (and what is already
+    /// below it) and take its files into the graph.
+    fn overview_dir_created(&mut self, group_id: usize, dir: &Path) {
+        if dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            return;
+        }
+        let Some(data) = self
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.overview.as_ref())
+        else {
+            return;
+        };
+        let mut sources: Vec<Source> = data
+            .graph
+            .sources()
+            .iter()
+            .filter(|(path, _)| !path.starts_with(dir))
+            .cloned()
+            .collect();
+        sources.extend(scan_root(dir));
+        let graph = Graph::build(sources);
+        let fresh = self.watch_overview_dirs(group_id, dir);
+        self.set_overview_graph(group_id, graph, None, None);
+        if let Some(data) = self
+            .groups
+            .iter_mut()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.overview.as_mut())
+        {
+            data.monitors.extend(fresh);
+        }
+        self.overview_changed(group_id);
+    }
+
+    /// One monitor for `root` and every directory below it (dot-dirs and
+    /// symlinks skipped), each reporting its `*.md` changes and new
+    /// directories into `update` for `group_id`.
+    fn watch_overview_dirs(
+        &self,
+        group_id: usize,
+        root: &Path,
+    ) -> HashMap<PathBuf, gio::FileMonitor> {
+        let mut monitors = HashMap::new();
+        for dir in overview_dirs(root) {
+            let file = gio::File::for_path(&dir);
+            match file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+            {
+                Ok(monitor) => {
+                    let input = self.input.clone();
+                    monitor.connect_changed(move |_, file, other, event| {
+                        let other = other.and_then(|f| f.path());
+                        for msg in
+                            overview_events(group_id, file.path(), other, event, Path::is_dir)
+                        {
+                            let _ = input.send(msg);
+                        }
+                    });
+                    monitors.insert(dir, monitor);
+                }
+                Err(err) => eprintln!("kabelsalat: watching {}: {err}", dir.display()),
+            }
+        }
+        monitors
+    }
+
+    /// The group's tagged tabs, as the issue derivation and the Resolve
+    /// prompt want them.
+    fn tagged_tabs(&self, group_id: usize) -> Vec<TaggedTab> {
+        self.tabs
+            .iter()
+            .filter(|t| t.group == group_id)
+            .filter_map(|t| {
+                t.tags.as_ref().map(|tags| TaggedTab {
+                    uuid: t.uuid.clone(),
+                    name: t.title.clone(),
+                    tags: tags.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// The map's tab chips — one per link of every tagged tab — and the
+    /// "Unmapped work" tray: tabs whose tagging found a topic but no node.
+    fn overview_chips(&self, group_id: usize) -> (Vec<TabChip>, Vec<Unmapped>) {
+        let now = SystemTime::now();
+        let mut chips = Vec::new();
+        let mut unmapped = Vec::new();
+        for tab in self.tabs.iter().filter(|t| t.group == group_id) {
+            let Some(tags) = &tab.tags else { continue };
+            let elapsed = now
+                .duration_since(tab.last_activity.get())
+                .unwrap_or(Duration::ZERO);
+            let age = age_prefix(elapsed);
+            for link in &tags.links {
+                chips.push(TabChip {
+                    uuid: tab.uuid.clone(),
+                    name: tab.title.clone(),
+                    role: link.role.clone(),
+                    node: link.node.clone(),
+                    activity: tags.activity.clone(),
+                    age: age.clone(),
+                });
+            }
+            if let Some(topic) = &tags.topic
+                && tags.links.is_empty()
+            {
+                unmapped.push(Unmapped {
+                    uuid: tab.uuid.clone(),
+                    name: tab.title.clone(),
+                    topic: topic.clone(),
+                });
+            }
+        }
+        (chips, unmapped)
+    }
+
+    /// Re-derive a group's issues after its tags changed (the graph did not).
+    fn recompute_issues(&mut self, group_id: usize) {
+        let tabs = self.tagged_tabs(group_id);
+        if let Some(data) = self
+            .groups
+            .iter_mut()
+            .find(|g| g.id == group_id)
+            .and_then(|g| g.overview.as_mut())
+        {
+            data.issues = issues::derive(&data.graph, &tabs);
+        }
+    }
+
+    /// The `kabelsalat run`-shaped message that opens the Resolve tab for
+    /// the active group's issue at `index`; `None` when the issue is gone.
+    fn resolve_issue_command(&self, index: usize) -> Option<Msg> {
+        let active = self.active_group()?;
+        let group = self.groups.iter().find(|g| g.id == active)?;
+        let root = group.overview_root.as_ref()?;
+        let data = group.overview.as_ref()?;
+        let issue = data.issues.get(index)?;
+        let tabs = self.tagged_tabs(group.id);
+        // A missing link names a tab: the first one linking both nodes.
+        let tab = match (issue.kind, issue.nodes.as_slice()) {
+            (issues::IssueKind::MissingLink, [a, b]) => tabs.iter().find(|t| {
+                let links = |id: &str| t.tags.links.iter().any(|l| l.node == id);
+                links(a) && links(b)
+            }),
+            _ => None,
+        };
+        let prompt = issues::resolve_prompt(issue, &data.graph, root, tab);
+        Some(Msg::SpawnCommand {
+            group: crate::cli::GroupTarget::Existing(group.uuid.clone()),
+            tab_uuid: state::new_uuid(),
+            cwd: Some(root.clone()),
+            argv: vec!["claude".to_string(), prompt],
+        })
+    }
+
+    /// The periodic trigger: offer every tab to `maybe_tag`; the
+    /// one-at-a-time rule inside lets at most one run start per scan.
+    fn overview_scan(&mut self) {
+        let ids: Vec<usize> = self.tabs.iter().map(|t| t.id).collect();
+        for id in ids {
+            if self.tagger_running {
+                break;
+            }
+            self.maybe_tag(id);
+        }
+    }
+
+    /// Run the tagger for a tab when it is due: a local tab of a group with
+    /// a non-empty overview, the command available, no run in flight, the
+    /// per-tab gap elapsed, and enough new transcript (or a new title). The
+    /// process runs off-thread and reports `Msg::TaggerDone`.
+    fn maybe_tag(&mut self, tab_id: usize) {
+        if !self.tagging_available || self.tagger_running {
+            return;
+        }
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        if self.group_host(tab.group).is_some() {
+            return; // remote groups are not tagged
+        }
+        let Some(graph) = self
+            .groups
+            .iter()
+            .find(|g| g.id == tab.group)
+            .and_then(|g| g.overview.as_ref())
+            .map(|data| data.graph.clone())
+        else {
+            return;
+        };
+        if graph.is_empty() {
+            return;
+        }
+        let last_run = tab.last_tag_run.map(|at| at.elapsed().as_secs());
+        if !tagger::may_run(last_run, self.tagger_running) {
+            return;
+        }
+        let Some((mark, text)) = tagger_input(tab) else {
+            return;
+        };
+        let nodes: Vec<NodeSummary> = graph
+            .nodes()
+            .map(|n| NodeSummary {
+                id: &n.id,
+                kind: &n.kind,
+                title: &n.title,
+            })
+            .collect();
+        let current = tab.tags.clone().unwrap_or_default();
+        let prompt = tagger::prompt(
+            &self.tagger_config.roles,
+            &nodes,
+            &current,
+            &tab.title,
+            &text,
+        );
+        let tab_uuid = tab.uuid.clone();
+        let argv = self.tagger_config.tagger_command.clone();
+        let input = self.input.clone();
+        self.tagger_running = true;
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.last_tag_run = Some(Instant::now());
+        }
+        let mark = mark.render();
+        std::thread::spawn(move || {
+            let result = run_tagger(&argv, &prompt);
+            let _ = input.send(Msg::TaggerDone {
+                tab_uuid,
+                mark,
+                result,
+            });
+        });
+    }
+
+    /// Apply a finished tagger run: the answer's tags replace the tab's and
+    /// go to its tmux session with the watermark; a failed run or an
+    /// unparsable answer keeps the old tags and mark (the next significant
+    /// change retries).
+    fn tagger_done(&mut self, tab_uuid: &str, mark: &str, result: Result<String, String>) {
+        self.tagger_running = false;
+        let Some((tab_id, group_id)) = self
+            .tabs
+            .iter()
+            .find(|t| t.uuid == tab_uuid)
+            .map(|t| (t.id, t.group))
+        else {
+            return; // the tab closed while the tagger ran
+        };
+        let stdout = match result {
+            Ok(stdout) => stdout,
+            Err(err) => {
+                eprintln!("kabelsalat: tagger for tab {tab_uuid}: {err}");
+                return;
+            }
+        };
+        let tags = match tagger::parse_response(&stdout) {
+            Ok(tags) => tags,
+            Err(err) => {
+                eprintln!("kabelsalat: tagger answer for tab {tab_uuid}: {err}");
+                return;
+            }
+        };
+        self.store_tags(tab_id, group_id, tags, mark);
+        self.recompute_issues(group_id);
+        self.overview_changed(group_id);
+    }
+
+    /// Keep a tab's tags in the model and — with tmux, for a local group —
+    /// on its session, where they survive a GUI restart. Without tmux they
+    /// live in memory only (spec section 8).
+    fn store_tags(&mut self, tab_id: usize, group_id: usize, tags: Tags, mark: &str) {
+        let local = self.group_host(group_id).is_none();
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return;
+        };
+        tab.tag_mark = Watermark::parse(mark);
+        if let Some(tmux) = &self.tmux
+            && local
+        {
+            match serde_json::to_string(&tags) {
+                Ok(json) => {
+                    if let Err(err) = tmux.set_environment(&tab.uuid, ENV_LINKS, &json) {
+                        eprintln!("kabelsalat: set {ENV_LINKS} on {}: {err}", tab.uuid);
+                    }
+                }
+                Err(err) => eprintln!("kabelsalat: serializing tags: {err}"),
+            }
+            if let Err(err) = tmux.set_environment(&tab.uuid, ENV_TAG_MARK, mark) {
+                eprintln!("kabelsalat: set {ENV_TAG_MARK} on {}: {err}", tab.uuid);
+            }
+        }
+        tab.tags = Some(tags);
+    }
+
+    /// Seed the tags of reattached local tabs from their tmux sessions,
+    /// where the previous run left them. Anything unreadable starts untagged.
+    fn restore_tags(&mut self, reattached: &[(String, usize)]) {
+        let Some(tmux) = &self.tmux else { return };
+        for (uuid, group) in reattached {
+            if self.group_host(*group).is_some() {
+                continue;
+            }
+            let tags = match tmux.show_environment(uuid, ENV_LINKS) {
+                Ok(Some(json)) => serde_json::from_str::<Tags>(&json).ok(),
+                _ => None,
+            };
+            let Some(tags) = tags else { continue };
+            let mark = match tmux.show_environment(uuid, ENV_TAG_MARK) {
+                Ok(Some(mark)) => Watermark::parse(&mark),
+                _ => None,
+            };
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.uuid == *uuid) {
+                tab.tags = Some(tags);
+                tab.tag_mark = mark;
+            }
+        }
+    }
+}
+
+/// The name the overview shows for a group: the sidebar header's.
+fn overview_group_name(group: &Group) -> String {
+    if group.name.is_empty() {
+        format!("Tab group {}", group.id)
+    } else {
+        group.name.clone()
+    }
+}
+
+/// Whether `program` would be found by `Command::new`: as given when it
+/// has a directory part, else in one of `path`'s directories.
+fn on_path(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    if program.contains('/') {
+        return Path::new(program).is_file();
+    }
+    path.is_some_and(|path| std::env::split_paths(path).any(|dir| dir.join(program).is_file()))
+}
+
+/// `root` and every directory below it, breadth first; directories whose
+/// name starts with `.` and symlinks are skipped, like `scan_root` does.
+fn overview_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.to_path_buf()];
+    let mut next = 0;
+    while next < dirs.len() {
+        if let Ok(entries) = std::fs::read_dir(&dirs[next]) {
+            for entry in entries.flatten() {
+                let hidden = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.'));
+                if !hidden && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        next += 1;
+    }
+    dirs
+}
+
+/// What a directory monitor event means for the overview: a `*.md` file
+/// changed or went away, a directory appeared, or nothing of interest. On
+/// a rename `file` is the old name and `other` the new one.
+fn overview_events(
+    group_id: usize,
+    file: Option<PathBuf>,
+    other: Option<PathBuf>,
+    event: gio::FileMonitorEvent,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Vec<Msg> {
+    let is_md = |path: &Path| path.extension().is_some_and(|ext| ext == "md");
+    let changed = |path: PathBuf| Msg::OverviewFileChanged {
+        group_id,
+        path,
+        removed: false,
+    };
+    let removed = |path: PathBuf| Msg::OverviewFileChanged {
+        group_id,
+        path,
+        removed: true,
+    };
+    let Some(file) = file else {
+        return Vec::new();
+    };
+    match event {
+        gio::FileMonitorEvent::Created if is_dir(&file) => {
+            vec![Msg::OverviewDirCreated {
+                group_id,
+                path: file,
+            }]
+        }
+        gio::FileMonitorEvent::Created
+        | gio::FileMonitorEvent::Changed
+        | gio::FileMonitorEvent::ChangesDoneHint
+        | gio::FileMonitorEvent::MovedIn => {
+            if is_md(&file) {
+                vec![changed(file)]
+            } else {
+                Vec::new()
+            }
+        }
+        gio::FileMonitorEvent::Deleted | gio::FileMonitorEvent::MovedOut => {
+            if is_md(&file) {
+                vec![removed(file)]
+            } else {
+                Vec::new()
+            }
+        }
+        gio::FileMonitorEvent::Renamed => {
+            let mut out = Vec::new();
+            if is_md(&file) {
+                out.push(removed(file));
+            }
+            if let Some(new) = other.filter(|path| is_md(path)) {
+                out.push(changed(new));
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// What the tagger gets for a tab, and the watermark that run will leave:
+/// the transcript since the current mark when the tab runs a claude whose
+/// transcript grew significantly, else the title when it changed. `None`
+/// when there is nothing new (keeping the old mark).
+fn tagger_input(tab: &Tab) -> Option<(Watermark, String)> {
+    if let Some(session) = &tab.claude
+        && let Some(projects) = claude::projects_dir()
+    {
+        let path = claude::transcript_path(&projects, session);
+        // A transcript that is not there yet falls through to the title; one
+        // that cannot be read waits for the next scan.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let text = std::fs::read_to_string(&path).ok()?;
+            let last = tagger::last_uuid(&text);
+            if tagger::unchanged(tab.tag_mark.as_ref(), meta.len(), last.as_deref()) {
+                return None;
+            }
+            let delta = tagger::delta_since(&text, tab.tag_mark.as_ref());
+            if !tagger::significant(&delta) {
+                return None;
+            }
+            let previous = match &tab.tag_mark {
+                Some(Watermark::Transcript { uuid, .. }) => Some(uuid.clone()),
+                _ => None,
+            };
+            let uuid = delta.last_uuid.clone().or(last).or(previous)?;
+            return Some((
+                Watermark::Transcript {
+                    uuid,
+                    offset: delta.end_offset,
+                },
+                delta.text,
+            ));
+        }
+    }
+    let (mark, text) = tagger::title_input(&tab.title);
+    if tab.tag_mark.as_ref() == Some(&mark) {
+        return None;
+    }
+    Some((mark, text))
+}
+
+/// How often the tagger thread checks whether its child exited.
+const TAGGER_POLL: Duration = Duration::from_millis(200);
+
+/// Run the tagger command with `prompt` on stdin and return its stdout.
+/// Shaped like `android::run_capture`, but with a piped stdin and a reader
+/// thread for stdout, so neither a long prompt nor a long answer can stall
+/// the child on a full pipe. Kills the child after `tagger::TIMEOUT_SECS`.
+fn run_tagger(argv: &[String], prompt: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+    let Some((program, args)) = argv.split_first() else {
+        return Err("the tagger command is empty".to_string());
+    };
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("{program}: {err}"))?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("the tagger has no stdout".to_string());
+    };
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        out
+    });
+    if let Some(mut stdin) = child.stdin.take() {
+        let written = stdin.write_all(prompt.as_bytes());
+        // Dropped here: the child sees EOF.
+        drop(stdin);
+        if let Err(err) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("writing the prompt: {err}"));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(tagger::TIMEOUT_SECS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(TAGGER_POLL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {} s", tagger::TIMEOUT_SECS));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err.to_string());
+            }
+        }
+    };
+    let out = reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(out)
+    } else {
+        Err(format!("exited with {status}: {}", out.trim()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- overview mode ------------------------------------------------------
+
+    #[test]
+    fn a_program_with_a_directory_part_is_looked_up_as_given() {
+        assert!(on_path("/bin/sh", None));
+        assert!(!on_path(
+            "/nonexistent/kabelsalat-test/sh",
+            Some(std::ffi::OsStr::new("/bin"))
+        ));
+    }
+
+    #[test]
+    fn a_bare_program_is_searched_on_path() {
+        let path = std::ffi::OsStr::new("/nonexistent/kabelsalat-test:/bin");
+        assert!(on_path("sh", Some(path)));
+        assert!(!on_path("kabelsalat-no-such-program", Some(path)));
+        assert!(!on_path("sh", None));
+    }
+
+    #[test]
+    fn overview_dirs_walks_below_the_root_and_skips_dot_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "kabelsalat-app-test-overview-dirs-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join("a/n.md"), "x").unwrap();
+        let mut dirs = overview_dirs(&root);
+        dirs.sort();
+        assert_eq!(dirs, vec![root.clone(), root.join("a"), root.join("a/b")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn monitor_events_name_md_files_and_new_directories() {
+        let md = PathBuf::from("/r/n.md");
+        let changed = overview_events(
+            3,
+            Some(md.clone()),
+            None,
+            gio::FileMonitorEvent::Changed,
+            |_| false,
+        );
+        assert!(matches!(
+            &changed[..],
+            [Msg::OverviewFileChanged { group_id: 3, path, removed: false }] if *path == md
+        ));
+        let deleted = overview_events(
+            3,
+            Some(md.clone()),
+            None,
+            gio::FileMonitorEvent::Deleted,
+            |_| false,
+        );
+        assert!(matches!(
+            &deleted[..],
+            [Msg::OverviewFileChanged { removed: true, .. }]
+        ));
+        let dir = PathBuf::from("/r/sub");
+        let created = overview_events(
+            3,
+            Some(dir.clone()),
+            None,
+            gio::FileMonitorEvent::Created,
+            |_| true,
+        );
+        assert!(matches!(
+            &created[..],
+            [Msg::OverviewDirCreated { group_id: 3, path }] if *path == dir
+        ));
+        let other = overview_events(
+            3,
+            Some(PathBuf::from("/r/x.txt")),
+            None,
+            gio::FileMonitorEvent::Changed,
+            |_| false,
+        );
+        assert!(other.is_empty());
+        let renamed = overview_events(
+            3,
+            Some(md),
+            Some(PathBuf::from("/r/m.md")),
+            gio::FileMonitorEvent::Renamed,
+            |_| false,
+        );
+        assert!(matches!(
+            &renamed[..],
+            [
+                Msg::OverviewFileChanged { removed: true, .. },
+                Msg::OverviewFileChanged { removed: false, .. },
+            ]
+        ));
+    }
 
     // --- sidebar selection echo -------------------------------------------
 
