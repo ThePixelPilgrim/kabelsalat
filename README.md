@@ -28,6 +28,10 @@ colour-coded groups.
   running there inspects and drives the page in front of you, zero
   configuration. One camera-button click hands it a screenshot of the pane
   instead, pasted straight into the tab you took it from.
+- **A map of the work.** A group can show an overview in place of its
+  terminals: a zoomable map of projects, decisions and themes read from
+  Markdown files in the repository, with each tab drawn on the node it is
+  working on and gaps in the data flagged for an agent to fix.
 - **Agent-friendly CLI.** `kabelsalat run -g web -- npm run dev` opens a
   command in a visible tab without stealing focus; a Claude Code plugin
   teaches agents the whole interface.
@@ -94,6 +98,9 @@ second window:
     kabelsalat run -g newproj --create -- claude   # create "newproj" if missing
     kabelsalat rename newproj proj2        # rename an existing group
     kabelsalat browser -g web              # bring up "web"'s browser, or print its CDP endpoint
+    kabelsalat android -g web              # bring up Android in "web"'s pane, or print its ctl=/adb= lines
+    kabelsalat overview root -g web docs   # draw "web"'s overview from the *.md files below docs/
+    kabelsalat overview issues -g web      # print the overview's data issues, one per line
     kabelsalat resume                      # recreate saved claude sessions, no GUI (the boot unit)
 
 `--group` takes a group name or uuid; `--cwd` overrides the working directory,
@@ -108,9 +115,18 @@ takes the group from the caller's `KABELSALAT_GROUP` when `-g` is omitted; it
 prints the endpoint if the browser is already up, otherwise brings it up —
 hidden unless that group is the active one, never taking focus — and prints
 nothing, the endpoint then appearing in the group's sessions as
-`KABELSALAT_CDP`. Exit codes: 0 success, 1 not running, 2 usage, 3 no such
-group, ambiguous, remote (for `browser`), or (for `rename`) name already in
-use, 4 (for `resume`) tmux unavailable.
+`KABELSALAT_CDP`. `android` does the same for the group's Android pane
+(Waydroid) and, with a subcommand (`screenshot`, `tap`, `type`, `key`,
+`resize`), drives it. `overview root` sets the directory a group's overview is
+read from — resolved against the caller's directory, and it must exist —
+or unsets it with `--clear`; `overview issues` prints the group's current data
+issues, tab-separated (kind, node ids, file, detail), nothing when there are
+none. Neither switches the group to its overview, changes the active group or
+takes focus. Exit codes: 0 success, 1 not running, 2 usage (also an
+`overview root` directory that does not exist), 3 no such group, ambiguous,
+remote (for `browser`, `android` and `overview`), or (for `rename`) name
+already in use, 4 (for `resume`) tmux unavailable or (for `android`) the
+pane refused the request.
 
 Claude Code learns this interface through the plugin below.
 
@@ -191,10 +207,13 @@ plugin marketplace. Inside Claude Code:
     /plugin marketplace add ThePixelPilgrim/kabelsalat
     /plugin install kabelsalat@kabelsalat
 
-The skill teaches an agent to launch commands into groups via `kabelsalat run`
-and to drive the group's embedded browser over CDP (see "Browser automation"
-below, including its security note). Plugin versions follow tagged releases —
-`/plugin update` picks up a release, not every commit.
+The skill teaches an agent to launch commands into groups via `kabelsalat run`,
+to drive the group's embedded browser over CDP (see "Browser automation"
+below, including its security note) and Firefox in its Android pane, and to
+keep the group's overview current — `kabelsalat overview` plus the node file
+format in `skills/kabelsalat/overview-format.md`, which an agent in any
+repository can adopt from that page alone. Plugin versions follow tagged
+releases — `/plugin update` picks up a release, not every commit.
 
 For hacking on the skill itself, `scripts/install-skill.sh` symlinks
 `skills/kabelsalat` into `~/.claude/skills/` — a dev-mode shortcut, not the
@@ -316,6 +335,44 @@ any other copy action, and the keystroke goes to whatever is running in that
 tab — a shell rather than an agent sees a plain `Ctrl+V`, exactly as if you had
 pressed it yourself. If you switch tabs while the capture is still in flight,
 the paste is skipped and the screenshot only lands on the clipboard.
+
+### Overview mode
+
+The "Terminals | Overview" toggle in the header bar swaps the active group's
+terminal area for a map of its work; the sidebar and the browser or Android
+pane stay. The mode is remembered per group, so switching groups brings back
+whichever view each one was in, and activating a tab — in the sidebar, or by
+clicking it on the map — switches back to Terminals and shows it. The map is
+read from Markdown files with YAML frontmatter below one directory of the
+project, set with `kabelsalat overview root`; the format is documented for
+agents in [skills/kabelsalat/overview-format.md](skills/kabelsalat/overview-format.md).
+A group without a root shows an empty state naming that command and linking
+the format page; a root that is missing or unreadable shows the path and the
+error, and nothing else in the group is affected. Remote groups have no
+overview in this version — their toggle is insensitive, with a tooltip saying
+so.
+
+Which tab works on which node is inferred, not written by anyone: when a
+tab's recent work changes, kabelsalat hands the new part of its `claude`
+transcript (or just the tab title, for other tabs) to a small model and keeps
+the answer in the tab's tmux session as `KABELSALAT_LINKS` (a JSON object with
+the linked nodes, their roles and an activity line) and `KABELSALAT_TAG_MARK`
+(how far the transcript was read). Nothing is written to the repository or
+to `state.json`, and the tags survive a GUI restart with the tmux server. The
+model command comes from `$XDG_CONFIG_HOME/kabelsalat/overview.json`, key
+`tagger_command` (an argv array; default
+`["claude", "-p", "--model", "haiku", "--output-format", "json"]`), and key
+`roles` overrides the default role list `planning`, `implementing`,
+`researching`, `related`; a missing file means defaults. Data issues — an
+unparsable file, a duplicate id, a reference to a node that does not exist, a
+parent cycle, or a tab working on two nodes with no edge between them — are
+listed in a tray on the map, each with a **Resolve** button that opens a
+`claude` tab in the group with the issue and the files involved, under the
+same no-focus rules as `kabelsalat run`.
+
+Without tmux (or tmux < 3.2) the overview works, but the tags live in memory
+and are lost on restart. Without a working tagger command the overview works
+without tab links, and the empty tab panels say that tagging is unavailable.
 
 ### Browser automation (CDP)
 

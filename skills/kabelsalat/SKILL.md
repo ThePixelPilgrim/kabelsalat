@@ -1,6 +1,6 @@
 ---
 name: kabelsalat
-description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess; not for commands whose output you need to capture or read back. Also use to read, screenshot or drive the page in the user's embedded browser pane (CDP/Playwright), or Firefox for Android in the Android pane (Waydroid, WebDriver BiDi over adb). All of these live in the named groups of the user's running kabelsalat terminal.
+description: Use when a command should run in a visible, persistent terminal the user can watch and interact with — a dev server, a long build, or an interactive claude session — rather than as a captured subprocess; not for commands whose output you need to capture or read back. Also use to read, screenshot or drive the page in the user's embedded browser pane (CDP/Playwright), or Firefox for Android in the Android pane (Waydroid, WebDriver BiDi over adb). Also use to set a group's overview root or check its overview data for issues (`kabelsalat overview`), and before writing the Markdown node files that overview draws. All of these live in the named groups of the user's running kabelsalat terminal.
 ---
 
 # Launching terminals in kabelsalat
@@ -78,10 +78,10 @@ anything.
 
 | Code | Meaning | What to do |
 |------|---------|------------|
-| 0 | Tab created | Tell the user which group it went to |
+| 0 | Tab created; (overview issues) the data is clean when nothing was printed | Tell the user which group it went to |
 | 1 | kabelsalat is not running | Report this to the user and stop. Do not retry, and do not try to start it — that is theirs to do |
-| 2 | Usage error | Fix the invocation; check `--` is present |
-| 3 | Group not found, ambiguous, (rename) name already in use, (browser, android) a remote group, (android) Android owned by another group or not open, or its pane did not answer | Re-run `kabelsalat groups` and retry with a uuid, or pick a different name; for Android, tell the user which group has it |
+| 2 | Usage error, (overview root) `DIR` does not exist | Fix the invocation; check `--` is present, or create the directory first |
+| 3 | Group not found, ambiguous, (rename) name already in use, (browser, android, overview) a remote group, (android) Android owned by another group or not open, or its pane did not answer | Re-run `kabelsalat groups` and retry with a uuid, or pick a different name; for Android, tell the user which group has it |
 | 4 | (android subcommand) the pane refused the request | Read the message; fix the arguments |
 
 ## After launching
@@ -445,3 +445,40 @@ first click after the pointer enters the pane can register as a swipe from
 the top edge, opening the notification shade: press `kabelsalat android key
 escape` and tap again. For text, use `kabelsalat android type '…'`, never a
 multi-character `key`: key names go through a US keymap.
+
+## Keeping the group's overview current
+
+Each group can show an overview instead of its terminals: a map of nodes —
+projects, decisions, themes, whatever the project calls them — read from
+Markdown files with YAML frontmatter below one directory of the repository,
+with the group's tabs drawn on the nodes they work on. The format is
+documented in [overview-format.md](overview-format.md); read it before
+creating or editing node files. The files are yours to keep current;
+kabelsalat only draws them.
+
+    kabelsalat overview root [-g <name|uuid>] DIR    # draw <group>'s overview from the *.md files below DIR
+    kabelsalat overview root [-g <name|uuid>] --clear
+    kabelsalat overview issues [-g <name|uuid>]
+
+`DIR` is resolved against your working directory and must exist (exit 2
+otherwise). `-g` defaults to your `KABELSALAT_GROUP`; outside a kabelsalat
+tab it is required. None of these commands switch the group to its overview,
+change the active group or take focus — the user flips the "Terminals |
+Overview" toggle in the header bar themselves, so tell them the root is set.
+Remote groups have no overview (exit 3).
+
+`issues` prints the group's current data issues, one per line, tab-separated:
+issue kind, node ids joined by `,`, file (empty when the issue is not about
+one file), detail. No output and exit 0 means the data is clean. The kinds
+are `unreadable-file`, `duplicate-id`, `unknown-node`, `parent-cycle` and
+`missing-link`; what each means and how to fix it is in the format page.
+
+    unknown-node	adr-118,adr-999	docs/adr/adr-118.md	links target 'adr-999' does not exist
+    missing-link	adr-064,adr-118		tab 'recovery flow' links both; no edge between them
+
+Which tab works on which node is inferred by kabelsalat from the tab's recent
+work and kept in the tab's tmux environment, never in the repository: do not
+write tab links into node files. A **Resolve** button on an issue in the GUI
+opens a `claude` tab in the group with the issue and the files involved; if
+you were started that way, fix the data per the format page and re-run
+`kabelsalat overview issues` to confirm.
