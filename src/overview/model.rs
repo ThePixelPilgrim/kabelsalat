@@ -703,6 +703,29 @@ impl Graph {
             || self.edges.contains(&(b.to_string(), a.to_string()))
     }
 
+    /// The node a link in a rendered body points at: `href` is a node id, or
+    /// a path to a node's file — absolute, relative to any ancestor directory
+    /// (a path suffix), or just the file name — with or without the `.md`
+    /// extension, a leading `./`, or a `#fragment`. URLs with a scheme and
+    /// unknown targets give `None`.
+    pub fn node_for_href(&self, href: &str) -> Option<&Node> {
+        let href = href.split(['#', '?']).next().unwrap_or("");
+        if href.is_empty() || href.contains("://") {
+            return None;
+        }
+        if let Some(node) = self.nodes.get(href) {
+            return Some(node);
+        }
+        let target = Path::new(href.strip_prefix("./").unwrap_or(href));
+        let with_md = target.with_extension("md");
+        let wanted = if target.extension().is_some() {
+            target
+        } else {
+            with_md.as_path()
+        };
+        self.nodes.values().find(|n| n.file.ends_with(wanted))
+    }
+
     pub fn issues(&self) -> &[FormatIssue] {
         &self.issues
     }
@@ -1420,5 +1443,27 @@ owner: ops\ntags: [security, access]\n---\n# ADR-118: Emergency access account\n
         assert_eq!(sources[0].0, dir);
         assert!(sources[0].1.is_err());
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    // --- links in rendered bodies ---
+
+    #[test]
+    fn body_link_targets_resolve_to_nodes_by_id_or_file() {
+        let graph = Graph::build(vec![
+            src("/r/docs/a.md", &fm("A-1", "")),
+            src("/r/docs/sub/b.md", &fm("B-2", "")),
+        ]);
+        fn id(n: Option<&Node>) -> Option<&str> {
+            n.map(|n| n.id.as_str())
+        }
+        assert_eq!(id(graph.node_for_href("A-1")), Some("A-1"));
+        assert_eq!(id(graph.node_for_href("b.md")), Some("B-2"));
+        assert_eq!(id(graph.node_for_href("sub/b.md")), Some("B-2"));
+        assert_eq!(id(graph.node_for_href("./sub/b")), Some("B-2"));
+        assert_eq!(id(graph.node_for_href("/r/docs/a.md")), Some("A-1"));
+        assert_eq!(id(graph.node_for_href("a.md#context")), Some("A-1"));
+        assert_eq!(id(graph.node_for_href("https://example.org/a.md")), None);
+        assert_eq!(id(graph.node_for_href("c.md")), None);
+        assert_eq!(id(graph.node_for_href("")), None);
     }
 }
