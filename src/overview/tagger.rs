@@ -7,6 +7,7 @@
 //! and uuids come in as values; the only I/O is `load_config`, kept thin.
 //! No GTK, no tmux, nothing from the other overview modules.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -182,8 +183,10 @@ pub fn unchanged(mark: Option<&Watermark>, size: u64, last_uuid: Option<&str>) -
 /// The part of a transcript written since a watermark.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Delta {
-    /// `user` messages that are not tool results.
+    /// `user` messages that are not tool results or injected text.
     pub user_prompts: usize,
+    /// Distinct assistant API messages: Claude Code writes one line per
+    /// content block, all carrying the same `message.id`.
     pub assistant_messages: usize,
     /// Message text only, as "user: …\n" / "assistant: …\n" lines.
     pub text: String,
@@ -202,12 +205,21 @@ struct Line {
     uuid: Option<String>,
     #[serde(rename = "isSidechain", default)]
     is_sidechain: bool,
+    /// Text the harness injected (caveats, skill text, hook feedback).
+    #[serde(rename = "isMeta", default)]
+    is_meta: bool,
+    /// The summary `/compact` writes in place of the earlier conversation.
+    #[serde(rename = "isCompactSummary", default)]
+    is_compact_summary: bool,
     #[serde(default)]
     message: Option<Message>,
 }
 
 #[derive(Deserialize)]
 struct Message {
+    /// The API message id, shared by all lines of one assistant message.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     content: serde_json::Value,
 }
@@ -229,7 +241,7 @@ fn parse_line(line: &str) -> Option<Line> {
 }
 
 /// What the line says, or `None` for lines that are not conversation
-/// (summaries, system lines, sidechains, tool results only).
+/// (summaries, system lines, sidechains, tool results only, injected text).
 fn said(line: &Line) -> Option<Said> {
     if line.is_sidechain {
         return None;
@@ -239,6 +251,10 @@ fn said(line: &Line) -> Option<Said> {
         Some("assistant") => "assistant",
         _ => return None,
     };
+    if role == "user" && (line.is_meta || line.is_compact_summary) {
+        // Written by the harness, not typed by the user.
+        return None;
+    }
     let content = line.message.as_ref().map(|m| &m.content)?;
     let (text, has_text) = match content {
         serde_json::Value::String(s) => (s.clone(), true),
@@ -280,7 +296,11 @@ pub fn delta_since(transcript: &str, mark: Option<&Watermark>) -> Delta {
         end_offset: transcript.len() as u64,
         ..Delta::default()
     };
-    for line in lines.into_iter().skip(start).flatten() {
+    // Assistant messages already counted, by `message.id`, else by uuid,
+    // else by line number.
+    let mut seen_assistant: HashSet<String> = HashSet::new();
+    for (index, line) in lines.into_iter().enumerate().skip(start) {
+        let Some(line) = line else { continue };
         if let Some(uuid) = &line.uuid {
             delta.last_uuid = Some(uuid.clone());
         }
@@ -288,7 +308,15 @@ pub fn delta_since(transcript: &str, mark: Option<&Watermark>) -> Delta {
         if said.is_prompt {
             delta.user_prompts += 1;
         } else {
-            delta.assistant_messages += 1;
+            let key = line
+                .message
+                .as_ref()
+                .and_then(|m| m.id.clone())
+                .or_else(|| line.uuid.clone())
+                .unwrap_or_else(|| format!("line:{index}"));
+            if seen_assistant.insert(key) {
+                delta.assistant_messages += 1;
+            }
         }
         if !said.text.is_empty() {
             delta.text.push_str(said.role);
@@ -601,6 +629,90 @@ mod tests {
             "user: hi\nassistant: hello\nassistant: first\nsecond\n"
         );
         assert_eq!(d.last_uuid.as_deref(), Some("a2"));
+    }
+
+    fn assistant_block(uuid: &str, message_id: &str, block: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","uuid":"{uuid}","message":{{"id":"{message_id}","role":"assistant","content":[{block}]}}}}"#
+        )
+    }
+
+    /// One API message as Claude Code writes it: thinking, text and a tool
+    /// call on three lines sharing one `message.id`.
+    fn three_line_message(n: usize) -> [String; 3] {
+        let id = format!("msg_{n}");
+        [
+            assistant_block(
+                &format!("a{n}-think"),
+                &id,
+                r#"{"type":"thinking","thinking":"hm","signature":"s"}"#,
+            ),
+            assistant_block(
+                &format!("a{n}-text"),
+                &id,
+                &format!(r#"{{"type":"text","text":"reply {n}"}}"#),
+            ),
+            assistant_block(
+                &format!("a{n}-tool"),
+                &id,
+                r#"{"type":"tool_use","id":"t1","name":"Bash","input":{}}"#,
+            ),
+        ]
+    }
+
+    #[test]
+    fn assistant_lines_sharing_a_message_id_count_as_one_message() {
+        let t = joined(&three_line_message(1));
+        let d = delta_since(&t, None);
+        assert_eq!(d.assistant_messages, 1);
+        assert_eq!(d.text, "assistant: reply 1\n");
+        assert_eq!(d.last_uuid.as_deref(), Some("a1-tool"));
+    }
+
+    #[test]
+    fn six_multi_line_messages_are_significant_two_are_not() {
+        let two: Vec<String> = (1..=2).flat_map(three_line_message).collect();
+        let d = delta_since(&joined(&two), None);
+        assert_eq!(d.assistant_messages, 2);
+        assert!(!significant(&d));
+        let six: Vec<String> = (1..=6).flat_map(three_line_message).collect();
+        let d = delta_since(&joined(&six), None);
+        assert_eq!(d.assistant_messages, 6);
+        assert!(significant(&d));
+    }
+
+    #[test]
+    fn assistant_lines_without_a_message_id_count_per_line() {
+        let t = joined(&[
+            assistant("a1", "one"),
+            assistant("a2", "two"),
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"three"}]}}"#.to_string(),
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"four"}]}}"#.to_string(),
+        ]);
+        let d = delta_since(&t, None);
+        assert_eq!(d.assistant_messages, 4);
+    }
+
+    #[test]
+    fn meta_user_lines_are_not_prompts() {
+        let meta = r#"{"type":"user","uuid":"m1","isMeta":true,"message":{"role":"user","content":"Caveat: injected text"}}"#.to_string();
+        let t = joined(&[meta, assistant("a1", "ok")]);
+        let d = delta_since(&t, None);
+        assert_eq!(d.user_prompts, 0);
+        assert_eq!(d.assistant_messages, 1);
+        assert_eq!(d.text, "assistant: ok\n");
+        assert_eq!(d.last_uuid.as_deref(), Some("a1"));
+        assert!(!significant(&d));
+    }
+
+    #[test]
+    fn compact_summary_user_lines_are_not_prompts() {
+        let summary = r#"{"type":"user","uuid":"c1","isCompactSummary":true,"message":{"role":"user","content":[{"type":"text","text":"This session is being continued..."}]}}"#.to_string();
+        let d = delta_since(&joined(&[summary]), None);
+        assert_eq!(d.user_prompts, 0);
+        assert_eq!(d.text, "");
+        assert_eq!(d.last_uuid.as_deref(), Some("c1"));
+        assert!(!significant(&d));
     }
 
     #[test]
