@@ -1102,8 +1102,12 @@ pub fn dispatch(cli: &Cli, groups: &[GroupInfo], caller_cwd: &Path) -> Outcome {
                 action: Some(Action::SetOverviewRoot {
                     group_uuid: target.uuid.clone(),
                     // `join` with an absolute path replaces the base, so this
-                    // handles both absolute and relative directories.
-                    root: root.as_ref().map(|dir| caller_cwd.join(dir)),
+                    // handles both absolute and relative directories. The
+                    // lexical cleanup makes the stored root the path gio
+                    // later reports events under.
+                    root: root
+                        .as_ref()
+                        .map(|dir| normalize_lexically(&caller_cwd.join(dir))),
                 }),
             }
         }
@@ -1164,6 +1168,31 @@ pub fn check_overview_root(action: &Action, is_dir: impl Fn(&Path) -> bool) -> O
         )),
         _ => None,
     }
+}
+
+/// `path` with `.` dropped and `..` resolved against the preceding component,
+/// lexically, the way glib's `g_canonicalize_filename` does it: gio reports
+/// monitor events under that form, so a stored root must match it or later
+/// events never find their source. Nothing is read from the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `/..` is `/`.
+                Some(Component::RootDir) => {}
+                // A leading `..` of a relative path has nothing to cancel.
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The shared `run`/`rename` wording for a selector that matched nothing or
@@ -2647,6 +2676,58 @@ mod tests {
                 group_uuid: "bbb-222".into(),
                 root: Some(PathBuf::from("/srv/notes")),
             })
+        );
+    }
+
+    #[test]
+    fn overview_root_normalises_dot_and_dotdot_lexically() {
+        // gio reports monitor events under the canonical path, so the stored
+        // root must already be the clean one or later events never match.
+        let out = dispatch(
+            &overview_root("web", Some("../y/./z")),
+            &overview_groups(),
+            Path::new("/w/x"),
+        );
+        assert_eq!(out.code, EXIT_OK);
+        assert_eq!(
+            out.action,
+            Some(Action::SetOverviewRoot {
+                group_uuid: "aaa-111".into(),
+                root: Some(PathBuf::from("/w/y/z")),
+            })
+        );
+        let absolute = dispatch(
+            &overview_root("web", Some("/r/sub/../docs/.")),
+            &overview_groups(),
+            Path::new("/w/x"),
+        );
+        assert_eq!(
+            absolute.action,
+            Some(Action::SetOverviewRoot {
+                group_uuid: "aaa-111".into(),
+                root: Some(PathBuf::from("/r/docs")),
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_lexically_stops_at_the_root_and_keeps_plain_paths() {
+        assert_eq!(
+            normalize_lexically(Path::new("/a/../../b")),
+            PathBuf::from("/b")
+        );
+        assert_eq!(normalize_lexically(Path::new("/")), PathBuf::from("/"));
+        assert_eq!(
+            normalize_lexically(Path::new("/srv/notes")),
+            PathBuf::from("/srv/notes")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("./a/../b")),
+            PathBuf::from("b")
+        );
+        assert_eq!(
+            normalize_lexically(Path::new("../a")),
+            PathBuf::from("../a")
         );
     }
 
