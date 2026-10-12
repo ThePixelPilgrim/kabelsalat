@@ -1003,8 +1003,8 @@ pub enum Msg {
     OverviewLoaded {
         group_id: usize,
         token: u64,
-        loaded: Loaded,
-        layout: Layout,
+        /// Boxed: a graph and its layout dwarf every other message.
+        loaded: Box<(Loaded, Layout)>,
     },
     /// Periodic scan for tabs whose transcript grew enough to re-tag.
     OverviewScan,
@@ -2330,8 +2330,8 @@ impl SimpleComponent for App {
                 group_id,
                 token,
                 loaded,
-                layout,
             } => {
+                let (loaded, layout) = *loaded;
                 self.overview_loaded(group_id, token, loaded, layout);
                 return;
             }
@@ -7107,8 +7107,7 @@ impl App {
             let _ = input.send(Msg::OverviewLoaded {
                 group_id,
                 token,
-                loaded,
-                layout,
+                loaded: Box::new((loaded, layout)),
             });
         });
     }
