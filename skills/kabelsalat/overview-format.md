@@ -13,8 +13,16 @@ The user names one directory per group as the overview root (`kabelsalat
 overview root DIR`). Every `*.md` file below it whose content starts with a
 YAML frontmatter block — a `---` line, YAML, a `---` line — containing an
 `id` is a node. Files without such a block or without an `id` are ignored, as
-is every directory whose name starts with `.`. The Markdown after the
-frontmatter is the node's body.
+is every directory whose name starts with `.`; symlinked directories are not
+followed, and only the exact extension `.md` is read (not `.markdown` or
+`.mdx`). The Markdown after the frontmatter is the node's body.
+
+Make the root the directory that holds the node files (`docs/`, `overview/`),
+not the whole repository: everything below it is read and watched, which for
+a repository root means `target/`, `node_modules/` and the like. A root
+without a single node file shows "No node files below the root" in the GUI
+with a setup checklist; the same checklist is behind the `?` button next to
+the zoom controls while the map is up.
 
     ---
     id: adr-118
@@ -133,9 +141,10 @@ Check your work without the GUI:
 One line per issue, tab-separated: the issue kind as in the table, the node
 ids involved joined by `,`, the file as an absolute path (empty when the issue
 is not about one file), and a detail sentence for humans — read it, do not
-parse it. No output and exit 0 means the data is clean. Exit 1 means
-kabelsalat is not running; exit 3 an unknown, ambiguous or remote group —
-remote groups have no overview.
+parse it. No output and exit 0 means the data is clean — or that no node
+file was found at all, which the GUI shows as "No node files below the
+root". Exit 1 means kabelsalat is not running; exit 3 an unknown, ambiguous
+or remote group — remote groups have no overview.
 
     unknown-node	adr-118,adr-999	/home/you/project/docs/adr/adr-118.md	'adr-118' links to unknown node 'adr-999' under 'builds-on'
     missing-link	adr-064,adr-118		tab 'recovery flow' links both; no edge between them

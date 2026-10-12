@@ -55,6 +55,11 @@ This file provides guidance to Claude Code when working with code in this reposi
   monitors, tagger scheduling and `tmux set-environment`. Tab ↔ node links
   are inferred by the tagger and live in the tab's tmux environment only:
   never in the repository, never in `state.json`.
+- Nothing reads an overview root or a claude transcript on the GTK thread:
+  `model::load_root` and `tagger::input` run on worker threads spawned from
+  `src/app.rs`, which only installs their results (`Msg::OverviewLoaded`,
+  `Msg::TaggerDone`) and creates the file monitors. A stale load result (the
+  group's root or load token changed meanwhile) is dropped.
 - `src/autostart.rs` is pure over the facts it is handed (unit text, status
   classification, dialog responses) plus thin `systemctl --user` runners;
   `src/resume.rs` is the `kabelsalat resume` glue and never writes

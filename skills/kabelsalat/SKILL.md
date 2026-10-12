@@ -465,12 +465,15 @@ otherwise). `-g` defaults to your `KABELSALAT_GROUP`; outside a kabelsalat
 tab it is required. None of these commands switch the group to its overview,
 change the active group or take focus — the user flips the "Terminals |
 Overview" toggle in the header bar themselves, so tell them the root is set.
-Remote groups have no overview (exit 3).
+Remote groups have no overview (exit 3). Point `DIR` at the directory that
+holds the node files, not at the repository root: everything below it is
+read, and a root without a node file shows "No node files below the root"
+with a setup checklist instead of a map.
 
 `issues` prints the group's current data issues, one per line, tab-separated:
 issue kind, node ids joined by `,`, the file's absolute path (empty when the
 issue is not about one file), detail. No output and exit 0 means the data is
-clean. The kinds are `unreadable-file`, `duplicate-id`, `unknown-node`,
+clean (or that no node file was found: check the GUI's empty page). The kinds are `unreadable-file`, `duplicate-id`, `unknown-node`,
 `parent-cycle` and `missing-link`; what each means and how to fix it is in the
 format page.
 

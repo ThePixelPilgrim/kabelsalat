@@ -421,15 +421,19 @@ fn scan_dir(dir: &Path, depth: usize, out: &mut Vec<Source>) {
         }
     };
     for entry in entries {
-        let path = match entry {
-            Ok(entry) => entry.path(),
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(e) => {
                 out.push((dir.to_path_buf(), Err(e.to_string())));
                 continue;
             }
         };
+        let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if path.is_dir() {
+        // `file_type` does not follow symlinks, so a symlinked directory is
+        // neither read nor (in `overview_dirs`) watched; `is_dir` would.
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_dir {
             if !name.starts_with('.') && depth < MAX_SCAN_DEPTH {
                 scan_dir(&path, depth + 1, out);
             }
@@ -441,13 +445,102 @@ fn scan_dir(dir: &Path, depth: usize, out: &mut Vec<Source>) {
 }
 
 /// Every `*.md` file below `root`, sorted by path, with its contents (or the
-/// read error). Directories whose name starts with `.` are skipped; a
-/// directory that cannot be listed (the root included) is one `Err` source.
+/// read error). Directories whose name starts with `.` and symlinked
+/// directories are skipped; a directory that cannot be listed (the root
+/// included) is one `Err` source.
 pub fn scan_root(root: &Path) -> Vec<Source> {
     let mut out = Vec::new();
     scan_dir(root, 0, &mut out);
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// `root` and every directory below it, breadth first, as `scan_root` walks
+/// them: directories whose name starts with `.` and symlinks are skipped.
+pub fn overview_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![root.to_path_buf()];
+    let mut next = 0;
+    while next < dirs.len() {
+        if let Ok(entries) = std::fs::read_dir(&dirs[next]) {
+            for entry in entries.flatten() {
+                let hidden = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with('.'));
+                if !hidden && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        next += 1;
+    }
+    dirs
+}
+
+/// What one read of an overview root yields. Pure over the file system, so
+/// the GUI computes it on a worker thread: a repository root can hold
+/// thousands of files, and reading them all on the GTK thread freezes the
+/// window.
+#[derive(Debug, Clone, Default)]
+pub struct Loaded {
+    /// Why the root could not be read (the empty state's text). The graph
+    /// is empty and `dirs` holds nothing then.
+    pub error: Option<String>,
+    pub graph: Graph,
+    /// The root and every directory below it, for the directory monitors.
+    pub dirs: Vec<PathBuf>,
+}
+
+/// Read `root`: the graph of its node files and the directories to watch.
+/// A root that is not a directory, or a directory that cannot be listed, is
+/// as unreadable as a missing one — the error state, not a blank map with
+/// an "unreadable file" issue naming the root.
+pub fn load_root(root: &Path) -> Loaded {
+    let error = match std::fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => std::fs::read_dir(root).err().map(|e| e.to_string()),
+        Ok(_) => Some("not a directory".to_string()),
+        Err(err) => Some(err.to_string()),
+    };
+    if let Some(error) = error {
+        return Loaded {
+            error: Some(error),
+            ..Loaded::default()
+        };
+    }
+    Loaded {
+        error: None,
+        graph: Graph::build(scan_root(root)),
+        dirs: overview_dirs(root),
+    }
+}
+
+/// What a repository needs for its overview to show something: the empty
+/// states and the map's help button list these, in this order. Plain text;
+/// the GUI escapes and lays it out.
+pub fn setup_checklist() -> &'static [&'static str] {
+    &[
+        "Pick one directory for the node files, such as docs/ or overview/, \
+         not the whole repository: every *.md file below the root is read.",
+        "Name node files *.md and keep them out of directories whose name \
+         starts with a dot; symlinked directories are not followed.",
+        "Start each node file on line 1 with a YAML frontmatter block: a --- \
+         line, the YAML, a --- line. Files without one are ignored.",
+        "Give every node an id of A-Z a-z 0-9 . _ - that is unique within the \
+         root. A frontmatter block without an id is not a node and raises no \
+         issue.",
+        "One node per file. Nesting comes from parent (the id of an existing \
+         node, no cycles), not from directories; edges go under links only, \
+         as edge name: id or list of ids.",
+        "Optional: title, kind, summary (one line) and status. A kind node \
+         (kind: kind, title: <kind>, color, statuses) styles a kind and is not \
+         drawn, so a root holding only kind nodes shows nothing.",
+        "Set the root with kabelsalat overview root -g <group> DIR, then flip \
+         Terminals | Overview in the header bar yourself.",
+        "Check with kabelsalat overview issues -g <group>: no output means no \
+         issues — and also no nodes, if none was found.",
+        "Never write tab links into node files: tabs are linked by the tagger, \
+         which needs claude on PATH or a tagger_command in overview.json.",
+    ]
 }
 
 /// `path` with `.md` added when it has no extension.
@@ -1685,5 +1778,86 @@ owner: ops\ntags: [security, access]\n---\n# ADR-118: Emergency access account\n
         assert_eq!(id(graph.node_for_href("../projects/p.md")), None);
         assert_eq!(id(graph.node_for_href_from("https://x/p.md", from)), None);
         assert_eq!(id(graph.node_for_href_from("", from)), None);
+    }
+
+    // --- load_root / overview_dirs ---
+
+    #[test]
+    fn overview_dirs_walks_below_the_root_and_skips_dot_dirs_and_symlinks() {
+        let root = tmp_dir("dirs");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join("a/n.md"), "x").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("a/loop")).unwrap();
+        let mut dirs = overview_dirs(&root);
+        dirs.sort();
+        assert_eq!(dirs, vec![root.clone(), root.join("a"), root.join("a/b")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_root_does_not_follow_symlinked_directories() {
+        let root = tmp_dir("scan-symlink");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/n.md"), "---\nid: n\n---\n").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("a/loop")).unwrap();
+        let sources = scan_root(&root);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].0, root.join("a/n.md"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_root_reads_the_graph_and_lists_the_directories_to_watch() {
+        let root = tmp_dir("load");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("a/n.md"), "---\nid: n\n---\n").unwrap();
+        std::fs::write(root.join(".hidden/h.md"), "---\nid: h\n---\n").unwrap();
+        let loaded = load_root(&root);
+        assert_eq!(loaded.error, None);
+        assert!(loaded.graph.node("n").is_some());
+        assert!(loaded.graph.node("h").is_none());
+        let mut dirs = loaded.dirs;
+        dirs.sort();
+        assert_eq!(dirs, vec![root.clone(), root.join("a"), root.join("a/b")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_root_of_a_missing_root_or_a_file_is_the_error_state() {
+        let root = tmp_dir("load-missing");
+        let missing = load_root(&root.join("nope"));
+        assert!(missing.error.is_some());
+        assert!(missing.graph.is_empty());
+        assert!(missing.dirs.is_empty());
+        std::fs::write(root.join("f.md"), "---\nid: f\n---\n").unwrap();
+        let file = load_root(&root.join("f.md"));
+        assert_eq!(file.error.as_deref(), Some("not a directory"));
+        assert!(file.graph.is_empty());
+        assert!(file.dirs.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- setup checklist ---
+
+    #[test]
+    fn the_setup_checklist_names_what_a_node_file_and_a_root_need() {
+        let text = setup_checklist().join("\n");
+        for needle in [
+            "---",
+            "id",
+            ".md",
+            "starts with a dot",
+            "parent",
+            "links",
+            "kind: kind",
+            "kabelsalat overview root",
+            "kabelsalat overview issues",
+            "not the whole repository",
+        ] {
+            assert!(text.contains(needle), "checklist lacks {needle:?}:\n{text}");
+        }
+        assert!(setup_checklist().iter().all(|item| !item.trim().is_empty()));
     }
 }

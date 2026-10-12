@@ -505,6 +505,80 @@ pub fn title_input(title: &str) -> (Watermark, String) {
     )
 }
 
+/// What the tagger gets for a tab, and the watermark that run will leave:
+/// the transcript since `mark` when `transcript` names a claude transcript
+/// that grew significantly, else the title when it changed. `None` when
+/// there is nothing new (keeping the old mark). Reads the file, so it runs
+/// on the tagger's thread: a long session's transcript is tens of MB.
+pub fn input(
+    transcript: Option<&Path>,
+    mark: Option<&Watermark>,
+    title: &str,
+) -> Option<(Watermark, String)> {
+    // A transcript that is not there yet falls through to the title; one
+    // that cannot be read waits for the next scan.
+    if let Some(path) = transcript
+        && let Ok(meta) = std::fs::metadata(path)
+    {
+        let size = meta.len();
+        // The cheap check (spec section 5, step 2): a size that matches the
+        // mark reads only the tail for the last uuid, and the whole
+        // transcript only when something changed, or the tail cannot decide.
+        if let Some(Watermark::Transcript { uuid, offset }) = mark
+            && *offset == size
+            && let Some(tail) = transcript_tail(path, size)
+            && last_uuid(&tail).as_deref() == Some(uuid.as_str())
+        {
+            return None;
+        }
+        let text = std::fs::read_to_string(path).ok()?;
+        let last = last_uuid(&text);
+        if unchanged(mark, size, last.as_deref()) {
+            return None;
+        }
+        let delta = delta_since(&text, mark);
+        if !significant(&delta) {
+            return None;
+        }
+        let previous = match mark {
+            Some(Watermark::Transcript { uuid, .. }) => Some(uuid.clone()),
+            _ => None,
+        };
+        let uuid = delta.last_uuid.clone().or(last).or(previous)?;
+        return Some((
+            Watermark::Transcript {
+                uuid,
+                offset: delta.end_offset,
+            },
+            delta.text,
+        ));
+    }
+    let (title_mark, text) = title_input(title);
+    if mark == Some(&title_mark) {
+        return None;
+    }
+    Some((title_mark, text))
+}
+
+/// How much of a transcript's end the cheap check reads to find its last
+/// message uuid: well beyond one line, even one carrying a large tool
+/// result, so the tail nearly always decides without the whole file.
+pub const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// The last `TRANSCRIPT_TAIL_BYTES` of the `size`-byte file at `path` (all
+/// of it when shorter), lossily decoded; `None` when it cannot be read. A
+/// cut first line (or character) fails to parse and is skipped by
+/// `last_uuid`, which searches from the end.
+pub fn transcript_tail(path: &Path, size: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(size.saturating_sub(TRANSCRIPT_TAIL_BYTES)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,5 +1134,91 @@ mod tests {
         assert_eq!(mark, Watermark::Title("vim: notes.md".to_string()));
         assert!(text.contains("vim: notes.md"));
         assert_eq!(mark.render(), "title:vim: notes.md");
+    }
+
+    // --- input over a transcript path ---
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kabelsalat-tagger-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn input_without_a_transcript_is_the_title_until_it_was_seen() {
+        let (mark, text) = input(None, None, "building").unwrap();
+        assert_eq!(mark, Watermark::Title("building".into()));
+        assert!(text.contains("title: building"));
+        assert_eq!(input(None, Some(&mark), "building"), None);
+        assert!(input(None, Some(&mark), "testing").is_some());
+        // A transcript that is not there yet falls through to the title too.
+        let dir = tmp_dir("input-missing");
+        assert_eq!(
+            input(Some(&dir.join("none.jsonl")), Some(&mark), "building"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn input_reads_the_transcript_since_the_mark_and_marks_its_end() {
+        let dir = tmp_dir("input");
+        let path = dir.join("s.jsonl");
+        let transcript = format!("{}\n{}\n", user("u1", "hi there"), assistant("a1", "hello"));
+        std::fs::write(&path, &transcript).unwrap();
+        let (mark, text) = input(Some(&path), None, "t").unwrap();
+        assert_eq!(
+            mark,
+            Watermark::Transcript {
+                uuid: "a1".into(),
+                offset: transcript.len() as u64
+            }
+        );
+        assert!(text.contains("user: hi there"));
+        // Nothing new since that mark: no input, whatever the title says.
+        assert_eq!(input(Some(&path), Some(&mark), "other"), None);
+        // One more assistant line is not significant yet.
+        let mut grown = transcript.clone();
+        grown.push_str(&assistant("a2", "more"));
+        grown.push('\n');
+        std::fs::write(&path, &grown).unwrap();
+        assert_eq!(input(Some(&path), Some(&mark), "t"), None);
+        // A new prompt is.
+        grown.push_str(&user("u2", "and now?"));
+        grown.push('\n');
+        std::fs::write(&path, &grown).unwrap();
+        let (mark2, text2) = input(Some(&path), Some(&mark), "t").unwrap();
+        assert_eq!(
+            mark2,
+            Watermark::Transcript {
+                uuid: "u2".into(),
+                offset: grown.len() as u64
+            }
+        );
+        assert!(text2.contains("user: and now?"));
+        assert!(!text2.contains("hi there"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_transcript_tail_is_the_last_256_kib_or_the_whole_short_file() {
+        let dir = tmp_dir("tail");
+        let long = dir.join("long.jsonl");
+        let mut body = "a".repeat(300_000);
+        body.push_str("\nlast line");
+        std::fs::write(&long, &body).unwrap();
+        let size = std::fs::metadata(&long).unwrap().len();
+        let tail = transcript_tail(&long, size).unwrap();
+        assert_eq!(tail.len() as u64, TRANSCRIPT_TAIL_BYTES);
+        assert!(tail.ends_with("\nlast line"));
+        let short = dir.join("short.jsonl");
+        std::fs::write(&short, "one\ntwo").unwrap();
+        assert_eq!(transcript_tail(&short, 7).as_deref(), Some("one\ntwo"));
+        assert_eq!(transcript_tail(&dir.join("missing"), 7), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

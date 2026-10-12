@@ -22,7 +22,7 @@ use crate::control;
 use crate::overview::canvas::{Callbacks, EmptyState, OverviewView, TabChip, Unmapped};
 use crate::overview::issues::{self, Issue, TaggedTab};
 use crate::overview::layout::{self, Layout, Metrics};
-use crate::overview::model::{Graph, Source, scan_root};
+use crate::overview::model::{Graph, Loaded, Source, load_root, overview_dirs, scan_root};
 use crate::overview::tagger::{self, ENV_LINKS, ENV_TAG_MARK, NodeSummary, Tags, Watermark};
 use crate::remote::{self, HostState, RemoteError};
 use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
@@ -399,7 +399,8 @@ pub struct Tab {
     tags: Option<Tags>,
     /// Where the last tagger run left off (`KABELSALAT_TAG_MARK`).
     tag_mark: Option<Watermark>,
-    /// When the tagger last ran for this tab; drives the per-tab rate limit.
+    /// When the tagger last looked at this tab (a run, or a check that found
+    /// nothing new); drives the per-tab rate limit.
     last_tag_run: Option<Instant>,
 }
 
@@ -449,6 +450,10 @@ pub struct Group {
     /// snapshot's issues come from here, so it must not wait for the map to
     /// be shown.
     overview: Option<OverviewData>,
+    /// The token of the load in flight for this group's root, if any. The
+    /// root is read on a worker thread (see `load_overview`); a result
+    /// carrying another token is stale and dropped.
+    overview_load: Option<u64>,
 }
 
 /// A group's overview as loaded from its root. `monitors` must stay stored:
@@ -992,15 +997,24 @@ pub enum Msg {
         group_id: usize,
         path: PathBuf,
     },
+    /// The worker thread read a group's overview root: the result of
+    /// `load_overview`'s `token`, applied only while that token is still
+    /// the group's pending one.
+    OverviewLoaded {
+        group_id: usize,
+        token: u64,
+        loaded: Loaded,
+        layout: Layout,
+    },
     /// Periodic scan for tabs whose transcript grew enough to re-tag.
     OverviewScan,
-    /// The off-thread tagger finished for a tab: its uuid, the watermark the
-    /// run covered (rendered), and stdout or the failure. A failure keeps the
-    /// tab's previous tags and mark.
+    /// The off-thread tagger finished for a tab: its uuid and, when the
+    /// transcript had enough new text to run on, the watermark the run
+    /// covered (rendered) with stdout or the failure. `None` = nothing new,
+    /// no run. A failure keeps the tab's previous tags and mark.
     TaggerDone {
         tab_uuid: String,
-        mark: String,
-        result: Result<String, String>,
+        run: Option<(String, Result<String, String>)>,
     },
     /// A remote host's worker reported back.
     Remote {
@@ -2311,6 +2325,16 @@ impl SimpleComponent for App {
                 self.overview_dir_removed(group_id, &path);
                 return;
             }
+            // The root was saved when it was set; the loaded data is runtime.
+            Msg::OverviewLoaded {
+                group_id,
+                token,
+                loaded,
+                layout,
+            } => {
+                self.overview_loaded(group_id, token, loaded, layout);
+                return;
+            }
             // Like the other ticks: starting a run writes nothing.
             Msg::OverviewScan => {
                 self.overview_scan();
@@ -2318,12 +2342,8 @@ impl SimpleComponent for App {
             }
             // Tags live on the tmux session (or in memory), never in the
             // state file: no save here either.
-            Msg::TaggerDone {
-                tab_uuid,
-                mark,
-                result,
-            } => {
-                self.tagger_done(&tab_uuid, &mark, result);
+            Msg::TaggerDone { tab_uuid, run } => {
+                self.tagger_done(&tab_uuid, run);
                 return;
             }
             Msg::RenameGroup { group_uuid, name } => {
@@ -2484,6 +2504,7 @@ impl App {
             overview_root: None,
             overview_mode: false,
             overview: None,
+            overview_load: None,
         });
         id
     }
@@ -2572,6 +2593,7 @@ impl App {
                 overview_root: group.overview_root.clone(),
                 overview_mode: group.overview_mode,
                 overview: None,
+                overview_load: None,
             });
         }
         self.next_group_id = saved.groups.iter().map(|g| g.id).max().map_or(1, |m| m + 1);
@@ -2654,11 +2676,12 @@ impl App {
         // Tags survive a GUI restart on the tmux server: read them back from
         // every reattached session. Anything unreadable simply starts untagged.
         self.restore_tags(&reattached);
-        // Every local group with a root reads it now, whatever its mode and
+        // Every local group with a root starts reading it now (on a worker
+        // thread, so the first paint does not wait), whatever its mode and
         // whether or not it is active: `kabelsalat overview issues` reads the
         // published snapshot, and the tagger only works on loaded data. The
-        // tags came back first, so the issues derived here include them. The
-        // save_state() at the end publishes the snapshot.
+        // tags came back first, so the issues derived on arrival include
+        // them; the arrival republishes the snapshot.
         let rooted: Vec<usize> = self
             .groups
             .iter()
@@ -6948,20 +6971,19 @@ impl App {
         // The root is read on activation whatever the group's mode: a group
         // whose data is missing (opened since the restore) or in an error
         // state (the root was absent or unreadable then) is read again, so a
-        // root that appeared later recovers. Only the drawing stays lazy.
+        // root that appeared later recovers — unless a read is already on
+        // its way. Only the drawing stays lazy.
         let unloaded = self.active_group().filter(|id| {
             self.groups.iter().any(|g| {
                 g.id == *id
                     && g.host.is_none()
                     && g.overview_root.is_some()
+                    && g.overview_load.is_none()
                     && g.overview.as_ref().is_none_or(|data| data.error.is_some())
             })
         });
         if let Some(group_id) = unloaded {
             self.load_overview(group_id);
-            // Not every path here ends in a save: the snapshot the CLI reads
-            // must carry the issues now.
-            self.publish_groups();
         }
         let showing = self
             .mode_stack
@@ -6997,8 +7019,14 @@ impl App {
         };
         let view = &self.overview_view;
         view.set_group_name(&overview_group_name(group));
-        let (Some(root), Some(data)) = (&group.overview_root, &group.overview) else {
+        let Some(root) = &group.overview_root else {
             view.set_empty(Some(EmptyState::NoRoot));
+            self.fed_overview = None;
+            return;
+        };
+        let Some(data) = &group.overview else {
+            // The worker thread is still reading the root.
+            view.set_empty(Some(EmptyState::Loading { root: root.clone() }));
             self.fed_overview = None;
             return;
         };
@@ -7006,6 +7034,16 @@ impl App {
             view.set_empty(Some(EmptyState::Unreadable {
                 root: root.clone(),
                 error: error.clone(),
+            }));
+            self.fed_overview = None;
+            return;
+        }
+        if data.graph.is_empty() {
+            // A readable root without one node file: a blank map would say
+            // nothing about why, so the empty state says what is missing.
+            view.set_empty(Some(EmptyState::NoNodes {
+                root: root.clone(),
+                issues: data.issues.len(),
             }));
             self.fed_overview = None;
             return;
@@ -7039,52 +7077,81 @@ impl App {
             .set_tabs(chips, unmapped, self.tagging_available);
     }
 
-    /// Build (or rebuild) a group's overview from its root: the graph, its
-    /// layout, one monitor per directory, the issues. A root that is not a
-    /// directory, or a directory that cannot be listed, gives the error
-    /// state (an empty graph, no monitors). No root, or a remote group,
-    /// drops the data and with it the monitors.
+    /// Start building (or rebuilding) a group's overview from its root. The
+    /// root is read and laid out on a worker thread — a repository root can
+    /// hold thousands of files, and reading them on the GTK thread froze the
+    /// window, resize included — and `overview_loaded` installs the result:
+    /// the graph, its layout, one monitor per directory, the issues. A root
+    /// that is not a directory, or a directory that cannot be listed, gives
+    /// the error state (an empty graph, no monitors). No root, or a remote
+    /// group, drops the data and with it the monitors, at once. A newer
+    /// load for the same group supersedes one still running: its token
+    /// replaces the group's, and the older result is dropped on arrival.
     fn load_overview(&mut self, group_id: usize) {
-        let root = self
-            .groups
-            .iter()
-            .find(|g| g.id == group_id && g.host.is_none())
-            .and_then(|g| g.overview_root.clone());
-        let Some(root) = root else {
-            if let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) {
-                group.overview = None;
-            }
+        let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) else {
             return;
         };
-        let (error, sources) = match std::fs::metadata(&root) {
-            // A directory that exists but cannot be listed is as unreadable
-            // as a missing one: the empty state with the error, not a blank
-            // map with an "unreadable file" issue naming the root.
-            Ok(meta) if meta.is_dir() => match std::fs::read_dir(&root) {
-                Ok(_) => (None, scan_root(&root)),
-                Err(err) => (Some(err.to_string()), Vec::new()),
-            },
-            Ok(_) => (Some("not a directory".to_string()), Vec::new()),
-            Err(err) => (Some(err.to_string()), Vec::new()),
+        let root = group.overview_root.clone().filter(|_| group.host.is_none());
+        let Some(root) = root else {
+            group.overview = None;
+            group.overview_load = None;
+            return;
         };
-        let monitors = if error.is_none() {
-            self.watch_overview_dirs(group_id, &root)
-        } else {
-            HashMap::new()
-        };
-        self.set_overview_graph(group_id, Graph::build(sources), error, Some(monitors));
+        self.overview_gen += 1;
+        let token = self.overview_gen;
+        group.overview_load = Some(token);
+        let input = self.input.clone();
+        std::thread::spawn(move || {
+            let loaded = load_root(&root);
+            let layout = layout::layout(&loaded.graph, &Metrics::default());
+            let _ = input.send(Msg::OverviewLoaded {
+                group_id,
+                token,
+                loaded,
+                layout,
+            });
+        });
     }
 
-    /// Install `graph` as a group's overview: lay it out, bump the
-    /// generation, derive the issues from it and the group's tags.
-    /// `monitors` replaces the group's set when given and keeps it otherwise
-    /// (a file change watches nothing new).
+    /// The worker thread's result for `load_overview`: installed when it is
+    /// the group's pending load, dropped when the group is gone, lost its
+    /// root or started a newer load since. The monitors are created here,
+    /// on the GTK thread, because their signals report into `update`.
+    fn overview_loaded(&mut self, group_id: usize, token: u64, loaded: Loaded, layout: Layout) {
+        let current = self
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .is_some_and(|g| g.overview_load == Some(token) && g.overview_root.is_some());
+        if !current {
+            return;
+        }
+        let monitors = self.watch_overview_dirs(group_id, &loaded.dirs);
+        if let Some(group) = self.groups.iter_mut().find(|g| g.id == group_id) {
+            group.overview_load = None;
+        }
+        self.set_overview_graph(
+            group_id,
+            loaded.graph,
+            loaded.error,
+            Some(monitors),
+            Some(layout),
+        );
+        self.overview_changed(group_id);
+    }
+
+    /// Install `graph` as a group's overview: lay it out (unless `placed`
+    /// brings the worker thread's layout), bump the generation, derive the
+    /// issues from it and the group's tags. `monitors` replaces the group's
+    /// set when given and keeps it otherwise (a file change watches nothing
+    /// new).
     fn set_overview_graph(
         &mut self,
         group_id: usize,
         graph: Graph,
         error: Option<String>,
         monitors: Option<HashMap<PathBuf, gio::FileMonitor>>,
+        placed: Option<Layout>,
     ) {
         let tabs = self.tagged_tabs(group_id);
         self.overview_gen += 1;
@@ -7093,7 +7160,7 @@ impl App {
             return;
         };
         let issues = issues::derive(&graph, &tabs);
-        let placed = layout::layout(&graph, &Metrics::default());
+        let placed = placed.unwrap_or_else(|| layout::layout(&graph, &Metrics::default()));
         let monitors = match (monitors, group.overview.take()) {
             (Some(fresh), _) => fresh,
             (None, Some(old)) => old.monitors,
@@ -7136,7 +7203,7 @@ impl App {
             let text = std::fs::read_to_string(path).map_err(|e| e.to_string());
             data.graph.with_source((path.to_path_buf(), text))
         };
-        self.set_overview_graph(group_id, graph, None, None);
+        self.set_overview_graph(group_id, graph, None, None, None);
         self.overview_changed(group_id);
     }
 
@@ -7167,8 +7234,8 @@ impl App {
             .collect();
         sources.extend(scan_root(dir));
         let graph = Graph::build(sources);
-        let fresh = self.watch_overview_dirs(group_id, dir);
-        self.set_overview_graph(group_id, graph, None, None);
+        let fresh = self.watch_overview_dirs(group_id, &overview_dirs(dir));
+        self.set_overview_graph(group_id, graph, None, None, None);
         if let Some(data) = self
             .groups
             .iter_mut()
@@ -7214,20 +7281,21 @@ impl App {
             .filter(|(path, _)| !path.starts_with(dir))
             .cloned()
             .collect();
-        self.set_overview_graph(group_id, Graph::build(sources), None, None);
+        self.set_overview_graph(group_id, Graph::build(sources), None, None, None);
         self.overview_changed(group_id);
     }
 
-    /// One monitor for `root` and every directory below it (dot-dirs and
-    /// symlinks skipped), each reporting its `*.md` changes and new
-    /// directories into `update` for `group_id`.
+    /// One monitor per directory in `dirs` (a root and what is below it, as
+    /// `overview_dirs` lists them), each reporting its `*.md` changes and
+    /// new directories into `update` for `group_id`.
     fn watch_overview_dirs(
         &self,
         group_id: usize,
-        root: &Path,
+        dirs: &[PathBuf],
     ) -> HashMap<PathBuf, gio::FileMonitor> {
         let mut monitors = HashMap::new();
-        for dir in overview_dirs(root) {
+        for dir in dirs {
+            let dir = dir.clone();
             let file = gio::File::for_path(&dir);
             match file.monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
             {
@@ -7354,7 +7422,12 @@ impl App {
     /// Run the tagger for a tab when it is due: a local tab of a group with
     /// a non-empty overview, the command available, no run in flight, the
     /// per-tab gap elapsed, and enough new transcript (or a new title). The
-    /// process runs off-thread and reports `Msg::TaggerDone`.
+    /// transcript check and the process both run off-thread — a long
+    /// session's transcript is tens of MB, and reading it here on every
+    /// title change froze the window — and report `Msg::TaggerDone`; a check
+    /// that finds nothing new reports `run: None`. The gap counts from the
+    /// check, not only from a run, so a tab whose title churns is read at
+    /// most once per gap.
     fn maybe_tag(&mut self, tab_id: usize) {
         if !self.tagging_available || self.tagger_running {
             return;
@@ -7381,25 +7454,18 @@ impl App {
         if !tagger::may_run(last_run, self.tagger_running) {
             return;
         }
-        let Some((mark, text)) = tagger_input(tab) else {
-            return;
+        let transcript = match (&tab.claude, claude::projects_dir()) {
+            (Some(session), Some(projects)) => Some(claude::transcript_path(&projects, session)),
+            _ => None,
         };
-        let nodes: Vec<NodeSummary> = graph
-            .nodes()
-            .map(|n| NodeSummary {
-                id: &n.id,
-                kind: &n.kind,
-                title: &n.title,
-            })
-            .collect();
+        let tag_mark = tab.tag_mark.clone();
+        let title = tab.title.clone();
         let current = tab.tags.clone().unwrap_or_default();
-        let prompt = tagger::prompt(
-            &self.tagger_config.roles,
-            &nodes,
-            &current,
-            &tab.title,
-            &text,
-        );
+        let nodes: Vec<(String, String, String)> = graph
+            .nodes()
+            .map(|n| (n.id.clone(), n.kind.clone(), n.title.clone()))
+            .collect();
+        let roles = self.tagger_config.roles.clone();
         let tab_uuid = tab.uuid.clone();
         let argv = self.tagger_config.tagger_command.clone();
         let input = self.input.clone();
@@ -7407,23 +7473,31 @@ impl App {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.last_tag_run = Some(Instant::now());
         }
-        let mark = mark.render();
         std::thread::spawn(move || {
-            let result = run_tagger(&argv, &prompt);
-            let _ = input.send(Msg::TaggerDone {
-                tab_uuid,
-                mark,
-                result,
-            });
+            let run = tagger::input(transcript.as_deref(), tag_mark.as_ref(), &title).map(
+                |(mark, text)| {
+                    let nodes: Vec<NodeSummary> = nodes
+                        .iter()
+                        .map(|(id, kind, title)| NodeSummary { id, kind, title })
+                        .collect();
+                    let prompt = tagger::prompt(&roles, &nodes, &current, &title, &text);
+                    (mark.render(), run_tagger(&argv, &prompt))
+                },
+            );
+            let _ = input.send(Msg::TaggerDone { tab_uuid, run });
         });
     }
 
     /// Apply a finished tagger run: the answer's tags replace the tab's and
     /// go to its tmux session with the watermark; a failed run or an
     /// unparsable answer keeps the old tags and mark (the next significant
-    /// change retries).
-    fn tagger_done(&mut self, tab_uuid: &str, mark: &str, result: Result<String, String>) {
+    /// change retries). A check that found nothing new (`run: None`) only
+    /// frees the tagger.
+    fn tagger_done(&mut self, tab_uuid: &str, run: Option<(String, Result<String, String>)>) {
         self.tagger_running = false;
+        let Some((mark, result)) = run else {
+            return;
+        };
         let Some((tab_id, group_id)) = self
             .tabs
             .iter()
@@ -7446,7 +7520,7 @@ impl App {
                 return;
             }
         };
-        self.store_tags(tab_id, group_id, tags, mark);
+        self.store_tags(tab_id, group_id, tags, &mark);
         self.recompute_issues(group_id);
         self.overview_changed(group_id);
     }
@@ -7555,28 +7629,6 @@ fn on_path(program: &str, path: Option<&std::ffi::OsStr>) -> bool {
     path.is_some_and(|path| std::env::split_paths(path).any(|dir| dir.join(program).is_file()))
 }
 
-/// `root` and every directory below it, breadth first; directories whose
-/// name starts with `.` and symlinks are skipped, like `scan_root` does.
-fn overview_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![root.to_path_buf()];
-    let mut next = 0;
-    while next < dirs.len() {
-        if let Ok(entries) = std::fs::read_dir(&dirs[next]) {
-            for entry in entries.flatten() {
-                let hidden = entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with('.'));
-                if !hidden && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    dirs.push(entry.path());
-                }
-            }
-        }
-        next += 1;
-    }
-    dirs
-}
-
 /// What a directory monitor event means for the overview: a `*.md` file
 /// changed or went away, a directory appeared (created, moved in or
 /// renamed to), something other than a `*.md` file went away (the handler
@@ -7642,80 +7694,6 @@ fn overview_events(
         }
         _ => Vec::new(),
     }
-}
-
-/// What the tagger gets for a tab, and the watermark that run will leave:
-/// the transcript since the current mark when the tab runs a claude whose
-/// transcript grew significantly, else the title when it changed. `None`
-/// when there is nothing new (keeping the old mark).
-fn tagger_input(tab: &Tab) -> Option<(Watermark, String)> {
-    if let Some(session) = &tab.claude
-        && let Some(projects) = claude::projects_dir()
-    {
-        let path = claude::transcript_path(&projects, session);
-        // A transcript that is not there yet falls through to the title; one
-        // that cannot be read waits for the next scan.
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let size = meta.len();
-            // The cheap check (spec section 5, step 2), on the GTK thread on
-            // every scan and title change: a size that matches the mark reads
-            // only the tail for the last uuid, and the whole transcript —
-            // tens of MB for a long session — is read only when something
-            // changed, or when the tail cannot decide.
-            if let Some(Watermark::Transcript { uuid, offset }) = &tab.tag_mark
-                && *offset == size
-                && let Some(tail) = transcript_tail(&path, size)
-                && tagger::last_uuid(&tail).as_deref() == Some(uuid.as_str())
-            {
-                return None;
-            }
-            let text = std::fs::read_to_string(&path).ok()?;
-            let last = tagger::last_uuid(&text);
-            if tagger::unchanged(tab.tag_mark.as_ref(), size, last.as_deref()) {
-                return None;
-            }
-            let delta = tagger::delta_since(&text, tab.tag_mark.as_ref());
-            if !tagger::significant(&delta) {
-                return None;
-            }
-            let previous = match &tab.tag_mark {
-                Some(Watermark::Transcript { uuid, .. }) => Some(uuid.clone()),
-                _ => None,
-            };
-            let uuid = delta.last_uuid.clone().or(last).or(previous)?;
-            return Some((
-                Watermark::Transcript {
-                    uuid,
-                    offset: delta.end_offset,
-                },
-                delta.text,
-            ));
-        }
-    }
-    let (mark, text) = tagger::title_input(&tab.title);
-    if tab.tag_mark.as_ref() == Some(&mark) {
-        return None;
-    }
-    Some((mark, text))
-}
-
-/// How much of a transcript's end the cheap check reads to find its last
-/// message uuid: well beyond one line, even one carrying a large tool
-/// result, so the tail nearly always decides without the whole file.
-const TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
-
-/// The last `TRANSCRIPT_TAIL_BYTES` of the `size`-byte file at `path` (all
-/// of it when shorter), lossily decoded; `None` when it cannot be read. A
-/// cut first line (or character) fails to parse and is skipped by
-/// `tagger::last_uuid`, which searches from the end.
-fn transcript_tail(path: &Path, size: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    file.seek(SeekFrom::Start(size.saturating_sub(TRANSCRIPT_TAIL_BYTES)))
-        .ok()?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// How often the tagger thread checks whether its child exited.
@@ -7834,22 +7812,6 @@ mod tests {
         assert!(on_path("sh", Some(path)));
         assert!(!on_path("kabelsalat-no-such-program", Some(path)));
         assert!(!on_path("sh", None));
-    }
-
-    #[test]
-    fn overview_dirs_walks_below_the_root_and_skips_dot_dirs() {
-        let root = std::env::temp_dir().join(format!(
-            "kabelsalat-app-test-overview-dirs-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("a/b")).unwrap();
-        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
-        std::fs::write(root.join("a/n.md"), "x").unwrap();
-        let mut dirs = overview_dirs(&root);
-        dirs.sort();
-        assert_eq!(dirs, vec![root.clone(), root.join("a"), root.join("a/b")]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -8038,29 +8000,6 @@ mod tests {
         // success: the answer is what counts.
         let ok = run_tagger_within(&sh("echo done"), &prompt, Duration::from_secs(5)).unwrap();
         assert_eq!(ok.trim(), "done");
-    }
-
-    // --- the transcript tail -------------------------------------------
-
-    #[test]
-    fn the_transcript_tail_is_the_last_256_kib_or_the_whole_short_file() {
-        let dir =
-            std::env::temp_dir().join(format!("kabelsalat-app-test-tail-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let long = dir.join("long.jsonl");
-        let mut body = "a".repeat(300_000);
-        body.push_str("\nlast line");
-        std::fs::write(&long, &body).unwrap();
-        let size = std::fs::metadata(&long).unwrap().len();
-        let tail = transcript_tail(&long, size).unwrap();
-        assert_eq!(tail.len() as u64, TRANSCRIPT_TAIL_BYTES);
-        assert!(tail.ends_with("\nlast line"));
-        let short = dir.join("short.jsonl");
-        std::fs::write(&short, "one\ntwo").unwrap();
-        assert_eq!(transcript_tail(&short, 7).as_deref(), Some("one\ntwo"));
-        assert_eq!(transcript_tail(&dir.join("missing"), 7), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- sidebar selection echo -------------------------------------------

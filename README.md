@@ -346,11 +346,16 @@ clicking it on the map — switches back to Terminals and shows it. The map is
 read from Markdown files with YAML frontmatter below one directory of the
 project, set with `kabelsalat overview root`; the format is documented for
 agents in [skills/kabelsalat/overview-format.md](skills/kabelsalat/overview-format.md).
-A group without a root shows an empty state naming that command and linking
-the format page; a root that is missing or unreadable shows the path and the
-error, and nothing else in the group is affected. Remote groups have no
-overview in this version — their toggle is insensitive, with a tooltip saying
-so.
+A group without a root shows an empty state naming that command, linking the
+format page and listing what a repository needs for the overview; a root
+that holds no node file shows the same checklist under "No node files below
+the root"; a root that is missing or unreadable shows the path and the
+error, and nothing else in the group is affected. While the map is up, the
+`?` button next to the zoom controls shows the checklist. The root is read
+on a worker thread, so a large directory never stalls the window; the page
+says "Reading the overview root" until the map is ready. Remote groups have
+no overview in this version — their toggle is insensitive, with a tooltip
+saying so.
 
 Which tab works on which node is inferred, not written by anyone: when a
 tab's recent work changes, kabelsalat hands the new part of its `claude`

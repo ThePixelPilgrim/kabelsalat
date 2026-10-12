@@ -18,7 +18,7 @@ use relm4::gtk::{self, cairo, gdk, glib, graphene, pango};
 
 use super::issues::{self, Issue};
 use super::layout::{self, BoxKey, Layout, MID_ROWS, PlacedBox, Rect, Tier, Viewport};
-use super::model::{Color, FieldValue, Graph, Node};
+use super::model::{Color, FieldValue, Graph, Node, setup_checklist};
 
 // --- sizes (world units unless named *_PX) and colours ---
 
@@ -64,6 +64,7 @@ const CSS: &str = "
 .overview-tab-row { padding: 4px 6px; border-radius: 8px; }
 .overview-tab-row.selected { background-color: alpha(@accent_bg_color, 0.25); }
 .overview-role-header { letter-spacing: 0.08em; }
+.overview-checklist label { opacity: 0.85; }
 ";
 
 // --- public API ---
@@ -102,7 +103,20 @@ pub struct Unmapped {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmptyState {
     NoRoot,
-    Unreadable { root: PathBuf, error: String },
+    /// The root is being read on a worker thread.
+    Loading {
+        root: PathBuf,
+    },
+    Unreadable {
+        root: PathBuf,
+        error: String,
+    },
+    /// The root was read and holds no node file; `issues` counts the data
+    /// issues it produced anyway (unparsable files).
+    NoNodes {
+        root: PathBuf,
+        issues: usize,
+    },
 }
 
 /// The overview page: cheap to clone, every clone shares the same widgets.
@@ -366,6 +380,9 @@ struct Inner {
     panel: gtk::Box,
     panel_built: RefCell<Option<(BoxKey, u64)>>,
     empty_page: adw::StatusPage,
+    /// The setup checklist below the empty page's text; shown while the
+    /// page explains a missing root or a root without nodes.
+    checklist: gtk::Box,
     pinch_last: Cell<f64>,
     drag_origin: Cell<(f64, f64)>,
 }
@@ -409,6 +426,25 @@ impl Inner {
         let zoom_out = gtk::Button::with_label("\u{2212}");
         let zoom_in = gtk::Button::with_label("+");
         let zoom_fit = gtk::Button::with_label("Fit");
+        // The setup checklist, reachable while the map is up: the same list
+        // the empty page shows, in a popover.
+        let help = gtk::MenuButton::new();
+        help.set_label("?");
+        help.set_tooltip_text(Some("Overview setup checklist"));
+        help.add_css_class("flat");
+        let help_body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        help_body.set_margin_top(6);
+        help_body.set_margin_bottom(6);
+        help_body.set_margin_start(6);
+        help_body.set_margin_end(6);
+        let help_title = gtk::Label::new(Some("What the overview needs"));
+        help_title.add_css_class("heading");
+        help_title.set_xalign(0.0);
+        help_body.append(&help_title);
+        help_body.append(&checklist_box());
+        let help_popover = gtk::Popover::new();
+        help_popover.set_child(Some(&help_body));
+        help.set_popover(Some(&help_popover));
         let zoom_panel = gtk::Box::new(gtk::Orientation::Vertical, 6);
         zoom_panel.add_css_class("overview-zoom");
         zoom_panel.set_halign(gtk::Align::End);
@@ -423,6 +459,7 @@ impl Inner {
             b.add_css_class("flat");
             buttons.append(b);
         }
+        buttons.append(&help);
         zoom_panel.append(&buttons);
         overlay.add_overlay(&zoom_panel);
 
@@ -446,6 +483,9 @@ impl Inner {
         let empty_page = adw::StatusPage::new();
         empty_page.set_hexpand(true);
         empty_page.set_vexpand(true);
+        let checklist = checklist_box();
+        checklist.set_halign(gtk::Align::Center);
+        empty_page.set_child(Some(&checklist));
 
         let stack = gtk::Stack::new();
         stack.set_hexpand(true);
@@ -479,6 +519,7 @@ impl Inner {
             panel,
             panel_built: RefCell::new(None),
             empty_page,
+            checklist,
             pinch_last: Cell::new(1.0),
             drag_origin: Cell::new((0.0, 0.0)),
         })
@@ -829,22 +870,36 @@ impl Inner {
             let s = self.state.borrow();
             (s.empty.clone(), s.group_name.clone())
         };
+        let group = if group.is_empty() {
+            "<group>".to_string()
+        } else {
+            shell_word(&group)
+        };
+        let group = glib::markup_escape_text(&group);
+        let root_line = |root: &Path| glib::markup_escape_text(&root.display().to_string());
+        // The checklist belongs under the pages that explain what to set
+        // up, not under a read in progress or a read error.
+        self.checklist.set_visible(matches!(
+            &empty,
+            Some(EmptyState::NoRoot | EmptyState::NoNodes { .. })
+        ));
         match empty {
             None => {}
             Some(EmptyState::NoRoot) => {
                 self.empty_page.set_icon_name(Some("folder-symbolic"));
                 self.empty_page.set_title("No overview root");
-                let group = if group.is_empty() {
-                    "<group>".to_string()
-                } else {
-                    shell_word(&group)
-                };
                 self.empty_page.set_description(Some(&format!(
-                    "Set one with  <tt>kabelsalat overview root -g {} DIR</tt>  \u{2014} the node \
-                     format is documented in the kabelsalat skill's \
-                     <a href=\"{FORMAT_DOC_URL}\">overview-format.md</a>",
-                    glib::markup_escape_text(&group)
+                    "Set one with  <tt>kabelsalat overview root -g {group} DIR</tt>  \u{2014} the \
+                     node format is documented in the kabelsalat skill's \
+                     <a href=\"{FORMAT_DOC_URL}\">overview-format.md</a>"
                 )));
+            }
+            Some(EmptyState::Loading { root }) => {
+                self.empty_page
+                    .set_icon_name(Some("content-loading-symbolic"));
+                self.empty_page.set_title("Reading the overview root");
+                self.empty_page
+                    .set_description(Some(&format!("<tt>{}</tt>", root_line(&root))));
             }
             Some(EmptyState::Unreadable { root, error }) => {
                 self.empty_page
@@ -852,8 +907,30 @@ impl Inner {
                 self.empty_page.set_title("Overview root unreadable");
                 self.empty_page.set_description(Some(&format!(
                     "<tt>{}</tt>\n{}",
-                    glib::markup_escape_text(&root.display().to_string()),
+                    root_line(&root),
                     glib::markup_escape_text(&error)
+                )));
+            }
+            Some(EmptyState::NoNodes { root, issues }) => {
+                self.empty_page.set_icon_name(Some("folder-open-symbolic"));
+                self.empty_page.set_title("No node files below the root");
+                let issues = match issues {
+                    0 => String::new(),
+                    1 => format!(
+                        "\n1 file has frontmatter that does not parse: see \
+                         <tt>kabelsalat overview issues -g {group}</tt>"
+                    ),
+                    n => format!(
+                        "\n{n} files have frontmatter that does not parse: see \
+                         <tt>kabelsalat overview issues -g {group}</tt>"
+                    ),
+                };
+                self.empty_page.set_description(Some(&format!(
+                    "<tt>{}</tt>\nNo <tt>*.md</tt> file below it starts with a YAML frontmatter \
+                     block carrying an <tt>id</tt>. Point the root at the directory holding \
+                     the node files, or create them \u{2014} the format is documented in \
+                     <a href=\"{FORMAT_DOC_URL}\">overview-format.md</a>.{issues}",
+                    root_line(&root)
                 )));
             }
         }
@@ -1236,6 +1313,29 @@ fn field_text(value: &FieldValue) -> String {
         FieldValue::Scalar(s) => s.clone(),
         FieldValue::List(items) => items.join(", "),
     }
+}
+
+/// The setup checklist as a column of numbered, wrapping lines, ending in
+/// the link to the format page. One per place it is shown (the empty page,
+/// the help popover): a widget has one parent.
+fn checklist_box() -> gtk::Box {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    column.add_css_class("overview-checklist");
+    for (index, item) in setup_checklist().iter().enumerate() {
+        let label = gtk::Label::new(Some(&format!("{}. {item}", index + 1)));
+        label.set_wrap(true);
+        label.set_wrap_mode(pango::WrapMode::WordChar);
+        label.set_xalign(0.0);
+        label.set_max_width_chars(64);
+        column.append(&label);
+    }
+    let link = gtk::Label::new(None);
+    link.set_markup(&format!(
+        "Full format: <a href=\"{FORMAT_DOC_URL}\">overview-format.md</a>"
+    ));
+    link.set_xalign(0.0);
+    column.append(&link);
+    column
 }
 
 fn build_tray(title: &str) -> (gtk::Box, gtk::Box) {
