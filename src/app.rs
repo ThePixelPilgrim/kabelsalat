@@ -744,6 +744,9 @@ pub struct App {
     /// enough: the echo is queued behind whatever else is pending, and two
     /// queued tab switches then ping-pong forever and freeze the main loop.
     reselecting: Rc<Cell<bool>>,
+    /// The active tab whose sidebar row was last scrolled into view, so a
+    /// rebuild only reveals the active row when it is a new one.
+    revealed: Rc<Cell<Option<usize>>>,
     /// Icon name for the group drag handle, resolved once against the
     /// display's cached icon theme.
     drag_handle_icon: &'static str,
@@ -779,6 +782,19 @@ fn user_selection(reselecting: bool, row_id: Option<usize>) -> Option<usize> {
         return None;
     }
     row_id
+}
+
+/// Where the sidebar scroller should sit after a rebuild, given the offset
+/// the user left it at (`saved`), the viewport height (`page`) and, only when
+/// the active tab just changed, its row's `(y, height)`. Scrolling belongs to
+/// the user: a rebuild alone (a close, a title or age change) never moves the
+/// list, and a switch moves it just far enough to reveal the new active row.
+fn sidebar_scroll(saved: f64, page: f64, reveal: Option<(f64, f64)>) -> f64 {
+    match reveal {
+        Some((y, _)) if y < saved => y,
+        Some((y, height)) if y + height > saved + page => y + height - page,
+        _ => saved,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1631,6 +1647,7 @@ impl SimpleComponent for App {
             save_error_shown: Cell::new(false),
             pending_kills: Vec::new(),
             reselecting: Rc::new(Cell::new(false)),
+            revealed: Rc::new(Cell::new(None)),
             drag_handle_icon,
             host_keys: RefCell::new(Vec::new()),
             mode_stack: gtk::Stack::new(),
@@ -5410,6 +5427,8 @@ impl App {
     /// expanded (one row per tab); every other group collapses to a single row
     /// showing its last-active tab plus the group tab count.
     fn rebuild_list(&self) {
+        // Clearing the rows can reset the scroller; put it back afterwards.
+        let saved = self.list_scroller.vadjustment().value();
         while let Some(row) = self.tab_list.row_at_index(0) {
             self.tab_list.remove(&row);
         }
@@ -5450,6 +5469,7 @@ impl App {
 
         // Re-select the active row with the row-selected handler muted, so
         // the programmatic selection is never echoed back as a Msg::Select.
+        let mut active_row = None;
         if let Some(active) = self.active {
             let mut i = 0;
             while let Some(row) = self.tab_list.row_at_index(i) {
@@ -5457,47 +5477,50 @@ impl App {
                     self.reselecting.set(true);
                     self.tab_list.select_row(Some(&row));
                     self.reselecting.set(false);
-                    self.scroll_row_into_view(&row);
+                    active_row = Some(row);
                     break;
                 }
                 i += 1;
             }
         }
+        self.settle_list_scroll(saved, active_row);
     }
 
-    /// Bring the active sidebar row into the list scroller's visible range.
+    /// Restore the sidebar scroll a rebuild started from and, if the active
+    /// tab changed since the last reveal, bring its row into view
+    /// (`sidebar_scroll` decides).
     ///
     /// `ListBox::select_row` neither scrolls nor focuses, and focus goes to
     /// the terminal on activation, so the viewport's scroll-to-focus never
-    /// fires. Without this, the list only appears to follow the selection
-    /// because collapsing/expanding groups changes the content height and the
-    /// adjustment gets clamped as a side effect — which does nothing when the
+    /// fires; without the reveal the list would not follow a switch when the
     /// active group alone is taller than the viewport.
     ///
     /// Deferred to idle for the same reason as `scroll_active_into_view`:
     /// the rows were only just appended and have no allocation yet.
-    fn scroll_row_into_view(&self, row: &gtk::ListBoxRow) {
+    fn settle_list_scroll(&self, saved: f64, active_row: Option<gtk::ListBoxRow>) {
         let scroller = self.list_scroller.clone();
         let list = self.tab_list.clone();
-        let row = row.clone();
+        let revealed = self.revealed.clone();
+        let active = self.active;
         gtk::glib::idle_add_local_once(move || {
             // rebuild_list runs on every title/age change; a later rebuild may
-            // already have torn this row out, and a detached row's bounds are
-            // garbage.
-            if row.parent().as_ref() != Some(list.upcast_ref::<gtk::Widget>()) {
+            // already have torn these rows out, and its own callback settles
+            // the scroll instead. A detached row's bounds are garbage.
+            if active_row
+                .as_ref()
+                .is_some_and(|row| row.parent().as_ref() != Some(list.upcast_ref::<gtk::Widget>()))
+            {
                 return;
             }
-            let Some(bounds) = row.compute_bounds(&list) else {
-                return;
-            };
-            let (y, height) = (bounds.y() as f64, bounds.height() as f64);
+            let reveal = active_row
+                .filter(|_| revealed.get() != active)
+                .and_then(|row| row.compute_bounds(&list))
+                .map(|b| (b.y() as f64, b.height() as f64));
+            if reveal.is_some() {
+                revealed.set(active);
+            }
             let vadj = scroller.vadjustment();
-            let (value, page) = (vadj.value(), vadj.page_size());
-            if y < value {
-                vadj.set_value(y);
-            } else if y + height > value + page {
-                vadj.set_value(y + height - page);
-            }
+            vadj.set_value(sidebar_scroll(saved, vadj.page_size(), reveal));
         });
     }
 
@@ -5963,10 +5986,14 @@ impl App {
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build(),
         );
+        // The row buttons never take focus: rebuild_list tears out the row of
+        // the clicked button, and the viewport would scroll to wherever the
+        // orphaned focus lands (the top of the list) instead of staying put.
         if collapsed_count.is_none() && tab.crashed.is_some() {
             let restart = gtk::Button::builder()
                 .icon_name("view-refresh-symbolic")
                 .tooltip_text("Restart shell")
+                .focus_on_click(false)
                 .build();
             restart.add_css_class("flat");
             restart.add_css_class("circular");
@@ -5981,6 +6008,7 @@ impl App {
             let close = gtk::Button::builder()
                 .icon_name("window-close-symbolic")
                 .tooltip_text("Close tab")
+                .focus_on_click(false)
                 .build();
             close.add_css_class("flat");
             close.add_css_class("circular");
@@ -8020,6 +8048,31 @@ mod tests {
     fn deselection_never_emits_select() {
         assert_eq!(user_selection(false, None), None);
         assert_eq!(user_selection(true, None), None);
+    }
+
+    // --- sidebar scroll -----------------------------------------------------
+
+    #[test]
+    fn a_rebuild_without_a_tab_switch_keeps_the_users_scroll() {
+        // The regression: closing a tab far down the list jumped the
+        // sidebar back to the top (or to the active row), so closing several
+        // meant scrolling down again after each one.
+        assert_eq!(sidebar_scroll(400.0, 300.0, None), 400.0);
+    }
+
+    #[test]
+    fn a_switch_to_a_visible_row_keeps_the_users_scroll() {
+        assert_eq!(sidebar_scroll(400.0, 300.0, Some((500.0, 30.0))), 400.0);
+    }
+
+    #[test]
+    fn a_switch_to_a_row_above_the_view_scrolls_up_to_it() {
+        assert_eq!(sidebar_scroll(400.0, 300.0, Some((100.0, 30.0))), 100.0);
+    }
+
+    #[test]
+    fn a_switch_to_a_row_below_the_view_scrolls_just_far_enough() {
+        assert_eq!(sidebar_scroll(400.0, 300.0, Some((800.0, 30.0))), 530.0);
     }
 
     #[test]
