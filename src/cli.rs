@@ -94,7 +94,7 @@ pub enum Cli {
         /// `None`: open it, or print `ctl=`/`adb=`. `Some`: one request.
         cmd: Option<AndroidCmd>,
     },
-    /// Recreate the claude sessions of saved tabs on the private tmux
+    /// Recreate the claude and codex sessions of saved tabs on the private tmux
     /// server, without a GUI: what the boot unit runs. Handled entirely in
     /// the calling process; against a running GUI it does nothing.
     Resume,
@@ -329,7 +329,7 @@ Usage:
   kabelsalat overview issues [-g <group>]      Print <group>'s overview data issues, one per
                                                line: kind, node ids, file, detail (tab-
                                                separated); nothing and exit 0 when there are none
-  kabelsalat resume                            Recreate saved claude sessions on the tmux
+  kabelsalat resume                            Recreate saved claude/codex sessions on the tmux
                                                server without a GUI (what the boot unit runs)
 
 Options for run:

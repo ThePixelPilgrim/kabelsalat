@@ -10,6 +10,7 @@ pub mod autostart;
 pub mod browser;
 pub mod claude;
 mod cli;
+pub mod codex;
 mod control;
 pub mod overview;
 pub mod remote;
@@ -172,6 +173,8 @@ pub fn run() {
          button.tab-active { background: alpha(currentColor, 0.12); }
          row.tab-claude, button.tab-claude { background: alpha(#33d17a, 0.08); }
          row.tab-claude:selected, button.tab-claude.tab-active { background: alpha(#33d17a, 0.32); }
+         row.tab-codex, button.tab-codex { background: alpha(#ff7800, 0.08); }
+         row.tab-codex:selected, button.tab-codex.tab-active { background: alpha(#ff7800, 0.32); }
          button.group-c0, button.group-c1, button.group-c2,
          button.group-c3, button.group-c4, button.group-c5 {
              border-left: none;

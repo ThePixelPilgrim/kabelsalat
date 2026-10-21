@@ -152,28 +152,77 @@ pub struct SavedTab {
     /// attach-time title re-emission from stamping every tab fresh on startup.
     #[serde(default)]
     pub last_title: Option<String>,
-    /// The Claude Code session last seen running in this tab, if any. Kept
-    /// current by the app's discovery tick; when the tab's tmux session is
-    /// gone at startup (a reboot), the tab comes back as
-    /// `claude --resume <id>` in that directory instead of a plain shell.
+    /// The agent session (Claude Code or Codex) last seen running in this
+    /// tab, if any; the key stays `claude` for files written before codex
+    /// support. Kept current by the app's discovery tick; when the tab's tmux
+    /// session is gone at startup (a reboot), the tab comes back as
+    /// `claude --resume <id>` / `codex resume <id>` in that directory instead
+    /// of a plain shell.
     #[serde(default)]
-    pub claude: Option<ClaudeSession>,
+    pub claude: Option<AgentSession>,
 }
 
-/// A Claude Code session, as discovered in a tab: enough to resume it.
+/// Which coding agent a tracked session belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentKind {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl AgentKind {
+    /// The program name, as the user types it and as logs name it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+        }
+    }
+
+    fn is_claude(&self) -> bool {
+        *self == AgentKind::Claude
+    }
+}
+
+/// An agent session (Claude Code or Codex), as discovered in a tab: enough
+/// to resume it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeSession {
-    /// The session id `claude --resume` takes.
+pub struct AgentSession {
+    /// The session id the agent's resume command takes.
     pub id: String,
-    /// The directory claude ran in. Sessions are stored per project, so a
+    /// The directory the agent ran in. Sessions are stored per project, so a
     /// resume has to start there.
     pub cwd: PathBuf,
+    /// Absent on disk for claude, so files written before codex support load
+    /// unchanged and claude tabs keep their old shape.
+    #[serde(default, skip_serializing_if = "AgentKind::is_claude")]
+    pub kind: AgentKind,
 }
 
-impl ClaudeSession {
+impl AgentSession {
+    pub fn claude(id: String, cwd: PathBuf) -> Self {
+        Self {
+            id,
+            cwd,
+            kind: AgentKind::Claude,
+        }
+    }
+
+    pub fn codex(id: String, cwd: PathBuf) -> Self {
+        Self {
+            id,
+            cwd,
+            kind: AgentKind::Codex,
+        }
+    }
+
     /// The command that brings this session back.
     pub fn resume_argv(&self) -> Vec<String> {
-        vec!["claude".into(), "--resume".into(), self.id.clone()]
+        match self.kind {
+            AgentKind::Claude => vec!["claude".into(), "--resume".into(), self.id.clone()],
+            AgentKind::Codex => vec!["codex".into(), "resume".into(), self.id.clone()],
+        }
     }
 }
 
@@ -550,10 +599,10 @@ pub fn reconcile(saved: &SavedState, live: &[String], dead: &[DeadPane]) -> Reco
 /// command for one that is). The same on either side: a remote tab's session
 /// was found by its host's worker, and its directory is a path there.
 pub fn resume_on_restore<'a>(
-    claude: Option<&'a ClaudeSession>,
+    claude: Option<&'a AgentSession>,
     uuid: &str,
     live: &[String],
-) -> Option<&'a ClaudeSession> {
+) -> Option<&'a AgentSession> {
     claude.filter(|_| !live.iter().any(|live| live == uuid))
 }
 
@@ -595,12 +644,12 @@ pub fn boot_resume_plan(saved: &SavedState, live: &[String]) -> Vec<SavedTab> {
         .collect()
 }
 
-/// The command a boot-time resume runs: the claude's [`ClaudeSession::resume_argv`]
+/// The command a boot-time resume runs: the claude's [`AgentSession::resume_argv`]
 /// behind a login shell. The user manager's environment has no `~/.cargo/bin`
 /// and nothing from `.profile`; `$SHELL -l` brings that back without touching
 /// any rc file. The words of `resume_argv` are a program name, a flag and a
 /// session id — nothing a shell would reinterpret — so they are joined bare.
-pub fn boot_resume_argv(shell: &str, session: &ClaudeSession) -> Vec<String> {
+pub fn boot_resume_argv(shell: &str, session: &AgentSession) -> Vec<String> {
     vec![
         shell.to_string(),
         "-lc".into(),
@@ -1303,6 +1352,50 @@ mod tests {
     // --- claude sessions ---
 
     #[test]
+    fn codex_session_resumes_with_the_codex_subcommand_and_round_trips() {
+        let session = AgentSession::codex(
+            "0199a213-81c0-7800-8aa1-bbab2a035a53".into(),
+            PathBuf::from("/home/me/project"),
+        );
+        assert_eq!(
+            session.resume_argv(),
+            ["codex", "resume", "0199a213-81c0-7800-8aa1-bbab2a035a53"]
+        );
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains(r#""kind":"codex""#));
+        assert_eq!(
+            serde_json::from_str::<AgentSession>(&json).unwrap(),
+            session
+        );
+    }
+
+    #[test]
+    fn agent_kinds_are_named_after_their_program() {
+        assert_eq!(AgentKind::Claude.name(), "claude");
+        assert_eq!(AgentKind::Codex.name(), "codex");
+    }
+
+    #[test]
+    fn a_claude_session_keeps_its_old_on_disk_shape() {
+        // No "kind" key is written for claude, and one-less files load as claude.
+        let session = AgentSession::claude("abc".into(), PathBuf::from("/p"));
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("kind"));
+        let old: AgentSession = serde_json::from_str(r#"{"id":"abc","cwd":"/p"}"#).unwrap();
+        assert_eq!(old, session);
+        assert_eq!(old.kind, AgentKind::Claude);
+    }
+
+    #[test]
+    fn boot_resume_runs_codex_through_a_login_shell_too() {
+        let session = AgentSession::codex("abc-123".into(), PathBuf::from("/p"));
+        assert_eq!(
+            boot_resume_argv("/bin/zsh", &session)[2],
+            "exec codex resume abc-123"
+        );
+    }
+
+    #[test]
     fn claude_session_round_trips_and_builds_the_resume_command() {
         let tab = SavedTab {
             uuid: "aaa".into(),
@@ -1310,10 +1403,10 @@ mod tests {
             title: "claude".into(),
             last_activity: None,
             last_title: None,
-            claude: Some(ClaudeSession {
-                id: "7b776c86-7bbd-5685-bafa-ec6d54623792".into(),
-                cwd: PathBuf::from("/home/me/project"),
-            }),
+            claude: Some(AgentSession::claude(
+                "7b776c86-7bbd-5685-bafa-ec6d54623792".into(),
+                PathBuf::from("/home/me/project"),
+            )),
         };
         let json = serde_json::to_string(&tab).unwrap();
         let back: SavedTab = serde_json::from_str(&json).unwrap();
@@ -1341,10 +1434,7 @@ mod tests {
         // The whole point of the field: a tab whose session did not survive
         // still knows which claude to bring back.
         let mut state = sample_state();
-        let session = ClaudeSession {
-            id: "sid".into(),
-            cwd: PathBuf::from("/work"),
-        };
+        let session = AgentSession::claude("sid".into(), PathBuf::from("/work"));
         state.tabs[1].claude = Some(session.clone());
         let plan = reconcile(&state, &["aaa".to_string()], &[]);
         assert_eq!(plan.attach[0].tab.claude, None);
@@ -1355,10 +1445,7 @@ mod tests {
     #[test]
     fn resume_on_restore_for_a_gone_tab_with_a_session_on_either_side() {
         let mut state = remote_state(); // group 1 is remote
-        let session = ClaudeSession {
-            id: "sid".into(),
-            cwd: PathBuf::from("/work"),
-        };
+        let session = AgentSession::claude("sid".into(), PathBuf::from("/work"));
         state.tabs[0].claude = Some(session.clone()); // aaa: local
         state.tabs[1].claude = Some(session.clone()); // bbb: remote
         let gone: Vec<String> = Vec::new();
@@ -1718,10 +1805,10 @@ mod tests {
             title: "claude".into(),
             last_activity: None,
             last_title: None,
-            claude: Some(ClaudeSession {
-                id: format!("sess-{uuid}"),
-                cwd: PathBuf::from(format!("/home/me/{uuid}")),
-            }),
+            claude: Some(AgentSession::claude(
+                format!("sess-{uuid}"),
+                PathBuf::from(format!("/home/me/{uuid}")),
+            )),
         }
     }
 
@@ -1769,10 +1856,7 @@ mod tests {
     fn boot_resume_runs_through_a_login_shell() {
         // The user manager's environment has no ~/.cargo/bin and nothing from
         // .profile; a login shell brings that back without touching rc files.
-        let session = ClaudeSession {
-            id: "abc-123".into(),
-            cwd: PathBuf::from("/home/me/proj"),
-        };
+        let session = AgentSession::claude("abc-123".into(), PathBuf::from("/home/me/proj"));
         assert_eq!(
             boot_resume_argv("/bin/zsh", &session),
             vec![

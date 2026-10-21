@@ -18,6 +18,7 @@ use crate::autostart;
 use crate::browser::{self, Browser, CapturedFrame, ProfileDisposition};
 use crate::claude;
 use crate::cli::{ANDROID_ENV_KEYS, CDP_ENV_KEYS};
+use crate::codex;
 use crate::control;
 use crate::overview::canvas::{Callbacks, EmptyState, OverviewView, TabChip, Unmapped};
 use crate::overview::issues::{self, Issue, TaggedTab};
@@ -27,7 +28,8 @@ use crate::overview::tagger::{self, ENV_LINKS, ENV_TAG_MARK, NodeSummary, Tags, 
 use crate::remote::{self, HostState, RemoteError};
 use crate::remote_worker::{self, RemoteEvent, RemoteWorker, SshRunner};
 use crate::state::{
-    self, BrowserKeyStep, ClaudeSession, PaneKind, SavedGroup, SavedState, SavedTab, SidebarOrder,
+    self, AgentKind, AgentSession, BrowserKeyStep, PaneKind, SavedGroup, SavedState, SavedTab,
+    SidebarOrder,
 };
 use crate::tmuxctl::{self, LingerStatus, SessionInfo, TmuxAvailability, TmuxCtl, TmuxError};
 
@@ -392,7 +394,7 @@ pub struct Tab {
     spawned_at: Option<Instant>,
     /// The claude session last seen in this tab (see `claude.rs`): what a
     /// respawn of the tab brings back instead of a shell.
-    claude: Option<ClaudeSession>,
+    claude: Option<AgentSession>,
     /// What the tagger last said this tab works on (overview mode). Mirrored
     /// into the tab's tmux session as `KABELSALAT_LINKS`, never persisted
     /// here; without tmux it lives only in memory.
@@ -3170,7 +3172,7 @@ impl App {
 
     /// A host answered a discovery: apply it to its tabs with the same rule
     /// as the local tick. Returns whether any tab changed.
-    fn on_claude_sessions(&mut self, host: &str, found: HashMap<String, ClaudeSession>) -> bool {
+    fn on_claude_sessions(&mut self, host: &str, found: HashMap<String, AgentSession>) -> bool {
         if let Some(entry) = self.hosts.get_mut(host) {
             entry.discovery.running = false;
             entry.discovery.next = Some(Instant::now() + Duration::from_secs(REMOTE_CLAUDE_SECS));
@@ -4800,12 +4802,12 @@ impl App {
         let Some(tmux) = &self.tmux else {
             return;
         };
-        let Some(dir) = claude::sessions_dir() else {
-            return;
-        };
         let proc_root = Path::new("/proc");
-        let records = claude::live_records(&dir, proc_root);
-        // No claude anywhere is the common case; it costs no tmux call.
+        let mut records = claude::sessions_dir()
+            .map(|dir| claude::live_records(&dir, proc_root))
+            .unwrap_or_default();
+        records.extend(codex::local_records(proc_root));
+        // No agent anywhere is the common case; it costs no tmux call.
         let panes = if records.is_empty() {
             Vec::new()
         } else {
@@ -5576,7 +5578,7 @@ impl App {
                 button.add_css_class("tab-active");
                 active_button = Some(button.clone());
             }
-            for class in tab_state_classes(tab.crashed, tab.claude.is_some()) {
+            for class in tab_state_classes(tab.crashed, tab.claude.as_ref().map(|s| s.kind)) {
                 button.add_css_class(class);
             }
             let id = tab.id;
@@ -6030,7 +6032,7 @@ impl App {
         {
             row.add_css_class("host-disconnected");
         }
-        for class in tab_state_classes(tab.crashed, tab.claude.is_some()) {
+        for class in tab_state_classes(tab.crashed, tab.claude.as_ref().map(|s| s.kind)) {
             row.add_css_class(class);
         }
 
@@ -6635,15 +6637,18 @@ fn age_prefix(elapsed: Duration) -> String {
 /// group of n tabs. Shared by row construction, tab-bar construction and the
 /// in-place refreshes so they can never drift apart.
 /// The CSS classes that say what state a tab is in: `tab-crashed` for a
-/// dead shell (red label), `tab-claude` for a tracked claude session (green
-/// tint). Shared by the sidebar row and the tab-bar button.
-fn tab_state_classes(crashed: Option<i32>, claude: bool) -> Vec<&'static str> {
+/// dead shell (red label), `tab-claude` / `tab-codex` for a tracked claude or
+/// codex session (green / orange tint). Shared by the sidebar row and the
+/// tab-bar button.
+fn tab_state_classes(crashed: Option<i32>, agent: Option<AgentKind>) -> Vec<&'static str> {
     let mut classes = Vec::new();
     if crashed.is_some() {
         classes.push("tab-crashed");
     }
-    if claude {
-        classes.push("tab-claude");
+    match agent {
+        Some(AgentKind::Claude) => classes.push("tab-claude"),
+        Some(AgentKind::Codex) => classes.push("tab-codex"),
+        None => {}
     }
     classes
 }
@@ -7482,7 +7487,11 @@ impl App {
             return;
         }
         let transcript = match (&tab.claude, claude::projects_dir()) {
-            (Some(session), Some(projects)) => Some(claude::transcript_path(&projects, session)),
+            // Only claude's transcripts are understood; a codex tab is
+            // tagged from its title alone.
+            (Some(session), Some(projects)) if session.kind == AgentKind::Claude => {
+                Some(claude::transcript_path(&projects, session))
+            }
             _ => None,
         };
         let tag_mark = tab.tag_mark.clone();
@@ -8339,15 +8348,23 @@ mod tests {
     // --- tab state classes ------------------------------------------------
 
     #[test]
-    fn tab_state_classes_mark_a_crash_and_a_tracked_claude() {
+    fn tab_state_classes_mark_a_crash_and_a_tracked_agent() {
         // Shared by the sidebar row and the tab-bar button, so the two can
         // never disagree about what a tab looks like.
-        assert!(tab_state_classes(None, false).is_empty());
-        assert_eq!(tab_state_classes(Some(1), false), ["tab-crashed"]);
-        assert_eq!(tab_state_classes(None, true), ["tab-claude"]);
+        assert!(tab_state_classes(None, None).is_empty());
+        assert_eq!(tab_state_classes(Some(1), None), ["tab-crashed"]);
+        assert_eq!(
+            tab_state_classes(None, Some(AgentKind::Claude)),
+            ["tab-claude"]
+        );
+        // Codex gets its own tint, so the two agents tell apart at a glance.
+        assert_eq!(
+            tab_state_classes(None, Some(AgentKind::Codex)),
+            ["tab-codex"]
+        );
         // A crashed claude tab is both: tinted, with the red label on top.
         assert_eq!(
-            tab_state_classes(Some(-1), true),
+            tab_state_classes(Some(-1), Some(AgentKind::Claude)),
             ["tab-crashed", "tab-claude"]
         );
     }

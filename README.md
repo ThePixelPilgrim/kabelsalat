@@ -8,9 +8,10 @@ colour-coded groups.
 - **Shells survive everything.** Tabs are backed by an invisible tmux
   server; crash, quit or upgrade the GUI and every shell reattaches, layout
   intact. With systemd lingering they survive logout too.
-- **Claude Code sessions are resumed.** A tab in which `claude` runs
-  records its session id; after a reboot the tab comes back as
-  `claude --resume` in the same directory rather than as a plain shell.
+- **Claude Code and Codex sessions are resumed.** A tab in which `claude` or
+  `codex` runs records its session id; after a reboot the tab comes back as
+  `claude --resume` / `codex resume` in the same directory rather than as a
+  plain shell.
   This applies to local and remote tabs.
 - **Failure is survivable.** Crashed shells keep their output and restart in
   one click; orphaned sessions land in a "Recovered" group. Works without
@@ -146,6 +147,16 @@ and directory of the match are saved with the tab in `state.json`. A new
 session id after `/clear` is picked up the same way. A tab with a tracked
 session is shown with a green tint in the tab list and the tab bar.
 
+Codex is tracked the same way, with an orange tint. Codex keeps no registry of
+running processes, so kabelsalat looks for processes holding a rollout file
+open (`~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl`,
+found through `/proc/<pid>/fd`); the uuid is the session id and
+`/proc/<pid>/cwd` the directory. Such a tab is resumed as
+`codex resume <id>`. On a remote host the same lookup runs in the discovery
+script and needs a Linux `/proc` and `ls`, `sort` and `readlink` there. A
+codex tab is tagged in overview mode from its title only, not from a
+transcript.
+
 What the saved session is used for:
 
 - When kabelsalat starts and a tab's tmux session is gone (after a reboot,
@@ -165,6 +176,8 @@ the host.
 
 Limits:
 
+- Codex tracking relies on codex holding its rollout file open while it
+  runs; if a codex version stops doing that, the tab is not tracked.
 - The registry is Claude Code's own, undocumented format (observed with
   Claude Code 2.1.x). A change to it would stop the tracking, not the app.
 - Without tmux there is no tracking; a tab is then a plain shell.
@@ -183,8 +196,9 @@ line says which of the two you have. The same dialog removes the unit again,
 leaving lingering as it is. Nothing in your shell setup is touched either way.
 
 `kabelsalat resume` starts the private tmux server the way the GUI does, then
-recreates every saved tab that had a Claude Code session and whose tmux
-session is gone, as `claude --resume <id>` in its directory — behind a login
+recreates every saved tab that had a Claude Code or Codex session and whose
+tmux session is gone, as `claude --resume <id>` / `codex resume <id>` in its
+directory — behind a login
 shell, so `PATH` and the rest of your profile apply. Plain shells are not
 resumed. When the GUI starts it finds those sessions live and attaches to
 them; a `claude` that could not start shows as a crashed tab like any other.

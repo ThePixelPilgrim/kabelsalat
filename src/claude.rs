@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::state::ClaudeSession;
+use crate::state::AgentSession;
 
 /// Longest parent chain followed from a claude process up to a pane shell.
 /// A real chain is two or three deep; the bound only guards against a
@@ -47,9 +47,22 @@ struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub pid: u32,
-    pub session: ClaudeSession,
+    pub session: AgentSession,
     proc_start: Option<String>,
     started_at: u64,
+}
+
+impl Record {
+    /// A record for a process found some other way than the claude registry
+    /// (codex has none); `started_at` orders two sessions in one pane.
+    pub fn new(pid: u32, session: AgentSession, started_at: u64) -> Self {
+        Self {
+            pid,
+            session,
+            proc_start: None,
+            started_at,
+        }
+    }
 }
 
 /// Where Claude Code keeps its registry: `$CLAUDE_CONFIG_DIR/sessions`, or
@@ -102,7 +115,7 @@ pub fn escape_cwd(cwd: &Path) -> String {
 }
 
 /// The transcript of a session: `<projects_dir>/<escaped cwd>/<id>.jsonl`.
-pub fn transcript_path(projects_dir: &Path, session: &ClaudeSession) -> PathBuf {
+pub fn transcript_path(projects_dir: &Path, session: &AgentSession) -> PathBuf {
     projects_dir
         .join(escape_cwd(&session.cwd))
         .join(format!("{}.jsonl", session.id))
@@ -114,10 +127,10 @@ pub fn transcript_path(projects_dir: &Path, session: &ClaudeSession) -> PathBuf 
 /// pane has no live claude by definition, and what it had is exactly what
 /// its restart should resume.
 pub fn after_tick(
-    previous: Option<ClaudeSession>,
-    found: Option<ClaudeSession>,
+    previous: Option<AgentSession>,
+    found: Option<AgentSession>,
     pane_dead: bool,
-) -> Option<ClaudeSession> {
+) -> Option<AgentSession> {
     match found {
         Some(session) => Some(session),
         None if pane_dead => previous,
@@ -141,10 +154,7 @@ pub fn parse_record(json: &str) -> Option<Record> {
     }
     Some(Record {
         pid: entry.pid,
-        session: ClaudeSession {
-            id: entry.session_id,
-            cwd: entry.cwd,
-        },
+        session: AgentSession::claude(entry.session_id, entry.cwd),
         proc_start: entry.proc_start,
         started_at: entry.started_at,
     })
@@ -203,8 +213,8 @@ pub fn sessions_by_pane(
     records: &[Record],
     panes: &[(String, u32)],
     tree: &impl ProcessTree,
-) -> HashMap<String, ClaudeSession> {
-    let mut found: HashMap<String, (u64, ClaudeSession)> = HashMap::new();
+) -> HashMap<String, AgentSession> {
+    let mut found: HashMap<String, (u64, AgentSession)> = HashMap::new();
     for record in records {
         let chain = ancestors(tree, record.pid);
         let Some((uuid, _)) = panes.iter().find(|(_, pid)| chain.contains(pid)) else {
@@ -242,7 +252,8 @@ fn ancestors(tree: &impl ProcessTree, pid: u32) -> Vec<u32> {
 
 /// The POSIX `sh` script a remote host runs to print what the local path
 /// reads itself: its kabelsalat panes, its process tree (`ps`, so it works
-/// beyond Linux), and its registry files, one per line. Each line is
+/// beyond Linux), its registry files and the rollout files codex processes
+/// hold open (`crate::codex::HOST_SNIPPET`), one per line. Each line is
 /// tagged, so `sessions_from_host_listing` can ignore anything else — a
 /// shell's banner, say.
 pub fn host_script() -> String {
@@ -254,13 +265,14 @@ pub fn host_script() -> String {
          ps -eo pid=,ppid= | awk '{{print \"proc\\t\" $1 \"\\t\" $2}}'; \
          for f in \"${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}\"/sessions/*.json; do \
          [ -f \"$f\" ] || continue; printf 'record\\t'; tr -d '\\n' < \"$f\"; printf '\\n'; \
-         done; exit 0"
+         done; {codex}; exit 0",
+        codex = crate::codex::HOST_SNIPPET
     )
 }
 
 /// What `host_script` printed, matched like the local path. A record whose
 /// pid the host did not list is a claude that is gone.
-pub fn sessions_from_host_listing(listing: &str) -> HashMap<String, ClaudeSession> {
+pub fn sessions_from_host_listing(listing: &str) -> HashMap<String, AgentSession> {
     let mut panes = Vec::new();
     let mut tree: HashMap<u32, u32> = HashMap::new();
     let mut records = Vec::new();
@@ -285,6 +297,7 @@ pub fn sessions_from_host_listing(listing: &str) -> HashMap<String, ClaudeSessio
                 }
             }
             "record" => records.extend(parse_record(rest)),
+            "codex" => records.extend(crate::codex::parse_host_line(rest)),
             _ => {}
         }
     }
@@ -388,10 +401,8 @@ mod tests {
 
     #[test]
     fn transcript_path_is_projects_escaped_cwd_id_jsonl() {
-        let session = ClaudeSession {
-            id: "abc-123".into(),
-            cwd: PathBuf::from("/home/user/kabelsalat"),
-        };
+        let session =
+            AgentSession::claude("abc-123".into(), PathBuf::from("/home/user/kabelsalat"));
         assert_eq!(
             transcript_path(Path::new("/home/me/.claude/projects"), &session),
             PathBuf::from("/home/me/.claude/projects/-home-user-kabelsalat/abc-123.jsonl")
@@ -420,14 +431,8 @@ mod tests {
 
     #[test]
     fn after_tick_takes_what_is_found_and_keeps_a_crashed_tabs_session() {
-        let old = ClaudeSession {
-            id: "old".into(),
-            cwd: PathBuf::from("/a"),
-        };
-        let new = ClaudeSession {
-            id: "new".into(),
-            cwd: PathBuf::from("/b"),
-        };
+        let old = AgentSession::claude("old".into(), PathBuf::from("/a"));
+        let new = AgentSession::claude("new".into(), PathBuf::from("/b"));
         // A claude seen in the pane is the truth, whatever was known before.
         assert_eq!(
             after_tick(None, Some(new.clone()), false),
@@ -546,10 +551,7 @@ mod tests {
         write_stat(&proc_root, 50, 1, "8");
         let record = |pid: u32, id: &str, started_at: u64| Record {
             pid,
-            session: ClaudeSession {
-                id: id.into(),
-                cwd: PathBuf::from("/p"),
-            },
+            session: AgentSession::claude(id.into(), PathBuf::from("/p")),
             proc_start: None,
             started_at,
         };
@@ -586,10 +588,7 @@ mod tests {
         write_stat(&proc_root, 22, 20, "3");
         let record = |pid: u32, id: &str, started_at: u64| Record {
             pid,
-            session: ClaudeSession {
-                id: id.into(),
-                cwd: PathBuf::from("/p"),
-            },
+            session: AgentSession::claude(id.into(), PathBuf::from("/p")),
             proc_start: None,
             started_at,
         };
@@ -623,10 +622,7 @@ mod tests {
         assert_eq!(ancestors(&tree, 9), [9]);
         let record = Record {
             pid: 4,
-            session: ClaudeSession {
-                id: "s".into(),
-                cwd: PathBuf::from("/p"),
-            },
+            session: AgentSession::claude("s".into(), PathBuf::from("/p")),
             proc_start: None,
             started_at: 0,
         };
@@ -690,5 +686,31 @@ warning: something ssh printed
             ]
         );
         assert!(sessions_from_host_listing("").is_empty());
+    }
+
+    #[test]
+    fn host_listing_finds_codex_sessions_beside_claude_ones() {
+        let id = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+        let listing = format!(
+            "pane\tks-a\t10\npane\tks-b\t30\nproc\t10\t1\nproc\t20\t10\nproc\t30\t1\nproc\t31\t30\n\
+             record\t{{\"pid\":20,\"sessionId\":\"c-session\",\"cwd\":\"/home/me/a\"}}\n\
+             codex\t31\t/h/.codex/sessions/2026/10/21/rollout-t-{id}.jsonl\t/home/me/b\n\
+             codex\t99\t/h/.codex/sessions/2026/10/21/rollout-t-{id}.jsonl\t/gone\n"
+        );
+        let found = sessions_from_host_listing(&listing);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            found["a"],
+            AgentSession::claude("c-session".into(), PathBuf::from("/home/me/a"))
+        );
+        assert_eq!(
+            found["b"],
+            AgentSession::codex(id.into(), PathBuf::from("/home/me/b"))
+        );
+    }
+
+    #[test]
+    fn host_script_also_runs_the_codex_snippet() {
+        assert!(host_script().contains(crate::codex::HOST_SNIPPET));
     }
 }

@@ -193,7 +193,7 @@ pub fn dialog_body(status: Status, path: &Path) -> String {
              (`systemctl --user`), which this system does not provide."
             .to_string(),
         Status::Off => format!(
-            "kabelsalat can bring the Claude sessions of your tabs back right after the \
+            "kabelsalat can bring the Claude and Codex sessions of your tabs back right after the \
              machine boots, before you log in, so they are already running when you open \
              it. Plain shells are not resumed this way.\n\n\
              Install writes a systemd user unit, {path}, enables it, and enables lingering \
@@ -203,13 +203,13 @@ pub fn dialog_body(status: Status, path: &Path) -> String {
              before login, and the unit then simply does nothing."
         ),
         Status::On { at_boot: true } => format!(
-            "Claude sessions are resumed right after boot by {UNIT_NAME}.\n\n\
+            "Claude and Codex sessions are resumed right after boot by {UNIT_NAME}.\n\n\
              Remove disables the unit and deletes {path}. Running sessions are not \
              affected, and lingering stays as it is."
         ),
         Status::On { at_boot: false } => format!(
             "{UNIT_NAME} is installed, but lingering is off for your user, so your Claude \
-             sessions come back only once you log in rather than right after boot. Enable \
+             and Codex sessions come back only once you log in rather than right after boot. Enable \
              lingering to have them resume at boot.\n\n\
              Remove disables the unit and deletes {path}. Running sessions are not affected."
         ),

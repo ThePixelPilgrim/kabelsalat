@@ -82,13 +82,26 @@ pub fn run(gui_running: bool) -> u8 {
         let argv = state::boot_resume_argv(&shell, claude);
         match ctl.create_detached_session(&tab.uuid, Some(&claude.cwd), &argv, &env) {
             Ok(Created::Created) => {
-                println!("resumed claude {} in {}", claude.id, claude.cwd.display());
+                println!(
+                    "resumed {} {} in {}",
+                    claude.kind.name(),
+                    claude.id,
+                    claude.cwd.display()
+                );
             }
             Ok(Created::AlreadyExists) => {
-                println!("claude {} already has its session", claude.id);
+                println!(
+                    "{} {} already has its session",
+                    claude.kind.name(),
+                    claude.id
+                );
             }
             Err(err) => {
-                eprintln!("kabelsalat: resuming claude {}: {err}", claude.id);
+                eprintln!(
+                    "kabelsalat: resuming {} {}: {err}",
+                    claude.kind.name(),
+                    claude.id
+                );
                 failed += 1;
             }
         }

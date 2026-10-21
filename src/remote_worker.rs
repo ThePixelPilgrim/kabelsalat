@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::claude;
 use crate::remote::{self, AuthMode, ControlOp, RemoteError, SshAvailability};
-use crate::state::ClaudeSession;
+use crate::state::AgentSession;
 use crate::tmuxctl::{self, SessionInfo, TmuxCtl, TmuxVersion};
 
 /// How long to wait for a pipe's end after the process exited. A master
@@ -218,7 +218,7 @@ pub enum RemoteEvent {
     /// The claude session found in each of the host's panes, by tab uuid
     /// (see `claude::host_script`). Only ever a real answer: a discovery
     /// that did not reach the host reports nothing at all.
-    ClaudeSessions(HashMap<String, ClaudeSession>),
+    ClaudeSessions(HashMap<String, AgentSession>),
 }
 
 /// One unit of work, run in arrival order.
@@ -441,7 +441,7 @@ impl<R: Runner> HostSession<R> {
     /// What claude runs in which pane, as the host sees it. The script ends
     /// in `exit 0`, so any other status is the transport (or no `sh`): the
     /// sessions are then unknown, which is not the same as none.
-    fn discover(&mut self) -> Option<HashMap<String, ClaudeSession>> {
+    fn discover(&mut self) -> Option<HashMap<String, AgentSession>> {
         let script = vec!["sh".to_string(), "-c".into(), claude::host_script()];
         let argv = remote::mux_argv(&self.dest, &self.control_path, false, &script);
         let out = self.run(&argv, &[], None);
@@ -563,7 +563,7 @@ impl RemoteWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ClaudeSession;
+    use crate::state::AgentSession;
     use std::collections::{HashMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -971,12 +971,9 @@ mod tests {
         let listing = "pane\tks-a\t20\nproc\t20\t1\nproc\t21\t20\n\
                        record\t{\"pid\":21,\"sessionId\":\"sid\",\"cwd\":\"/home/me/p\"}\n";
         let (mut host, calls) = host(AuthMode::BatchOnly, vec![reply(0, listing, "")]);
-        let expected: HashMap<String, ClaudeSession> = [(
+        let expected: HashMap<String, AgentSession> = [(
             "a".to_string(),
-            ClaudeSession {
-                id: "sid".into(),
-                cwd: Path::new("/home/me/p").to_path_buf(),
-            },
+            AgentSession::claude("sid".into(), Path::new("/home/me/p").to_path_buf()),
         )]
         .into_iter()
         .collect();
